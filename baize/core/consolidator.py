@@ -11,7 +11,7 @@ import re
 import sqlite3
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import ScratchpadManager
@@ -21,7 +21,13 @@ from baize.storage.db import init_db
 _ENTITY_RE = re.compile(r"(proj:[\w\-]+)")
 _DECISION_RE = re.compile(r"(?:定案|改为|敲定)[::]?\s*(.+)")
 _SUPERSEDE_RE = re.compile(r"(?:推翻|废弃|取代)[::]?\s*(.+?)(?:[,,。;;]|$)|(.+?)\s*(?:推翻|废弃|取代)")
+_ALIAS_RE = re.compile(r"alias[::]\s*([^\s]+)")
+_ALIAS_SPLIT_RE = re.compile(r"[,,、]")
 _EXPLORATION_RE = re.compile(r"假设|如果|要不|探讨|尚未批准|[?？]|呢$")
+_LLM_SYSTEM_PROMPT = (
+    "从对话中提取最终定案 decision、被推翻的方案 superseded、简洁中文名 display_name "
+    "与别名数组 aliases,只输出 JSON。"
+)
 
 
 def _is_authoritative(log: Dict[str, Any]) -> bool:
@@ -32,12 +38,28 @@ def _is_authoritative(log: Dict[str, Any]) -> bool:
     )
 
 
+def _clean_decision(text: Optional[str]) -> Optional[str]:
+    return (text or "").lstrip(":: \t\r\n").strip() or None
+
+
+def _split_aliases(raw: str) -> List[str]:
+    return [a.strip() for a in _ALIAS_SPLIT_RE.split(raw) if a.strip()]
+
+
+def _union(*groups: List[str]) -> List[str]:
+    seen: Dict[str, None] = {}
+    for group in groups:
+        for item in group:
+            seen.setdefault(item, None)
+    return list(seen)
+
+
 def _plan_node_id(entity_id: str, decision: str) -> str:
     digest = hashlib.sha1(f"{entity_id}|{decision}".encode("utf-8")).hexdigest()[:12]
     return f"plan:{digest}"
 
 
-def _open_unique_archive(archive_dir: str, stamp: str) -> Tuple[str, Any]:
+def _open_unique_archive(archive_dir: str, stamp: str) -> Any:
     while True:
         path = os.path.join(archive_dir, f"scratchpad_{stamp}_{int(time.time() * 1000)}.jsonl.gz")
         try:
@@ -84,19 +106,14 @@ class DreamConsolidator:
 
         plans: List[Dict[str, Any]] = []
         for entity_id, logs in groups.items():
-            decision, superseded = self._consolidate_group(logs)
-            if decision:
-                plans.append({
-                    "entity_id": entity_id,
-                    "decision": decision,
-                    "superseded": superseded,
-                    "logs": logs,
-                })
+            extracted = self._consolidate_group(logs)
+            if extracted and extracted["decision"]:
+                plans.append({"entity_id": entity_id, "logs": logs, **extracted})
         return plans
 
-    def _consolidate_group(self, logs: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    def _consolidate_group(self, logs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not any(_is_authoritative(log) for log in logs):
-            return None, None
+            return None
         user_logs = [log for log in logs if log["role"] == "user"]
         if self.llm_client is not None:
             try:
@@ -105,29 +122,35 @@ class DreamConsolidator:
                 pass
         return self._consolidate_by_rules(user_logs)
 
-    def _consolidate_with_llm(self, logs: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    def _consolidate_with_llm(self, logs: List[Dict[str, Any]]) -> Dict[str, Any]:
         transcript = "\n".join(log["raw_text"] for log in logs)
-        raw = self.llm_client.chat(
-            "从对话中提取最终定案 decision 与被推翻的方案 superseded,只输出 JSON。",
-            transcript,
-        )
+        raw = self.llm_client.chat(_LLM_SYSTEM_PROMPT, transcript)
         data = json.loads(raw)
-        return data.get("decision") or None, data.get("superseded") or None
+        return {
+            "decision": _clean_decision(data.get("decision")),
+            "superseded": data.get("superseded") or None,
+            "display_name": (data.get("display_name") or "").strip() or None,
+            "aliases": [a.strip() for a in (data.get("aliases") or []) if a and a.strip()],
+        }
 
-    def _consolidate_by_rules(self, logs: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    def _consolidate_by_rules(self, logs: List[Dict[str, Any]]) -> Dict[str, Any]:
         decision = None
         superseded = None
+        aliases: List[str] = []
         for log in logs:
             text = log["raw_text"]
             if _is_authoritative(log):
                 m = _DECISION_RE.search(text)
                 if m:
-                    decision = m.group(1).strip()
+                    decision = _clean_decision(m.group(1))
+                a = _ALIAS_RE.search(text)
+                if a:
+                    aliases.extend(_split_aliases(a.group(1)))
             if log["phase_hint"] == "rejection":
                 s = _SUPERSEDE_RE.search(text)
                 if s:
                     superseded = (s.group(1) or s.group(2)).strip()
-        return decision, superseded
+        return {"decision": decision, "superseded": superseded, "display_name": None, "aliases": aliases}
 
     def _extract_entity(self, text: str) -> Optional[str]:
         m = _ENTITY_RE.search(text)
@@ -158,7 +181,9 @@ class DreamConsolidator:
                 entity_id = plan["entity_id"]
                 decision = plan["decision"]
                 current = self.living.get_state(entity_id)
-                display = current["display_name"] if current else entity_id
+                display = plan["display_name"] or (current["display_name"] if current else entity_id)
+                existing_aliases = current["metadata"].get("aliases", []) if current else []
+                aliases = _union(existing_aliases, plan["aliases"])
                 plan_id = _plan_node_id(entity_id, decision)
 
                 self.graph.upsert_node(entity_id, display, "project", commit=False)
@@ -170,6 +195,7 @@ class DreamConsolidator:
                     decision,
                     superseded_plan=plan["superseded"],
                     killed_reason="睡眠合成:被新定案取代" if plan["superseded"] else None,
+                    metadata={"aliases": aliases} if aliases else None,
                     commit=False,
                 )
                 if not self._has_active_decision_edge(entity_id, plan_id):

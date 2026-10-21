@@ -1,12 +1,27 @@
 """Cognitive Recall Router: Level 1 活体卡直达 / Level 2 PPR 能量游走的统一召回入口"""
 from __future__ import annotations
 
+import re
 import sqlite3
 from typing import Any, Dict, List, Optional
 
 from baize.core.living_state import LivingStateManager
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.intelligence.ppr_engine import PPREngine
+
+
+_PARTICLES = ("的", "什么", "怎么", "定的", "呢", "吗", "吧", "啊")
+_TOKEN_RE = re.compile(r"[一-鿿A-Za-z0-9_]{2,}")
+
+
+def _strip_particles(text: str) -> str:
+    for p in _PARTICLES:
+        text = text.replace(p, "")
+    return text.strip()
+
+
+def _tokens(text: str) -> List[str]:
+    return _TOKEN_RE.findall(text)
 
 
 class CognitiveRecallRouter:
@@ -23,6 +38,9 @@ class CognitiveRecallRouter:
 
         seeds = self._match_seed_nodes(query)
         if not seeds:
+            state = self._match_decision_text(query)
+            if state is not None:
+                return {"strategy": "DECISION_TEXT_MATCH", "confidence": 0.6, "state": state, "nodes": []}
             return {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
 
         energy = self.ppr.run_ppr(self.graph.get_active_subgraph(), seeds)
@@ -35,9 +53,25 @@ class CognitiveRecallRouter:
         }
 
     def _match_living_state(self, query: str) -> Optional[Dict[str, Any]]:
+        stripped = _strip_particles(query)
         for state in self.living.list_active_states():
             names = [state["display_name"], *state["metadata"].get("aliases", [])]
-            if any(name and name in query for name in names):
+            for name in names:
+                if not name:
+                    continue
+                if name in query or name in stripped:
+                    return state
+                if len(name) >= 4 and stripped and stripped in name:
+                    return state
+        return None
+
+    def _match_decision_text(self, query: str) -> Optional[Dict[str, Any]]:
+        stripped = _strip_particles(query)
+        if len(stripped) < 2:
+            return None
+        for state in self.living.list_active_states():
+            decision = state["current_decision"] or ""
+            if any(len(tok) >= 2 and tok in decision for tok in _tokens(stripped)):
                 return state
         return None
 
