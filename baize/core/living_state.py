@@ -44,7 +44,7 @@ class LivingStateManager:
         killed_reason: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """就地更新定案,并将被取代的方案追加进墓碑区。"""
+        """就地更新定案，并将被取代的方案追加进墓碑区。"""
         cur = self.conn.cursor()
         current = self.get_state(entity_id)
 
