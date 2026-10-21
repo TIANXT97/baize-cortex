@@ -1,11 +1,13 @@
-"""白泽·Cortex 统一 FastAPI 入口与 MCP 工具包装
+"""白泽·Cortex 统一 FastAPI 入口
 
 启动: uvicorn baize.server.app:create_app --factory
 """
+import sqlite3
 import threading
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from baize.core.living_state import LivingStateManager
@@ -38,22 +40,51 @@ class PPRIn(BaseModel):
     seed_nodes: Dict[str, float]
 
 
+class GraphNodeIn(BaseModel):
+    node_id: str
+    label: str
+    node_type: str
+    properties: Optional[Dict[str, Any]] = None
+
+
+class GraphEdgeIn(BaseModel):
+    src_id: str
+    dst_id: str
+    rel_type: str
+    valid_at: str
+    weight: float = 1.0
+    invalid_at: Optional[str] = None
+
+
+class GraphInvalidateIn(BaseModel):
+    src_id: str
+    dst_id: str
+    rel_type: str
+    invalid_at: str
+
+
 def create_app(db_path: str = "baize.db") -> FastAPI:
-    conn = init_db(db_path)
     lock = threading.Lock()
-    scratchpad = ScratchpadManager(conn)
-    living = LivingStateManager(conn)
-    graph = BiTemporalGraphManager(conn)
     ppr = PPREngine()
 
-    app = FastAPI(title="白泽·Cortex", version=VERSION)
-    app.state.conn = conn
-    app.state.graph = graph
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        conn = init_db(db_path)
+        app.state.conn = conn
+        app.state.scratchpad = ScratchpadManager(conn)
+        app.state.living = LivingStateManager(conn)
+        app.state.graph = BiTemporalGraphManager(conn)
+        try:
+            yield
+        finally:
+            conn.close()
+
+    app = FastAPI(title="白泽·Cortex", version=VERSION, lifespan=lifespan)
 
     @app.get("/health")
     def health():
         with lock:
-            conn.execute("SELECT 1").fetchone()
+            app.state.conn.execute("SELECT 1").fetchone()
         return {
             "status": "ok",
             "version": VERSION,
@@ -69,15 +100,20 @@ def create_app(db_path: str = "baize.db") -> FastAPI:
     @app.post("/v1/scratchpad/log")
     def scratchpad_log(body: ScratchpadLogIn):
         with lock:
-            log_id = scratchpad.append_log(
+            log_id = app.state.scratchpad.append_log(
                 body.session_id, body.role, body.raw_text, body.phase_hint, body.noul_score
             )
         return {"id": log_id}
 
+    @app.get("/v1/living-states")
+    def list_living_states():
+        with lock:
+            return app.state.living.list_active_states()
+
     @app.get("/v1/living-state/{entity_id}")
     def get_living_state(entity_id: str):
         with lock:
-            state = living.get_state(entity_id)
+            state = app.state.living.get_state(entity_id)
         if state is None:
             raise HTTPException(status_code=404, detail="living state not found")
         return state
@@ -85,7 +121,7 @@ def create_app(db_path: str = "baize.db") -> FastAPI:
     @app.post("/v1/living-state/decision")
     def post_decision(body: DecisionIn):
         with lock:
-            return living.update_decision(
+            return app.state.living.update_decision(
                 body.entity_id,
                 body.display_name,
                 body.new_decision,
@@ -94,18 +130,40 @@ def create_app(db_path: str = "baize.db") -> FastAPI:
                 body.metadata,
             )
 
+    @app.post("/v1/graph/node")
+    def graph_node(body: GraphNodeIn):
+        with lock:
+            app.state.graph.upsert_node(body.node_id, body.label, body.node_type, body.properties)
+        return {"node_id": body.node_id}
+
+    @app.post("/v1/graph/edge")
+    def graph_edge(body: GraphEdgeIn):
+        with lock:
+            try:
+                app.state.graph.add_edge(
+                    body.src_id, body.dst_id, body.rel_type, body.valid_at, body.weight, body.invalid_at
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+        return {"status": "created"}
+
+    @app.post("/v1/graph/invalidate")
+    def graph_invalidate(body: GraphInvalidateIn):
+        with lock:
+            app.state.graph.invalidate_edge(body.src_id, body.dst_id, body.rel_type, body.invalid_at)
+        return {"status": "invalidated"}
+
+    @app.get("/v1/graph/active-subgraph")
+    def active_subgraph():
+        with lock:
+            edges = app.state.graph.get_active_subgraph()
+        return {"edges": [{"src_id": s, "dst_id": d, "weight": w} for s, d, w in edges]}
+
     @app.post("/v1/recall/ppr")
     def recall_ppr(body: PPRIn):
         with lock:
-            edges = graph.get_active_subgraph()
+            edges = app.state.graph.get_active_subgraph()
         energy = ppr.run_ppr(edges, body.seed_nodes)
         return {"ranking": [{"node_id": node, "energy": score} for node, score in energy.items()]}
-
-    app.state.mcp_tools = {
-        "baize_scratchpad_log": lambda args: scratchpad_log(ScratchpadLogIn(**args)),
-        "baize_get_living_state": lambda args: get_living_state(args["entity_id"]),
-        "baize_decision": lambda args: post_decision(DecisionIn(**args)),
-        "baize_recall_ppr": lambda args: recall_ppr(PPRIn(**args)),
-    }
 
     return app

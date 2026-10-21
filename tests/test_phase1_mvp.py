@@ -103,39 +103,33 @@ def test_living_state_malformed_json_falls_back():
 def test_api_end_to_end():
     with tempfile.TemporaryDirectory() as d:
         app = create_app(os.path.join(d, "api.db"))
-        client = TestClient(app)
+        with TestClient(app) as client:
+            health = client.get("/health").json()
+            assert health["version"] == "2.0.0-alpha"
 
-        health = client.get("/health").json()
-        assert health["version"] == "2.0.0-alpha"
+            r = client.post("/v1/scratchpad/log", json={
+                "session_id": "s1", "role": "user", "raw_text": "阿里云跳板", "phase_hint": None,
+            })
+            assert r.status_code == 200
 
-        r = client.post("/v1/scratchpad/log", json={
-            "session_id": "s1", "role": "user", "raw_text": "阿里云跳板", "phase_hint": None,
-        })
-        assert r.status_code == 200
+            client.post("/v1/living-state/decision", json={
+                "entity_id": "proj:glass_mold", "display_name": "模具知识库",
+                "new_decision": "人肉拆图",
+            })
+            r = client.post("/v1/living-state/decision", json={
+                "entity_id": "proj:glass_mold", "display_name": "模具知识库",
+                "new_decision": "飞桨切片", "superseded_plan": "人肉拆图", "killed_reason": "不可扩展",
+            })
+            assert r.json()["current_decision"] == "飞桨切片"
+            assert r.json()["tombstones"][0]["plan"] == "人肉拆图"
 
-        client.post("/v1/living-state/decision", json={
-            "entity_id": "proj:glass_mold", "display_name": "模具知识库",
-            "new_decision": "人肉拆图",
-        })
-        r = client.post("/v1/living-state/decision", json={
-            "entity_id": "proj:glass_mold", "display_name": "模具知识库",
-            "new_decision": "飞桨切片", "superseded_plan": "人肉拆图", "killed_reason": "不可扩展",
-        })
-        assert r.json()["current_decision"] == "飞桨切片"
-        assert r.json()["tombstones"][0]["plan"] == "人肉拆图"
+            got = client.get("/v1/living-state/proj:glass_mold").json()
+            assert got["current_decision"] == "飞桨切片"
+            assert client.get("/v1/living-state/proj:none").status_code == 404
 
-        got = client.get("/v1/living-state/proj:glass_mold").json()
-        assert got["current_decision"] == "飞桨切片"
-        assert client.get("/v1/living-state/proj:none").status_code == 404
-
-        r = client.post("/v1/recall/ppr", json={"seed_nodes": {"topic:aliyun": 1.0}})
-        assert r.status_code == 200
-        assert "ranking" in r.json()
-
-        assert set(app.state.mcp_tools) == {
-            "baize_scratchpad_log", "baize_get_living_state", "baize_decision", "baize_recall_ppr",
-        }
-        app.state.conn.close()
+            r = client.post("/v1/recall/ppr", json={"seed_nodes": {"topic:aliyun": 1.0}})
+            assert r.status_code == 200
+            assert "ranking" in r.json()
 
 
 if __name__ == "__main__":
