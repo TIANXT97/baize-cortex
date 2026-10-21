@@ -117,7 +117,8 @@ baize-cortex/
 - [x] **Phase 2: 双时态图谱与 PPR 扩散** —— 实现有效子图切片、PPR 能量扩散、PhaseDetector 相变嗅探与 MCP stdio 服务
 - [x] **Phase 3: 慢波睡眠回放** —— 实现慢波合成引擎、规则降级、无损 gzip 冷归档与热表清退
 - [x] **Phase 4: 认知召回中枢** —— 实现 `CognitiveRecallRouter`(活体卡直达 / PPR 游走)、核心工程资产预置、`POST /v1/recall` 与 MCP `baize_recall`
-- [ ] **Phase 5: 全量平滑割接** —— 现役 baize 资产迁移与生产上线
+- [x] **Phase 5: 承重架构加固与生产可靠性** —— 修复 F1~F9 核心承重墙（唯一归档防覆盖、授权批准门、图文双写同步、双时态生效断言），实现 System 1 & System 2 真实模型接入与 Hermes 插件契约贯通
+- [ ] **Phase 6: 全量生产平滑割接** —— 现役存量数据提纯与全场景持续演化
 
 ---
 

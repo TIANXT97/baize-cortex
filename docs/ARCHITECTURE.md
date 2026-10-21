@@ -76,3 +76,40 @@
 - **System 2 (深思层 · 离线淬火引擎)**：
   - 核心引擎：具备深度推理能力的通用大模型基座；
   - 职责：夜间慢波睡眠抽象提炼、复杂矛盾全局仲裁、白皮书生成。
+
+---
+
+## 5. 承重架构加固与生产可靠性 (Phase 5 Hardening)
+
+经过实弹穿透式红蓝军对抗审计（F1~F9），系统补齐了关键工程承重墙，兑现工业级可追责与无损保证：
+
+### 5.1 授权批准门与防误盖章 (F2)
+- **硬隔离**：`_is_authoritative(log)` 严格判定。只有 `role == "user"` 且显式标记 `phase_hint == "approval"`（且剔除探讨、反问与假设句）的记录才具备改写 `living_states` 正式定案的公章权限；
+- **防纂改**：Assistant 的方案建议、假设性推演（`如果...` / `探讨` / `?` / `呢$`）一律只能沉淀为草稿或候选，严禁隐式盖章。
+
+### 5.2 无损冷归档与 Write-Ahead 安全清退 (F1)
+- **唯一性防覆盖**：归档文件格式严格定为 `scratchpad_{stamp}_{timestamp_ms}.jsonl.gz`，采用排他性创建；
+- **先落盘后清退 (Write-Ahead)**：只有物理写入 gzip 并落盘校验后，才执行 `DELETE FROM scratchpad_log WHERE id IN (...)`；
+- **未折叠草稿保留**：清退范围仅限**本次真正被成功折叠入活体卡的日志 ID**，未进入折叠的瞬态草稿继续留在热表等待下一轮处理，彻底杜绝数据丢失。
+
+### 5.3 严格时态切片与图文双写同步 (F4 / F5)
+- **有效子图双时态约束**：
+  $$\mathcal{G}_{active} = \{e \in \mathcal{E} \mid e.invalid\_at \text{ IS NULL and } e.valid\_at \le \text{datetime('now')}\}$$
+  未生效的未来边（如预定生效的提案）被物理隔离在现役子图外；
+- **图文双写与别名保护**：慢波睡眠折叠出新定案后，自动为项目建立 `decided_as` 现役新边，并按 `node_id` 失效旧边；`update_decision` 强制增量合并 `metadata`，永久保留 `aliases` 别名库。
+
+---
+
+## 6. Hermes Agent 插件与调用契约规范
+
+### 6.1 MemoryProvider 基类契约对齐
+Hermes 网关核心的 `sync_turn` 采用 `(user_content, assistant_content, *, session_id, ...)` 签名调用。`plugins/cortex/__init__.py` 必须严格拆解：
+- 用户消息以 `role="user"` 写入，并由轻量正则/PhaseDetector 动态嗅探打标 `approval` 或 `rejection`；
+- 助手消息以 `role="assistant"` 写入，`phase_hint=None`，杜绝角色错位与死锁。
+
+### 6.2 环境变量无感模型注入
+System 1 与 System 2 真实模型完全通过环境变量声明注入：
+- `CORTEX_LLM_URL`：兼容 OpenAI 协议的网关出口；
+- `CORTEX_LLM_KEY`：鉴权令牌；
+- `CORTEX_DECISION_MODEL`：决策嗅探模型（如 `cbcn/deepseek-v4.1-flash`）；
+- `CORTEX_REASONING_MODEL`：慢波睡眠深度折叠模型。
