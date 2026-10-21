@@ -91,7 +91,7 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         settings = llm_settings_from_env()
         llm_client = None
         if settings is not None:
-            url, key, _, reasoning_model = settings
+            url, key, reasoning_model = settings
             llm_client = OpenAICompatClient(url, key, reasoning_model)
         app.state.detector = PhaseDetector.from_env()
         app.state.consolidator = DreamConsolidator(conn, archive_dir=archive_dir, llm_client=llm_client)
