@@ -77,6 +77,16 @@ class RecallIn(BaseModel):
     top_k: int = 5
 
 
+class PurgeIn(BaseModel):
+    before_id: Optional[int] = None
+    role: Optional[str] = None
+    dry_run: bool = True
+
+
+class BackfillIn(BaseModel):
+    dry_run: bool = True
+
+
 def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> FastAPI:
     lock = threading.Lock()
     ppr = PPREngine()
@@ -200,6 +210,16 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
     def recall(body: RecallIn):
         with lock:
             return app.state.router.recall(body.query, body.top_k)
+
+    @app.post("/v1/admin/backfill-display-names")
+    def admin_backfill(body: BackfillIn):
+        with lock:
+            return app.state.consolidator.backfill_display_names(body.dry_run)
+
+    @app.post("/v1/admin/purge-scratchpad")
+    def admin_purge(body: PurgeIn):
+        with lock:
+            return app.state.consolidator.purge_scratchpad(body.before_id, body.role, body.dry_run)
 
     @app.post("/v1/admin/seed")
     def admin_seed():

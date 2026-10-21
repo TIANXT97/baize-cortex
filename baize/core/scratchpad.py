@@ -41,6 +41,19 @@ class ScratchpadManager:
         ).fetchall()
         return [_row_to_log(r) for r in rows]
 
+    def find_for_purge(self, before_id: Optional[int] = None, role: Optional[str] = None) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, session_id, role, raw_text, phase_hint, noul_score, created_at
+            FROM scratchpad_log
+            WHERE (? IS NULL OR id < ?)
+              AND (? IS NULL OR role = ?)
+            ORDER BY id ASC
+            """,
+            (before_id, before_id, role, role),
+        ).fetchall()
+        return [_row_to_log(r) for r in rows]
+
     def export_pending_phase_logs(self, date_str: Optional[str] = None) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
             """

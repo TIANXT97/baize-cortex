@@ -35,6 +35,19 @@ class LivingStateManager:
         ).fetchall()
         return [_row_to_state(r) for r in rows]
 
+    def resolve_display_name(self, entity_id: str, proposed: Optional[str]) -> str:
+        current = self.get_state(entity_id)
+        if current is None or current["display_name"] == entity_id:
+            return proposed or (current["display_name"] if current else entity_id)
+        return current["display_name"]
+
+    def rename_display(self, entity_id: str, display_name: str) -> None:
+        self.conn.execute(
+            "UPDATE living_states SET display_name = ? WHERE entity_id = ?",
+            (display_name, entity_id),
+        )
+        self.conn.commit()
+
     def update_decision(
         self,
         entity_id: str,
