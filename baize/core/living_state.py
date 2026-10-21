@@ -43,6 +43,7 @@ class LivingStateManager:
         superseded_plan: Optional[str] = None,
         killed_reason: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        commit: bool = True,
     ) -> Dict[str, Any]:
         """就地更新定案，并将被取代的方案追加进墓碑区。"""
         cur = self.conn.cursor()
@@ -50,6 +51,7 @@ class LivingStateManager:
 
         tombstones: List[Dict[str, Any]] = current["tombstones"] if current else []
         version = (current["version"] + 1) if current else 1
+        merged_metadata = {**(current["metadata"] if current else {}), **(metadata or {})}
 
         if superseded_plan:
             tombstones.append({
@@ -75,11 +77,12 @@ class LivingStateManager:
                 display_name,
                 version,
                 new_decision,
-                json.dumps(metadata or {}),
+                json.dumps(merged_metadata, ensure_ascii=False),
                 json.dumps(tombstones, ensure_ascii=False),
             )
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return self.get_state(entity_id) or {}
 
 

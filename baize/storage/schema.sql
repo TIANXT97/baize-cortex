@@ -67,7 +67,8 @@ CREATE INDEX IF NOT EXISTS idx_edges_temporal ON graph_edges(valid_at, invalid_a
 
 -- 核心现役有效子图视图 (Active Subgraph View)
 -- PPR 能量游走引擎严格只对本视图进行遍历，彻底屏蔽已作废历史边
-CREATE VIEW IF NOT EXISTS v_active_graph_edges AS
+DROP VIEW IF EXISTS v_active_graph_edges;
+CREATE VIEW v_active_graph_edges AS
 SELECT edge_id, src_id, dst_id, rel_type, weight, valid_at
 FROM graph_edges
-WHERE invalid_at IS NULL;
+WHERE invalid_at IS NULL AND valid_at <= datetime('now');

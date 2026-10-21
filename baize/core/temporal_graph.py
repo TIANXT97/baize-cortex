@@ -12,7 +12,14 @@ class BiTemporalGraphManager:
     def __init__(self, db_conn: sqlite3.Connection):
         self.conn = db_conn
 
-    def upsert_node(self, node_id: str, label: str, node_type: str, properties: Optional[Dict[str, Any]] = None):
+    def upsert_node(
+        self,
+        node_id: str,
+        label: str,
+        node_type: str,
+        properties: Optional[Dict[str, Any]] = None,
+        commit: bool = True,
+    ):
         """插入或更新实体节点。"""
         cur = self.conn.cursor()
         cur.execute(
@@ -26,7 +33,8 @@ class BiTemporalGraphManager:
             """,
             (node_id, label, node_type, json.dumps(properties or {}))
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def add_edge(
         self,
@@ -35,7 +43,8 @@ class BiTemporalGraphManager:
         rel_type: str,
         valid_at: str,
         weight: float = 1.0,
-        invalid_at: Optional[str] = None
+        invalid_at: Optional[str] = None,
+        commit: bool = True,
     ):
         """添加带时态区间的关系边。"""
         cur = self.conn.cursor()
@@ -46,9 +55,17 @@ class BiTemporalGraphManager:
             """,
             (src_id, dst_id, rel_type, weight, valid_at, invalid_at)
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
-    def invalidate_edge(self, src_id: str, dst_id: str, rel_type: str, invalid_at_time: str):
+    def invalidate_edge(
+        self,
+        src_id: str,
+        dst_id: str,
+        rel_type: str,
+        invalid_at_time: str,
+        commit: bool = True,
+    ):
         """将某条关系边标记为失效（宣告旧事实退役）。"""
         cur = self.conn.cursor()
         cur.execute(
@@ -59,7 +76,8 @@ class BiTemporalGraphManager:
             """,
             (invalid_at_time, src_id, dst_id, rel_type)
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def get_active_subgraph(self) -> List[Tuple[str, str, float]]:
         """导出当前有效子图（只包含 invalid_at IS NULL 的现役边），专供 PPR 游走。"""

@@ -15,6 +15,7 @@ from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import ScratchpadManager
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.core.seeds import seed_initial_assets
+from baize.intelligence.phase_detector import OpenAICompatClient, PhaseDetector, llm_settings_from_env
 from baize.intelligence.ppr_engine import PPREngine
 from baize.intelligence.recall_router import CognitiveRecallRouter
 from baize.storage.db import init_db
@@ -87,7 +88,13 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         app.state.scratchpad = ScratchpadManager(conn)
         app.state.living = LivingStateManager(conn)
         app.state.graph = BiTemporalGraphManager(conn)
-        app.state.consolidator = DreamConsolidator(conn, archive_dir=archive_dir)
+        settings = llm_settings_from_env()
+        llm_client = None
+        if settings is not None:
+            url, key, _, reasoning_model = settings
+            llm_client = OpenAICompatClient(url, key, reasoning_model)
+        app.state.detector = PhaseDetector.from_env()
+        app.state.consolidator = DreamConsolidator(conn, archive_dir=archive_dir, llm_client=llm_client)
         app.state.router = CognitiveRecallRouter(conn, ppr)
         try:
             yield
