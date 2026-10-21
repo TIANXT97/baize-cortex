@@ -1,13 +1,15 @@
 """Layer 3: 慢波合成睡眠引擎 (Dream Consolidation)
 
-夜间折叠相变候选、就地固化活体卡、切断旧图谱边,并将热草稿无损冷归档。
+两段式执行:只读分析 -> 先归档落盘 -> 单一短事务回写卡片与图谱并清退已折叠草稿。
 """
 import argparse
 import gzip
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,8 +19,31 @@ from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.storage.db import init_db
 
 _ENTITY_RE = re.compile(r"(proj:[\w\-]+)")
-_DECISION_RE = re.compile(r"(?:定案|改为|敲定)[:：]?\s*(.+)")
-_SUPERSEDE_RE = re.compile(r"(?:推翻|废弃|取代)[:：]?\s*(.+?)(?:[，,。；;]|$)|(.+?)\s*(?:推翻|废弃|取代)")
+_DECISION_RE = re.compile(r"(?:定案|改为|敲定)[::]?\s*(.+)")
+_SUPERSEDE_RE = re.compile(r"(?:推翻|废弃|取代)[::]?\s*(.+?)(?:[,,。;;]|$)|(.+?)\s*(?:推翻|废弃|取代)")
+_EXPLORATION_RE = re.compile(r"假设|如果|要不|探讨|尚未批准|[?？]|呢$")
+
+
+def _is_authoritative(log: Dict[str, Any]) -> bool:
+    return (
+        log["role"] == "user"
+        and log["phase_hint"] == "approval"
+        and not _EXPLORATION_RE.search(log["raw_text"])
+    )
+
+
+def _plan_node_id(entity_id: str, decision: str) -> str:
+    digest = hashlib.sha1(f"{entity_id}|{decision}".encode("utf-8")).hexdigest()[:12]
+    return f"plan:{digest}"
+
+
+def _open_unique_archive(archive_dir: str, stamp: str) -> Tuple[str, Any]:
+    while True:
+        path = os.path.join(archive_dir, f"scratchpad_{stamp}_{int(time.time() * 1000)}.jsonl.gz")
+        try:
+            return path, open(path, "xb")
+        except FileExistsError:
+            continue
 
 
 class DreamConsolidator:
@@ -37,48 +62,48 @@ class DreamConsolidator:
 
     def run_consolidation(self, target_date: Optional[str] = None) -> Dict[str, Any]:
         phase_logs = self.scratchpad.export_pending_phase_logs(target_date)
-        updated_states = self._fold_phases(phase_logs)
-        archive_file, archived = self._archive_and_purge(target_date)
+        plans = self._analyze(phase_logs)
+        folded = [log for plan in plans for log in plan["logs"]]
+        if not folded:
+            return {"status": "ok", "archived_logs": 0, "updated_states": [], "archive_file": None}
+        archive_file = self._archive(folded, target_date)
+        updated_states = self._apply(plans)
         return {
             "status": "ok",
-            "archived_logs": archived,
+            "archived_logs": len(folded),
             "updated_states": updated_states,
             "archive_file": archive_file,
         }
 
-    def _fold_phases(self, phase_logs: List[Dict[str, Any]]) -> List[str]:
+    def _analyze(self, phase_logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for log in phase_logs:
             entity = self._extract_entity(log["raw_text"])
             if entity:
                 groups[entity].append(log)
 
-        updated: List[str] = []
+        plans: List[Dict[str, Any]] = []
         for entity_id, logs in groups.items():
             decision, superseded = self._consolidate_group(logs)
-            if not decision:
-                continue
-            current = self.living.get_state(entity_id)
-            display = current["display_name"] if current else entity_id
-            self.living.update_decision(
-                entity_id,
-                display,
-                decision,
-                superseded_plan=superseded,
-                killed_reason="睡眠合成:被新定案取代" if superseded else None,
-            )
-            if superseded:
-                self._retire_plan_edges(entity_id, superseded)
-            updated.append(entity_id)
-        return updated
+            if decision:
+                plans.append({
+                    "entity_id": entity_id,
+                    "decision": decision,
+                    "superseded": superseded,
+                    "logs": logs,
+                })
+        return plans
 
     def _consolidate_group(self, logs: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+        if not any(_is_authoritative(log) for log in logs):
+            return None, None
+        user_logs = [log for log in logs if log["role"] == "user"]
         if self.llm_client is not None:
             try:
-                return self._consolidate_with_llm(logs)
+                return self._consolidate_with_llm(user_logs)
             except Exception:
                 pass
-        return self._consolidate_by_rules(logs)
+        return self._consolidate_by_rules(user_logs)
 
     def _consolidate_with_llm(self, logs: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
         transcript = "\n".join(log["raw_text"] for log in logs)
@@ -94,69 +119,95 @@ class DreamConsolidator:
         superseded = None
         for log in logs:
             text = log["raw_text"]
-            m = _DECISION_RE.search(text)
-            if m:
-                decision = m.group(1).strip()
-            s = _SUPERSEDE_RE.search(text)
-            if s:
-                superseded = (s.group(1) or s.group(2)).strip()
+            if _is_authoritative(log):
+                m = _DECISION_RE.search(text)
+                if m:
+                    decision = m.group(1).strip()
+            if log["phase_hint"] == "rejection":
+                s = _SUPERSEDE_RE.search(text)
+                if s:
+                    superseded = (s.group(1) or s.group(2)).strip()
         return decision, superseded
 
     def _extract_entity(self, text: str) -> Optional[str]:
         m = _ENTITY_RE.search(text)
         return m.group(1) if m else None
 
-    def _retire_plan_edges(self, entity_id: str, superseded_plan: str) -> None:
+    def _archive(self, logs: List[Dict[str, Any]], target_date: Optional[str]) -> str:
+        os.makedirs(self.archive_dir, exist_ok=True)
+        path, raw = _open_unique_archive(self.archive_dir, target_date or "all")
+        with raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb") as gz:
+                for log in logs:
+                    line = json.dumps({
+                        "id": log["id"], "session_id": log["session_id"], "role": log["role"],
+                        "raw_text": log["raw_text"], "phase_hint": log["phase_hint"],
+                        "noul_score": log["noul_score"], "created_at": log["created_at"],
+                    }, ensure_ascii=False) + "\n"
+                    gz.write(line.encode("utf-8"))
+            raw.flush()
+            os.fsync(raw.fileno())
+        return path
+
+    def _apply(self, plans: List[Dict[str, Any]]) -> List[str]:
+        updated: List[str] = []
         now = self._now()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for plan in plans:
+                entity_id = plan["entity_id"]
+                decision = plan["decision"]
+                current = self.living.get_state(entity_id)
+                display = current["display_name"] if current else entity_id
+                plan_id = _plan_node_id(entity_id, decision)
+
+                self.graph.upsert_node(entity_id, display, "project", commit=False)
+                self.graph.upsert_node(plan_id, decision, "rule", commit=False)
+                self._retire_plan_edges(entity_id, plan_id, now)
+                self.living.update_decision(
+                    entity_id,
+                    display,
+                    decision,
+                    superseded_plan=plan["superseded"],
+                    killed_reason="睡眠合成:被新定案取代" if plan["superseded"] else None,
+                    commit=False,
+                )
+                if not self._has_active_decision_edge(entity_id, plan_id):
+                    self.graph.add_edge(entity_id, plan_id, "decided_as", valid_at=now, commit=False)
+                updated.append(entity_id)
+
+            folded_ids = [log["id"] for plan in plans for log in plan["logs"]]
+            placeholders = ",".join("?" * len(folded_ids))
+            self.conn.execute(f"DELETE FROM scratchpad_log WHERE id IN ({placeholders})", folded_ids)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return updated
+
+    def _retire_plan_edges(self, entity_id: str, new_plan_id: str, now: str) -> None:
         rows = self.conn.execute(
             """
-            SELECT src_id, dst_id, rel_type FROM v_active_graph_edges
-            WHERE src_id = ? OR dst_id = ?
+            SELECT dst_id FROM v_active_graph_edges
+            WHERE src_id = ? AND rel_type = 'decided_as' AND dst_id != ?
             """,
-            (entity_id, entity_id),
+            (entity_id, new_plan_id),
         ).fetchall()
-        for src, dst, rel in rows:
-            other = dst if src == entity_id else src
-            if superseded_plan in other:
-                self.graph.invalidate_edge(src, dst, rel, now)
+        for (dst,) in rows:
+            self.graph.invalidate_edge(entity_id, dst, "decided_as", now, commit=False)
+
+    def _has_active_decision_edge(self, entity_id: str, plan_id: str) -> bool:
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM v_active_graph_edges
+            WHERE src_id = ? AND dst_id = ? AND rel_type = 'decided_as' LIMIT 1
+            """,
+            (entity_id, plan_id),
+        ).fetchone()
+        return row is not None
 
     def _now(self) -> str:
         return self.conn.execute("SELECT strftime('%Y-%m-%d %H:%M:%S', 'now')").fetchone()[0]
-
-    def _archive_and_purge(self, target_date: Optional[str]) -> Tuple[Optional[str], int]:
-        if target_date:
-            rows = self.conn.execute(
-                """
-                SELECT id, session_id, role, raw_text, phase_hint, noul_score, created_at
-                FROM scratchpad_log WHERE date(created_at) = ? ORDER BY id
-                """,
-                (target_date,),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                """
-                SELECT id, session_id, role, raw_text, phase_hint, noul_score, created_at
-                FROM scratchpad_log ORDER BY id
-                """
-            ).fetchall()
-        if not rows:
-            return None, 0
-
-        os.makedirs(self.archive_dir, exist_ok=True)
-        stamp = target_date or "all"
-        path = os.path.join(self.archive_dir, f"scratchpad_{stamp}.jsonl.gz")
-        with gzip.open(path, "wt", encoding="utf-8") as fh:
-            for r in rows:
-                fh.write(json.dumps({
-                    "id": r[0], "session_id": r[1], "role": r[2], "raw_text": r[3],
-                    "phase_hint": r[4], "noul_score": r[5], "created_at": r[6],
-                }, ensure_ascii=False) + "\n")
-
-        ids = [r[0] for r in rows]
-        placeholders = ",".join("?" * len(ids))
-        self.conn.execute(f"DELETE FROM scratchpad_log WHERE id IN ({placeholders})", ids)
-        self.conn.commit()
-        return path, len(ids)
 
 
 def main() -> None:

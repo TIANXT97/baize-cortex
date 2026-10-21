@@ -27,7 +27,7 @@ def _seed(conn):
     for i in range(5):
         sp.append_log("day", "user", f"排障碎屑 {i}")
     sp.append_log("day", "user", "proj:glass_mold 旧方案 人肉拆图 推翻", phase_hint="rejection")
-    sp.append_log("day", "assistant", "proj:glass_mold 定案:飞桨切片", phase_hint="approval")
+    sp.append_log("day", "user", "proj:glass_mold 定案:飞桨切片", phase_hint="approval")
     return sp
 
 
@@ -46,22 +46,25 @@ def test_consolidation_archives_losslessly_and_updates_state():
             report = DreamConsolidator(conn, archive_dir=archive_dir).run_consolidation()
 
             assert report["status"] == "ok"
-            assert report["archived_logs"] == len(original_texts)
+            folded_texts = [t for t in original_texts if "proj:glass_mold" in t]
+            assert report["archived_logs"] == len(folded_texts) == 2
             assert "proj:glass_mold" in report["updated_states"]
-            assert conn.execute("SELECT COUNT(*) FROM scratchpad_log").fetchone()[0] == 0
+            remaining = _raw_rows(conn)
+            assert len(remaining) == len(original_texts) - len(folded_texts)
 
             path = report["archive_file"]
             assert os.path.exists(path) and path.endswith(".jsonl.gz")
             with gzip.open(path, "rt", encoding="utf-8") as fh:
                 restored = [json.loads(line)["raw_text"] for line in fh if line.strip()]
-            assert restored == original_texts
+            assert restored == folded_texts
 
             state = LivingStateManager(conn).get_state("proj:glass_mold")
             assert state["current_decision"] == "飞桨切片"
             assert any("人肉拆图" in t["plan"] for t in state["tombstones"])
 
             active = BiTemporalGraphManager(conn).get_active_subgraph()
-            assert ("proj:glass_mold", "plan:manual", "decided_as") not in active
+            assert not any(s == "proj:glass_mold" and d == "plan:manual" for s, d, _ in active)
+            assert any(s == "proj:glass_mold" and d.startswith("plan:") and d != "plan:manual" for s, d, _ in active)
         finally:
             conn.close()
 
