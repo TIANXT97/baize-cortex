@@ -123,3 +123,13 @@ def test_api_end_to_end():
             "baize_scratchpad_log", "baize_get_living_state", "baize_decision", "baize_recall_ppr",
         }
         app.state.conn.close()
+
+
+if __name__ == "__main__":
+    test_init_db_memory_and_file()
+    test_scratchpad_concurrent_writes_do_not_touch_main_tables()
+    test_scratchpad_phase_export()
+    test_living_state_supersede_keeps_tombstone()
+    test_living_state_malformed_json_falls_back()
+    test_api_end_to_end()
+    print("✅ Phase 1 MVP 集成测试全部通过")
