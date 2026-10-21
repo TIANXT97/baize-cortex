@@ -84,18 +84,25 @@ baize-cortex/
 │   ├── core/                  # 核心引擎层
 │   │   ├── living_state.py    # Layer 1: 项目活体状态卡管理器
 │   │   ├── temporal_graph.py  # Layer 2: 双时态图谱与有效子图切片
-│   │   ├── scratchpad.py      # Layer 0: 瞬态草稿流与冷归档
-│   │   └── consolidator.py    # Layer 3: 夜间慢波睡眠合成引擎
-│   ├── intelligence/          # 认知双系统
+│   │   ├── scratchpad.py      # Layer 0: 瞬态草稿流
+│   │   ├── consolidator.py    # Layer 3: 夜间慢波睡眠合成引擎
+│   │   └── seeds.py           # 核心工程资产预置
+│   ├── intelligence/          # 认知双系统与召回
 │   │   ├── phase_detector.py  # System 1: 毫秒级相变探测器 (Drex-Max)
-│   │   └── ppr_engine.py      # 吸引子能量扩散检索引擎 (Personalized PageRank)
+│   │   ├── ppr_engine.py      # 吸引子能量扩散检索引擎 (Personalized PageRank)
+│   │   └── recall_router.py   # 统一认知召回路由 (活体卡直达 / PPR 游走)
 │   ├── storage/               # 存储底座 (SQLite WAL)
 │   │   ├── schema.sql         # 四层正交物理数据库 Schema
-│   │   └── db.py              # 连接池与原子事务
+│   │   └── db.py              # 连接与 PRAGMA 初始化
 │   └── server/                # 服务接入 (FastAPI + MCP)
-│       └── app.py
+│       ├── app.py             # REST 端点
+│       └── mcp_server.py      # MCP stdio 服务 (JSON-RPC 2.0)
 ├── tests/                     # 验证套件
-│   └── test_bitemporal.py     # 双时态一致性测试
+│   ├── test_bitemporal.py          # 双时态一致性
+│   ├── test_phase1_mvp.py          # 活体卡与草稿流 MVP
+│   ├── test_phase2_mcp_graph.py    # 图谱、PhaseDetector、MCP 协议
+│   ├── test_phase3_consolidation.py # 慢波合成与冷归档
+│   └── test_phase4_recall_router.py # 认知召回路由与端到端
 ├── README.md
 ├── LICENSE
 └── requirements.txt
@@ -105,11 +112,12 @@ baize-cortex/
 
 ## 🗺️ 演进路线图 (Roadmap)
 
-- [ ] **Phase 0: 规范奠基** —— 完成架构白皮书、同行评审归档与 Schema 冻结（当前阶段）
-- [ ] **Phase 1: 活体状态单卡 (MVP)** —— 建立 Living State 引擎，实现核心项目 100% 秒回与墓碑隔离
-- [ ] **Phase 2: 双时态图谱与 PPR 扩散** —— 实现有效子图切片、能量扩散检索与 Drex-Max 瞬时相变嗅探
-- [ ] **Phase 3: 慢波睡眠回放** —— 实现自动昼夜节律、草稿冷归档与长周期抗膨胀自愈
-- [ ] **Phase 4: 全量平滑割接** —— 现役 baize 资产迁移与生产上线
+- [x] **Phase 0: 规范奠基** —— 完成架构白皮书、同行评审归档与 Schema 冻结
+- [x] **Phase 1: 活体状态单卡 (MVP)** —— 建立 Living State 引擎,实现核心项目秒回与墓碑隔离
+- [x] **Phase 2: 双时态图谱与 PPR 扩散** —— 实现有效子图切片、PPR 能量扩散、PhaseDetector 相变嗅探与 MCP stdio 服务
+- [x] **Phase 3: 慢波睡眠回放** —— 实现慢波合成引擎、规则降级、无损 gzip 冷归档与热表清退
+- [x] **Phase 4: 认知召回中枢** —— 实现 `CognitiveRecallRouter`(活体卡直达 / PPR 游走)、核心工程资产预置、`POST /v1/recall` 与 MCP `baize_recall`
+- [ ] **Phase 5: 全量平滑割接** —— 现役 baize 资产迁移与生产上线
 
 ---
 
