@@ -14,7 +14,9 @@ from baize.core.consolidator import DreamConsolidator
 from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import ScratchpadManager
 from baize.core.temporal_graph import BiTemporalGraphManager
+from baize.core.seeds import seed_initial_assets
 from baize.intelligence.ppr_engine import PPREngine
+from baize.intelligence.recall_router import CognitiveRecallRouter
 from baize.storage.db import init_db
 
 VERSION = "2.0.0-alpha"
@@ -69,6 +71,11 @@ class SleepIn(BaseModel):
     dry_run: bool = False
 
 
+class RecallIn(BaseModel):
+    query: str
+    top_k: int = 5
+
+
 def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> FastAPI:
     lock = threading.Lock()
     ppr = PPREngine()
@@ -81,6 +88,7 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         app.state.living = LivingStateManager(conn)
         app.state.graph = BiTemporalGraphManager(conn)
         app.state.consolidator = DreamConsolidator(conn, archive_dir=archive_dir)
+        app.state.router = CognitiveRecallRouter(conn, ppr)
         try:
             yield
         finally:
@@ -180,5 +188,16 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         with lock:
             report = app.state.consolidator.run_consolidation(body.target_date)
         return report
+
+    @app.post("/v1/recall")
+    def recall(body: RecallIn):
+        with lock:
+            return app.state.router.recall(body.query, body.top_k)
+
+    @app.post("/v1/admin/seed")
+    def admin_seed():
+        with lock:
+            seed_initial_assets(app.state.conn)
+        return {"status": "seeded"}
 
     return app
