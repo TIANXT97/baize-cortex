@@ -13,7 +13,7 @@ from baize.intelligence.ppr_engine import PPREngine
 def test_bitemporal_ppr_convergence():
     conn = sqlite3.connect(":memory:")
     # 加载 schema
-    with open("baize/storage/schema.sql") as f:
+    with open("baize/storage/schema.sql", encoding="utf-8") as f:
         conn.executescript(f.read())
 
     mgr = BiTemporalGraphManager(conn)
