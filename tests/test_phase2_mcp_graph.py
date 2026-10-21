@@ -42,7 +42,7 @@ def test_phase_detector_local_fallback():
 
 
 def test_phase_detector_falls_back_when_remote_fails():
-    det = PhaseDetector(api_url="http://127.0.0.1:9/none", api_key="k", timeout=0.5)
+    det = PhaseDetector(drex_url="http://127.0.0.1:9/none", drex_key="k", openjev_url="http://127.0.0.1:9/none", openjev_key="k", timeout=0.5)
     phase, conf, category = det.detect_phase("就这么定")
     assert phase == "decision_approved"
     assert category == "approval"

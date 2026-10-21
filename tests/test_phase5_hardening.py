@@ -121,17 +121,15 @@ def test_busy_timeout_configured():
 
 
 def test_llm_env_settings_and_local_fallback():
-    keys = ("CORTEX_LLM_URL", "CORTEX_LLM_KEY", "CORTEX_DECISION_MODEL", "CORTEX_REASONING_MODEL")
+    keys = ("CORTEX_LLM_URL", "CORTEX_LLM_KEY", "CORTEX_REASONING_MODEL")
     saved = {k: os.environ.pop(k, None) for k in keys}
     try:
         assert llm_settings_from_env() is None
-        assert PhaseDetector.from_env().detect_phase("就这么定")[0] == "decision_approved"
 
         os.environ["CORTEX_LLM_URL"] = "http://127.0.0.1:9/v1/chat/completions"
         os.environ["CORTEX_LLM_KEY"] = "k"
-        url, key, decision_model, reasoning_model = llm_settings_from_env()
-        assert decision_model == reasoning_model == "cbcn/deepseek-v4.1-flash"
-        assert PhaseDetector.from_env().detect_phase("就这么定")[0] == "decision_approved"
+        url, key, reasoning_model = llm_settings_from_env()
+        assert reasoning_model == "cbcn/deepseek-v4.1-flash"
     finally:
         for k in keys:
             os.environ.pop(k, None)
