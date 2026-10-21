@@ -128,7 +128,7 @@ def test_stdio_jsonrpc_protocol():
         names = {t["name"] for t in replies[1]["result"]["tools"]}
         assert names == {
             "baize_get_living_state", "baize_list_active_states", "baize_update_decision",
-            "baize_scratchpad_log", "baize_recall_ppr", "baize_consolidate_sleep",
+            "baize_scratchpad_log", "baize_recall_ppr", "baize_consolidate_sleep", "baize_recall",
         }
         call = json.loads(replies[2]["result"]["content"][0]["text"])
         assert call["current_decision"] == "方案"

@@ -14,6 +14,7 @@ from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import ScratchpadManager
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.intelligence.ppr_engine import PPREngine
+from baize.intelligence.recall_router import CognitiveRecallRouter
 from baize.storage.db import init_db
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -28,6 +29,10 @@ class BaizeTools:
         self.scratchpad = ScratchpadManager(conn)
         self.graph = BiTemporalGraphManager(conn)
         self.ppr = PPREngine()
+        self.router = CognitiveRecallRouter(conn, self.ppr)
+
+    def recall(self, args: Dict[str, Any]):
+        return self.router.recall(args["query"], args.get("top_k", 5))
 
     def get_living_state(self, args: Dict[str, Any]):
         return self.living.get_state(args["entity_id"])
@@ -114,6 +119,14 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             [],
         ),
         "handler": BaizeTools.consolidate_sleep,
+    },
+    "baize_recall": {
+        "description": "统一认知召回:活体卡直达或 PPR 能量游走收敛至现役定案",
+        "inputSchema": _schema(
+            {"query": _STR, "top_k": {"type": "integer"}},
+            ["query"],
+        ),
+        "handler": BaizeTools.recall,
     },
 }
 
