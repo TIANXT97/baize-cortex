@@ -9,6 +9,7 @@ import sqlite3
 import sys
 from typing import Any, Dict, Optional, TextIO
 
+from baize.core.consolidator import DreamConsolidator
 from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import ScratchpadManager
 from baize.core.temporal_graph import BiTemporalGraphManager
@@ -52,6 +53,11 @@ class BaizeTools:
     def recall_ppr(self, args: Dict[str, Any]):
         energy = self.ppr.run_ppr(self.graph.get_active_subgraph(), args["seed_nodes"])
         return [{"node_id": node, "energy": score} for node, score in energy.items()]
+
+    def consolidate_sleep(self, args: Dict[str, Any]):
+        return DreamConsolidator(self.conn, archive_dir=args.get("archive_dir", "cold_archive")).run_consolidation(
+            args.get("target_date")
+        )
 
 
 def _schema(properties: Dict[str, Any], required: list) -> Dict[str, Any]:
@@ -100,6 +106,14 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             ["seed_nodes"],
         ),
         "handler": BaizeTools.recall_ppr,
+    },
+    "baize_consolidate_sleep": {
+        "description": "执行慢波睡眠合成:折叠相变候选、固化活体卡、切断旧图谱边,并冷归档热草稿",
+        "inputSchema": _schema(
+            {"target_date": _STR, "archive_dir": _STR},
+            [],
+        ),
+        "handler": BaizeTools.consolidate_sleep,
     },
 }
 

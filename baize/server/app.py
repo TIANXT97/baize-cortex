@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from baize.core.consolidator import DreamConsolidator
 from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import ScratchpadManager
 from baize.core.temporal_graph import BiTemporalGraphManager
@@ -63,7 +64,12 @@ class GraphInvalidateIn(BaseModel):
     invalid_at: str
 
 
-def create_app(db_path: str = "baize.db") -> FastAPI:
+class SleepIn(BaseModel):
+    target_date: Optional[str] = None
+    dry_run: bool = False
+
+
+def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> FastAPI:
     lock = threading.Lock()
     ppr = PPREngine()
 
@@ -74,6 +80,7 @@ def create_app(db_path: str = "baize.db") -> FastAPI:
         app.state.scratchpad = ScratchpadManager(conn)
         app.state.living = LivingStateManager(conn)
         app.state.graph = BiTemporalGraphManager(conn)
+        app.state.consolidator = DreamConsolidator(conn, archive_dir=archive_dir)
         try:
             yield
         finally:
@@ -165,5 +172,13 @@ def create_app(db_path: str = "baize.db") -> FastAPI:
             edges = app.state.graph.get_active_subgraph()
         energy = ppr.run_ppr(edges, body.seed_nodes)
         return {"ranking": [{"node_id": node, "energy": score} for node, score in energy.items()]}
+
+    @app.post("/v1/sleep/consolidate")
+    def sleep_consolidate(body: SleepIn):
+        if body.dry_run:
+            return {"status": "dry_run", "archived_logs": 0, "updated_states": [], "archive_file": None}
+        with lock:
+            report = app.state.consolidator.run_consolidation(body.target_date)
+        return report
 
     return app
