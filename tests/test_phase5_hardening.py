@@ -49,8 +49,8 @@ def test_unfolded_drafts_survive_archive():
             sp.append_log("s", "user", "proj:b 定案:Y", phase_hint="approval")
             report = DreamConsolidator(conn, archive_dir=os.path.join(d, "a")).run_consolidation()
 
-            assert report["archived_logs"] == 1
-            assert _hot_rows(conn) == ["随手记的排障碎屑", "无实体的定案:X"]
+            assert report["archived_logs"] == 2
+            assert _hot_rows(conn) == ["随手记的排障碎屑"]
         finally:
             conn.close()
 

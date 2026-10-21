@@ -11,7 +11,7 @@ import re
 import sqlite3
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import ScratchpadManager
@@ -24,6 +24,8 @@ _SUPERSEDE_RE = re.compile(r"(?:推翻|废弃|取代)[::]?\s*(.+?)(?:[,,。;;]|$
 _ALIAS_RE = re.compile(r"alias[::]\s*([^\s]+)")
 _ALIAS_SPLIT_RE = re.compile(r"[,,、]")
 _EXPLORATION_RE = re.compile(r"假设|如果|要不|探讨|尚未批准|[?？]|呢$")
+_LEADING_PUNCT = " \t\r\n:："
+_GENERAL_ENTITY = "proj:general_decisions"
 _LLM_SYSTEM_PROMPT = (
     "从对话中提取最终定案 decision、被推翻的方案 superseded、简洁中文名 display_name "
     "与别名数组 aliases,只输出 JSON。"
@@ -39,7 +41,7 @@ def _is_authoritative(log: Dict[str, Any]) -> bool:
 
 
 def _clean_decision(text: Optional[str]) -> Optional[str]:
-    return (text or "").lstrip(":: \t\r\n").strip() or None
+    return (text or "").lstrip(_LEADING_PUNCT).strip() or None
 
 
 def _split_aliases(raw: str) -> List[str]:
@@ -59,9 +61,9 @@ def _plan_node_id(entity_id: str, decision: str) -> str:
     return f"plan:{digest}"
 
 
-def _open_unique_archive(archive_dir: str, stamp: str) -> Any:
+def _open_unique_archive(archive_dir: str, prefix: str) -> Tuple[str, Any]:
     while True:
-        path = os.path.join(archive_dir, f"scratchpad_{stamp}_{int(time.time() * 1000)}.jsonl.gz")
+        path = os.path.join(archive_dir, f"{prefix}_{int(time.time() * 1000)}.jsonl.gz")
         try:
             return path, open(path, "xb")
         except FileExistsError:
@@ -88,7 +90,7 @@ class DreamConsolidator:
         folded = [log for plan in plans for log in plan["logs"]]
         if not folded:
             return {"status": "ok", "archived_logs": 0, "updated_states": [], "archive_file": None}
-        archive_file = self._archive(folded, target_date)
+        archive_file = self._write_archive(folded, f"scratchpad_{target_date or 'all'}")
         updated_states = self._apply(plans)
         return {
             "status": "ok",
@@ -97,10 +99,64 @@ class DreamConsolidator:
             "archive_file": archive_file,
         }
 
+    def purge_scratchpad(
+        self,
+        before_id: Optional[int] = None,
+        role: Optional[str] = None,
+        dry_run: bool = True,
+    ) -> Dict[str, Any]:
+        rows = self.scratchpad.find_for_purge(before_id, role)
+        report: Dict[str, Any] = {
+            "dry_run": dry_run,
+            "matched": len(rows),
+            "sample": [
+                {"id": r["id"], "role": r["role"], "raw_text": r["raw_text"][:60]} for r in rows[:10]
+            ],
+            "archive_file": None,
+            "purged": 0,
+        }
+        if dry_run or not rows:
+            return report
+        report["archive_file"] = self._write_archive(rows, "purged")
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(f"DELETE FROM scratchpad_log WHERE id IN ({placeholders})", ids)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        report["purged"] = len(ids)
+        return report
+
+    def backfill_display_names(self, dry_run: bool = True) -> List[Dict[str, str]]:
+        changes = []
+        for state in self.living.list_active_states():
+            if state["display_name"] != state["entity_id"]:
+                continue
+            aliases = state["metadata"].get("aliases", [])
+            if not aliases:
+                continue
+            changes.append({
+                "entity_id": state["entity_id"],
+                "old_display_name": state["display_name"],
+                "new_display_name": aliases[0],
+            })
+        if not dry_run:
+            for change in changes:
+                self.living.rename_display(change["entity_id"], change["new_display_name"])
+        return changes
+
     def _analyze(self, phase_logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        last_entity: Dict[str, str] = {}
         for log in phase_logs:
             entity = self._extract_entity(log["raw_text"])
+            if entity:
+                last_entity[log["session_id"]] = entity
+            elif _is_authoritative(log):
+                entity = last_entity.get(log["session_id"]) or self._recent_entity() or _GENERAL_ENTITY
             if entity:
                 groups[entity].append(log)
 
@@ -110,6 +166,16 @@ class DreamConsolidator:
             if extracted and extracted["decision"]:
                 plans.append({"entity_id": entity_id, "logs": logs, **extracted})
         return plans
+
+    def _recent_entity(self) -> Optional[str]:
+        row = self.conn.execute(
+            """
+            SELECT entity_id FROM living_states
+            WHERE status = 'ACTIVE' AND updated_at >= datetime('now', '-30 minutes')
+            ORDER BY updated_at DESC LIMIT 1
+            """
+        ).fetchone()
+        return row[0] if row else None
 
     def _consolidate_group(self, logs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not any(_is_authoritative(log) for log in logs):
@@ -156,9 +222,9 @@ class DreamConsolidator:
         m = _ENTITY_RE.search(text)
         return m.group(1) if m else None
 
-    def _archive(self, logs: List[Dict[str, Any]], target_date: Optional[str]) -> str:
+    def _write_archive(self, logs: List[Dict[str, Any]], prefix: str) -> str:
         os.makedirs(self.archive_dir, exist_ok=True)
-        path, raw = _open_unique_archive(self.archive_dir, target_date or "all")
+        path, raw = _open_unique_archive(self.archive_dir, prefix)
         with raw:
             with gzip.GzipFile(fileobj=raw, mode="wb") as gz:
                 for log in logs:
@@ -181,7 +247,7 @@ class DreamConsolidator:
                 entity_id = plan["entity_id"]
                 decision = plan["decision"]
                 current = self.living.get_state(entity_id)
-                display = plan["display_name"] or (current["display_name"] if current else entity_id)
+                display = self.living.resolve_display_name(entity_id, plan["display_name"])
                 existing_aliases = current["metadata"].get("aliases", []) if current else []
                 aliases = _union(existing_aliases, plan["aliases"])
                 plan_id = _plan_node_id(entity_id, decision)
