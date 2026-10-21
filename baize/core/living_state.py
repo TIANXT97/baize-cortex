@@ -13,29 +13,27 @@ class LivingStateManager:
         self.conn = db_conn
 
     def get_state(self, entity_id: str) -> Optional[Dict[str, Any]]:
-        """获取指定实体的现役活体状态卡（O(1) 主键直达）。"""
-        cur = self.conn.cursor()
-        cur.execute(
+        """获取指定实体的现役活体状态卡(O(1) 主键直达)。"""
+        row = self.conn.execute(
             """
             SELECT entity_id, display_name, version, status, current_decision, metadata_json, tombstones_json, updated_at
             FROM living_states
             WHERE entity_id = ?
             """,
             (entity_id,)
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "entity_id": row[0],
-            "display_name": row[1],
-            "version": row[2],
-            "status": row[3],
-            "current_decision": row[4],
-            "metadata": json.loads(row[5] or "{}"),
-            "tombstones": json.loads(row[6] or "[]"),
-            "updated_at": row[7],
-        }
+        ).fetchone()
+        return _row_to_state(row) if row else None
+
+    def list_active_states(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT entity_id, display_name, version, status, current_decision, metadata_json, tombstones_json, updated_at
+            FROM living_states
+            WHERE status = 'ACTIVE'
+            ORDER BY entity_id
+            """
+        ).fetchall()
+        return [_row_to_state(r) for r in rows]
 
     def update_decision(
         self,
@@ -83,3 +81,24 @@ class LivingStateManager:
         )
         self.conn.commit()
         return self.get_state(entity_id) or {}
+
+
+def _load_json(raw: Optional[str], fallback: Any) -> Any:
+    try:
+        value = json.loads(raw or "")
+    except (TypeError, ValueError):
+        return fallback
+    return value if isinstance(value, type(fallback)) else fallback
+
+
+def _row_to_state(row) -> Dict[str, Any]:
+    return {
+        "entity_id": row[0],
+        "display_name": row[1],
+        "version": row[2],
+        "status": row[3],
+        "current_decision": row[4],
+        "metadata": _load_json(row[5], {}),
+        "tombstones": _load_json(row[6], []),
+        "updated_at": row[7],
+    }
