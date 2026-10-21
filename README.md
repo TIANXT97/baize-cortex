@@ -1,4 +1,4 @@
-# 🏛️ 白泽·皮层 (Bai Ze Cortex)
+# 🏛️ 白泽·Cortex (Bai Ze Cortex)
 
 > **工程命名**：`baize-cortex`  
 > **代号**：`Baize-Phoenix`（白泽·涅槃）  
@@ -14,7 +14,7 @@
 3. **门控机械误杀**：死板规则将合法短查询吞噬；
 4. **单步向量缺乏深度联想**：无法完成人脑式的“模式补全（Pattern Completion）”与情境还原。
 
-**白泽·皮层（baize-cortex）彻底摆脱“字典式记录”，转向“仿生认知中枢”**。借鉴现代计算神经科学（全息脑理论、海马-新皮层双阶段收敛、慢波睡眠突触修剪）与 2025~2026 年顶尖学术前沿（HippoRAG 2、Graphiti、MOSAIC、RaMem），构建一套具备**抗漂移、自愈合、永不膨胀**的下一代认知底座。
+**白泽·Cortex（baize-cortex）彻底摆脱“字典式记录”，转向“仿生认知中枢”**。借鉴现代计算神经科学（全息脑理论、海马-新皮层双阶段收敛、慢波睡眠突触修剪）与 2025~2026 年顶尖学术前沿（HippoRAG 2、Graphiti、MOSAIC、RaMem），构建一套具备**抗漂移、自愈合、永不膨胀**的下一代认知底座。
 
 ---
 
@@ -77,7 +77,7 @@
 ```text
 baize-cortex/
 ├── docs/                      # 架构规范与理论文献
-│   ├── ARCHITECTURE.md        # 白泽·皮层 完整架构设计白皮书
+│   ├── ARCHITECTURE.md        # 白泽·Cortex 完整架构设计白皮书
 │   └── PEER_REVIEWS.md        # Kimi-k3 / GLM-5.3 / Claude Haiku 同行评审报告实录
 ├── baize/                     # 核心源码骨架
 │   ├── __init__.py
