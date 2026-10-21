@@ -29,24 +29,37 @@ def test_init_db_memory_and_file():
 
 
 def test_scratchpad_concurrent_writes_do_not_touch_main_tables():
-    conn = init_db(":memory:")
-    sp = ScratchpadManager(conn)
-    lock = threading.Lock()
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "concurrent.db")
+        init_db(path).close()
 
-    def writer(i):
-        for j in range(50):
-            with lock:
-                sp.append_log(f"s{i}", "user", f"ping {j}")
+        errors = []
 
-    threads = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+        def writer(i):
+            try:
+                conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+                sp = ScratchpadManager(conn)
+                for j in range(50):
+                    sp.append_log(f"s{i}", "user", f"ping {j}")
+                conn.close()
+            except Exception as exc:
+                errors.append(exc)
 
-    assert len(sp.get_session_logs("s0", limit=1000)) == 50
-    assert conn.execute("SELECT COUNT(*) FROM living_states").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0] == 0
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        check = init_db(path)
+        sp = ScratchpadManager(check)
+        for i in range(8):
+            assert len(sp.get_session_logs(f"s{i}", limit=1000)) == 50
+        assert check.execute("SELECT COUNT(*) FROM scratchpad_log").fetchone()[0] == 400
+        assert check.execute("SELECT COUNT(*) FROM living_states").fetchone()[0] == 0
+        assert check.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0] == 0
+        check.close()
 
 
 def test_scratchpad_phase_export():
