@@ -86,6 +86,8 @@ baize-cortex/
 │   │   ├── temporal_graph.py  # Layer 2: 双时态图谱与有效子图切片
 │   │   ├── scratchpad.py      # Layer 0: 瞬态草稿流
 │   │   ├── consolidator.py    # Layer 3: 夜间慢波睡眠合成引擎
+│   │   ├── normalization.py   # 内容规范化与幂等键 (客户端/服务端共用)
+│   │   ├── supersession.py    # supersedes_id 校验与旧记录失效
 │   │   └── seeds.py           # 核心工程资产预置
 │   ├── intelligence/          # 认知双系统与召回
 │   │   ├── phase_detector.py  # System 1: 毫秒级相变探测器 (Drex-Max)
@@ -93,7 +95,12 @@ baize-cortex/
 │   │   └── recall_router.py   # 统一认知召回路由 (活体卡直达 / PPR 游走)
 │   ├── storage/               # 存储底座 (SQLite WAL)
 │   │   ├── schema.sql         # 四层正交物理数据库 Schema
+│   │   ├── migrations.py      # Phase A 增量迁移 (可重复执行、迁移前备份)
 │   │   └── db.py              # 连接与 PRAGMA 初始化
+│   ├── client/                # cortex 插件参考实现 (纯标准库)
+│   │   ├── outbox.py          # 可靠 Outbox 投递层
+│   │   ├── plugin.py          # cortex_add 与 on_memory_write 镜像钩子
+│   │   └── breaker.py         # 错误签名归一化与熔断
 │   └── server/                # 服务接入 (FastAPI + MCP)
 │       ├── app.py             # REST 端点
 │       └── mcp_server.py      # MCP stdio 服务 (JSON-RPC 2.0)
@@ -102,7 +109,9 @@ baize-cortex/
 │   ├── test_phase1_mvp.py          # 活体卡与草稿流 MVP
 │   ├── test_phase2_mcp_graph.py    # 图谱、PhaseDetector、MCP 协议
 │   ├── test_phase3_consolidation.py # 慢波合成与冷归档
-│   └── test_phase4_recall_router.py # 认知召回路由与端到端
+│   ├── test_phase4_recall_router.py # 认知召回路由与端到端
+│   ├── test_phase_a_*.py           # Phase A: 迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断
+│   └── fixtures/normalization_vectors.json # 规范化 golden vectors
 ├── README.md
 ├── LICENSE
 └── requirements.txt
@@ -118,6 +127,7 @@ baize-cortex/
 - [x] **Phase 3: 慢波睡眠回放** —— 实现慢波合成引擎、规则降级、无损 gzip 冷归档与热表清退
 - [x] **Phase 4: 认知召回中枢** —— 实现 `CognitiveRecallRouter`(活体卡直达 / PPR 游走)、核心工程资产预置、`POST /v1/recall` 与 MCP `baize_recall`
 - [x] **Phase 5: 承重架构加固与生产可靠性** —— 修复 F1~F9 核心承重墙（唯一归档防覆盖、授权批准门、图文双写同步、双时态生效断言），实现 System 1 & System 2 真实模型接入与 Hermes 插件契约贯通
+- [x] **Phase A: 记忆外溢通道与可靠投递** —— Schema 增量迁移、`POST /v1/cortex/add` 幂等写入、Outbox 投递、memory 镜像钩子与错误签名熔断
 - [ ] **Phase 6: 全量生产平滑割接** —— 现役存量数据提纯与全场景持续演化
 
 ---

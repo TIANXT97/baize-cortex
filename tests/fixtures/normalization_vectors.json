@@ -1,0 +1,8 @@
+[
+  {"session_id": "s1", "content": "hello world", "normalized": "hello world", "key": "277a57f6c3c29cec6407838939ec76b0"},
+  {"session_id": "s1", "content": "  hello   world \n", "normalized": "hello world", "key": "277a57f6c3c29cec6407838939ec76b0"},
+  {"session_id": "s1", "content": "ＨＥＬＬＯ　ｗｏｒｌｄ", "normalized": "HELLO world", "key": "8963956767d52275b790216b1a65981c"},
+  {"session_id": "s2", "content": "hello world", "normalized": "hello world", "key": "9b51bb3583524e11a31c6112c7147921"},
+  {"session_id": "s1", "content": "记忆写满了\t请改用  cortex_add", "normalized": "记忆写满了 请改用 cortex_add", "key": "7eb2fad480c7bc6f6ec15e74ee941624"},
+  {"session_id": "s1", "content": "①②③ ﬁne", "normalized": "123 fine", "key": "f5e882c7a95d94fd68c1f660f46d0a3f"}
+]
