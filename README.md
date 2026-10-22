@@ -78,6 +78,7 @@
 baize-cortex/
 ├── docs/                      # 架构规范与理论文献
 │   ├── ARCHITECTURE.md        # 白泽·Cortex 完整架构设计白皮书
+│   ├── CHANGELOG.md           # 按 PR 记录的变更日志
 │   └── PEER_REVIEWS.md        # 三方异构红蓝军同行评审报告实录
 ├── baize/                     # 核心源码骨架
 │   ├── __init__.py
@@ -110,6 +111,10 @@ baize-cortex/
 │   ├── test_phase2_mcp_graph.py    # 图谱、PhaseDetector、MCP 协议
 │   ├── test_phase3_consolidation.py # 慢波合成与冷归档
 │   ├── test_phase4_recall_router.py # 认知召回路由与端到端
+│   ├── test_phase5_hardening.py    # Phase 5: 承重加固与模型接入回退
+│   ├── test_phase6_semantic_alias.py # Phase 6: 别名提纯与语义召回
+│   ├── test_phase7_systemone_gates.py # Phase 7: SystemOne 双门神
+│   ├── test_phase8_consolidation_closure.py # Phase 8: 慢波合成收口与管理接口
 │   ├── test_phase_a_*.py           # Phase A: 迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断
 │   └── fixtures/normalization_vectors.json # 规范化 golden vectors
 ├── README.md
@@ -127,8 +132,11 @@ baize-cortex/
 - [x] **Phase 3: 慢波睡眠回放** —— 实现慢波合成引擎、规则降级、无损 gzip 冷归档与热表清退
 - [x] **Phase 4: 认知召回中枢** —— 实现 `CognitiveRecallRouter`(活体卡直达 / PPR 游走)、核心工程资产预置、`POST /v1/recall` 与 MCP `baize_recall`
 - [x] **Phase 5: 承重架构加固与生产可靠性** —— 修复 F1~F9 核心承重墙（唯一归档防覆盖、授权批准门、图文双写同步、双时态生效断言），实现 System 1 & System 2 真实模型接入与 Hermes 插件契约贯通
+- [x] **Phase 6: 别名提纯与语义召回** —— 慢波合成解析 `alias:`、别名并集合并,召回路由支持双向匹配与 `DECISION_TEXT_MATCH` 兜底
+- [x] **Phase 7: System 1 双门神** —— `PhaseDetector` 切换为 Drex-Max / OpenJev 的 SystemOne 协议,全部失败时 Fail-open 降级本地规则
+- [x] **Phase 8: 慢波合成收口** —— 全角冒号清洗、无锚点定案兜底、黑户展示名转正,新增 `backfill-display-names` 与 `purge-scratchpad` 管理接口
 - [x] **Phase A: 记忆外溢通道与可靠投递** —— Schema 增量迁移、`POST /v1/cortex/add` 幂等写入、Outbox 投递、memory 镜像钩子与错误签名熔断
-- [ ] **Phase 6: 全量生产平滑割接** —— 现役存量数据提纯与全场景持续演化
+- [ ] **后续: 全量生产平滑割接** —— 现役存量数据提纯与全场景持续演化(原路线图中的 Phase 6 编号已被别名提纯占用,此项改为不编号待排期)
 
 ---
 
