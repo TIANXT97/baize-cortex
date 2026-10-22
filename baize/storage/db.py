@@ -4,6 +4,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from baize.storage.migrations import migrate_phase_a
+
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
@@ -14,6 +16,7 @@ def init_db(db_path: str = "baize.db") -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA busy_timeout = 30000;")
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    migrate_phase_a(conn)
     return conn
 
 

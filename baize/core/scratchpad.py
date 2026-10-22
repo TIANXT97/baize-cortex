@@ -1,6 +1,11 @@
 """Layer 0: 瞬态草稿流管理器"""
 import sqlite3
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class ScratchpadManager:
@@ -14,15 +19,49 @@ class ScratchpadManager:
         raw_text: str,
         phase_hint: Optional[str] = None,
         noul_score: float = 0.0,
+        idempotency_key: Optional[str] = None,
+        agent_id: Optional[str] = None,
     ) -> int:
+        now = _utc_now()
         cur = self.conn.execute(
             """
-            INSERT INTO scratchpad_log (session_id, role, raw_text, phase_hint, noul_score)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO scratchpad_log
+                (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id, ingested_at, valid_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, role, raw_text, phase_hint, noul_score),
+            (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id, now, now),
         )
         self.conn.commit()
+        return cur.lastrowid
+
+    def find_by_idempotency_key(self, key: str) -> Optional[Tuple[int, Optional[str]]]:
+        row = self.conn.execute(
+            "SELECT id, agent_id FROM scratchpad_log WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def add_explicit(
+        self,
+        session_id: str,
+        content: str,
+        category: str,
+        reason: str,
+        idempotency_key: str,
+        agent_id: Optional[str],
+        commit: bool = True,
+    ) -> int:
+        now = _utc_now()
+        cur = self.conn.execute(
+            """
+            INSERT INTO scratchpad_log
+                (session_id, role, raw_text, phase_hint, noul_score, category, reason,
+                 idempotency_key, agent_id, ingested_at, valid_at)
+            VALUES (?, 'user', ?, 'explicit_addition', 0.0, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, content, category, reason, idempotency_key, agent_id, now, now),
+        )
+        if commit:
+            self.conn.commit()
         return cur.lastrowid
 
     def get_session_logs(self, session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
