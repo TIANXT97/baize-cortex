@@ -1,10 +1,13 @@
 # 🏛️ 白泽·Cortex (Bai Ze Cortex) 架构设计白皮书
 
 **工程标识**：`baize-cortex`  
-**文档版本**：v2.0-Draft  
+**文档版本**：v2.1  
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
-**日期**：2026-10-20  
+**初版日期**：2026-10-20  
+**最近同步**：2026-10-22（同步至 Phase A，PR #23）  
+
+> 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
 ---
 
@@ -20,6 +23,14 @@
 - **遗忘与睡眠修剪不是缺陷，而是系统维持抗熵增的最高算法**；
 - **重大工程方案存在唯一现役真理**，必须与历史演进拓扑物理解耦。
 
+### 1.1 架构铁律
+
+- 存储只用 SQLite（WAL 模式，`PRAGMA foreign_keys=ON`，`synchronous=NORMAL`，`busy_timeout=30000`），零外部中间件；
+- 不物理删除数据：热表清退前必须先无损写入 `cold_archive/*.jsonl.gz`；
+- MCP 层为手写 JSON-RPC 2.0（协议 2024-11-05）；
+- 所有外部 API 调用严格 Fail-open：网络故障绝不阻塞主系统交互；
+- Schema 只做增量加法迁移，对存量数据与旧客户端零影响。
+
 ---
 
 ## 2. 四层物理正交存储模型 (Storage Topology)
@@ -27,36 +38,63 @@
 底座坚持**纯嵌入式、单文件 SQLite WAL 模式**，内存预算 500MB~1GB。
 
 ### 2.1 Layer 0: 瞬态草稿流 (Episodic Scratchpad)
-- **表结构**：`scratchpad_log (id, session_id, role, raw_text, phase_hint, created_at)`
-- **特性**：微秒级无锁追加，零向量化，零阻断。
-- **生命周期**：仅在当前活跃会话与当日保留，夜间睡眠阶段执行冷归档。
+- **表结构**：`scratchpad_log (id, session_id, role, raw_text, phase_hint, noul_score, created_at)`，Phase A 起增补见 §2.5；
+- **特性**：微秒级追加，零向量化，零阻断；
+- **生命周期**：夜间慢波合成时，被折叠的记录先无损冷归档再清退；未折叠的草稿继续留在热表；
+- **清洗接口**：`POST /v1/admin/purge-scratchpad`（默认 `dry_run`），真实清洗前先归档至 `cold_archive/purged_*.jsonl.gz`。
 
 ### 2.2 Layer 1: 项目活体状态卡 (Living State Vault)
-- **表结构**：`living_states (entity_id PRIMARY KEY, version, current_decision, status, tombstones_json, updated_at)`
-- **特性**：一项目一文档，硬上限限制在 20~30 个核心工程实体。
-- **查询复杂度**：$O(1)$ 主键直连，直接旁路所有图检索与向量比对。
+- **表结构**：`living_states (entity_id PRIMARY KEY, display_name, version, status, current_decision, metadata_json, tombstones_json, updated_at)`；
+- **特性**：一项目一文档，硬上限限制在 20~30 个核心工程实体；
+- **查询复杂度**：$O(1)$ 主键直连，直接旁路所有图检索与向量比对；
+- **展示名保护**：`display_name == entity_id` 视为“黑户”，慢波合成或 `POST /v1/admin/backfill-display-names` 可将其转正为自然语言名称；已有的良好名称不会被覆盖；
+- **别名库**：`metadata.aliases` 增量取并集，永久保留。
 
 ### 2.3 Layer 2: 双时态实体拓扑图 (Bi-temporal Graph)
 - **表结构**：
-  - `graph_nodes (node_id PRIMARY KEY, label, properties_json, created_at)`
+  - `graph_nodes (node_id PRIMARY KEY, label, node_type, properties_json, created_at)`
   - `graph_edges (edge_id PRIMARY KEY, src_id, dst_id, rel_type, weight, valid_at, invalid_at, created_at, expired_at)`
 - **时态语义**：
   - `valid_at` / `invalid_at`：事实在现实世界中的有效时间区间；
   - `created_at` / `expired_at`：系统记录与标记该事实的时间区间；
-- **切片规则**：检索时必须强制执行有效子图切片（Active Subgraph Slice）：
-  $$\mathcal{G}_{active} = \{e \in \mathcal{E} \mid e.invalid\_at \text{ IS NULL}\}$$
+- **切片规则**：检索时必须强制执行有效子图切片（Active Subgraph Slice），由视图 `v_active_graph_edges` 提供：
+  $$\mathcal{G}_{active} = \{e \in \mathcal{E} \mid e.invalid\_at \text{ IS NULL and } e.valid\_at \le \text{datetime('now')}\}$$
 
 ### 2.4 Layer 3: 慢波合成睡眠 (Dream Consolidation)
-- **机制**：凌晨无监督离线批处理。
+- **机制**：离线批处理，由 `POST /v1/sleep/consolidate` 或 `python -m baize.core.consolidator` 触发。
 - **流程**：
-  1. 扫描当日 `scratchpad_log` 中由 System 1 标记的相变锚点；
-  2. 结合深度模型执行跨对话折叠，提炼高阶长效共识；
-  3. 执行 `UPDATE living_states` 与 `UPDATE graph_edges SET invalid_at = NOW()`；
-  4. 将原日志打包压缩归档至 `cold_archive/`，热表清空。
+  1. 只读分析：扫描 `phase_hint` 非空的草稿，按实体分组，判定授权批准门；
+  2. 先落盘：把将被折叠的记录写入唯一命名的 gzip 归档并 `fsync`；
+  3. 单一短事务（`BEGIN IMMEDIATE`）：更新 `living_states`、写图谱节点与 `decided_as` 边、失效旧边，并只删除本次真正折叠的记录 ID；
+  4. 失败整体回滚，热表数据不丢。
+- **模型分工**：配置了 `CORTEX_LLM_URL/KEY` 时由 System 2 抽取 `decision / superseded / display_name / aliases`；未配置或调用失败时降级为正则规则。
+- **无锚点定案兜底（Phase 8）**：授权批准且不带 `proj:` 锚点的记录，依次归入同会话最近出现的实体、30 分钟内最近更新的 ACTIVE 实体，兜底为 `proj:general_decisions`，不再滞留热表。
+- **决策清洗**：定案文本去除半角 `:`、全角 `：` 与首尾空白。
+
+### 2.5 Phase A 增量列（三表共有）
+
+`scratchpad_log`、`living_states`、`graph_edges` 均新增以下可空列，迁移由 `baize/storage/migrations.py` 在 `init_db` 中自动执行，可重复执行，迁移前备份数据库文件，存量回填分批提交：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `idempotency_key` | TEXT | 幂等键，局部唯一索引 `idx_<表>_idempotency`（仅非空时生效） |
+| `valid_at` / `invalid_at` | TEXT | 事实现实生效 / 失效时点 |
+| `ingested_at` / `expired_at` | TEXT | 认知入库 / 认知废弃时点 |
+| `supersedes_id` | INTEGER | 被本记录推翻的旧记录 ID |
+| `pinned` / `hit_count` / `last_recalled_at` | INTEGER / INTEGER / TEXT | 预留列，Phase A 只建列，不读写 |
+| `agent_id` | TEXT | 写入方归属，由服务端凭据确定 |
+
+另有 `scratchpad_log.category`、`scratchpad_log.reason`，保存 `cortex_add` 的分类与原因。`graph_edges` 已存在的 `valid_at / invalid_at / expired_at` 保持原样，迁移自动跳过。
+
+**时间格式约定**：所有时间戳统一为 `YYYY-MM-DD HH:MM:SS`（UTC），与 SQLite `CURRENT_TIMESTAMP` 兼容。带 `T` 的 ISO 格式会破坏视图中 `valid_at <= datetime('now')` 的字符串比较，禁止使用。
+
+**回填来源**：`scratchpad_log` 与 `graph_edges` 用 `created_at`，`living_states` 没有该列，用 `updated_at`。
 
 ---
 
-## 3. 检索与计算引擎：有效子图上的 PPR 能量扩散
+## 3. 检索与计算引擎
+
+### 3.1 有效子图上的 PPR 能量扩散
 
 为解决单步向量检索面对模糊词或偏置词抓瞎的问题，白泽 2.0 引入基于 Personalized PageRank 的吸引子滑落机制：
 
@@ -64,18 +102,37 @@
 2. **带阻尼的概率游走**：
    $$\mathbf{r}^{(k+1)} = (1 - \alpha) \mathbf{P}^T \mathbf{r}^{(k)} + \alpha \mathbf{p}$$
    其中 $\mathbf{P}$ 为有效子图 $\mathcal{G}_{active}$ 的转移概率矩阵，$\alpha$ 为重启阻尼因子（取 0.15）；
-3. **物理隔离旧方案**：由于已推翻方案的边在 $\mathcal{G}_{active}$ 中已被切断，能量无法向失效节点扩散，自然避免了“历史热搜偏见”，能量自发汇聚到连接最密集的现役核心定案。
+3. **物理隔离旧方案**：已推翻方案的边在 $\mathcal{G}_{active}$ 中已被切断，能量无法向失效节点扩散，能量自发汇聚到连接最密集的现役核心定案。
+
+### 3.2 统一认知召回路由 (Phase 4 / Phase 6)
+
+`CognitiveRecallRouter.recall(query, top_k)` 按优先级路由：
+
+按以下顺序依次尝试，命中即返回：
+
+| 顺序 | 路由 | 触发 | 说明 |
+|---|---|---|---|
+| 1 | `LIVING_STATE_DIRECT` | 查询命中活体卡的 `display_name` 或 `aliases` | 名称出现在原查询或剥离语气助词后的查询中即命中；反向包含（剥离后的查询是名称的子串）仅在名称长度不少于 4 时生效。置信度 1.0 |
+| 2 | `PPR_SPREADING` | 图谱节点 `label` 出现在查询中，得到种子节点 | 在有效子图上做 PPR 扩散，返回能量排序与 `resolved_state` |
+| 3 | `DECISION_TEXT_MATCH` | 没有任何种子节点时的兜底 | 剥离助词后长度不少于 2，用分词（`[一-鿿A-Za-z0-9_]{2,}`）匹配现役 `current_decision` 文本。置信度 0.6 |
+| 4 | `NO_MATCH` | 全部未命中 | 返回空结果，置信度 0.0 |
 
 ---
 
 ## 4. 双系统协同 (Dual-System Governance)
 
-- **System 1 (直觉层 · 毫秒级哨兵)**：
-  - 核心引擎：`Drex-Max`（推断耗时 ~24ms，端到端 ~300ms）；
-  - 职责：会话入口意图分类、瞬时相变嗅探（捕捉拍板与否定）；
-- **System 2 (深思层 · 离线淬火引擎)**：
-  - 核心引擎：具备深度推理能力的通用大模型基座；
-  - 职责：夜间慢波睡眠抽象提炼、复杂矛盾全局仲裁、白皮书生成。
+### 4.1 System 1：SystemOne 双门神（Phase 7）
+
+- **职责**：会话入口意图分类、瞬时相变嗅探（`approval` / `rejection` / `exploration`）；
+- **协议**：向门神 POST `{model, state, questions: {should_memorize: {type: noul, ...}, category: {type: choice, criteria: {...}}}}`，请求头带 `User-Agent: Baize/Gate-v2.0 (TypeSafe-Client)`；
+- **仲裁**：先问 Drex-Max；其 `noul` 得分落在模糊区间 (0.4, 0.6) 时，再交 OpenJev 复判；
+- **Fail-open**：两道门都不可用时，降级为本地关键词规则（`_detect_local`），不阻塞写入；
+- **返回**：`detect_phase(text) -> (phase, confidence, category)`。
+
+### 4.2 System 2：深度推理模型
+
+- **职责**：夜间慢波合成中的抽象提炼与矛盾仲裁，通过 `OpenAICompatClient` 调用兼容 OpenAI 协议的网关；
+- **边界**：DeepSeek 等推理模型只负责慢波折叠，不参与白天的 System 1 判定。
 
 ---
 
@@ -88,14 +145,12 @@
 - **防纂改**：Assistant 的方案建议、假设性推演（`如果...` / `探讨` / `?` / `呢$`）一律只能沉淀为草稿或候选，严禁隐式盖章。
 
 ### 5.2 无损冷归档与 Write-Ahead 安全清退 (F1)
-- **唯一性防覆盖**：归档文件格式严格定为 `scratchpad_{stamp}_{timestamp_ms}.jsonl.gz`，采用排他性创建；
+- **唯一性防覆盖**：归档文件命名为 `{前缀}_{毫秒时间戳}.jsonl.gz`（慢波合成前缀 `scratchpad_{日期或all}`，清洗前缀 `purged`），以排他模式创建；
 - **先落盘后清退 (Write-Ahead)**：只有物理写入 gzip 并落盘校验后，才执行 `DELETE FROM scratchpad_log WHERE id IN (...)`；
 - **未折叠草稿保留**：清退范围仅限**本次真正被成功折叠入活体卡的日志 ID**，未进入折叠的瞬态草稿继续留在热表等待下一轮处理，彻底杜绝数据丢失。
 
 ### 5.3 严格时态切片与图文双写同步 (F4 / F5)
-- **有效子图双时态约束**：
-  $$\mathcal{G}_{active} = \{e \in \mathcal{E} \mid e.invalid\_at \text{ IS NULL and } e.valid\_at \le \text{datetime('now')}\}$$
-  未生效的未来边（如预定生效的提案）被物理隔离在现役子图外；
+- **有效子图双时态约束**：未生效的未来边（如预定生效的提案）被物理隔离在现役子图外；
 - **图文双写与别名保护**：慢波睡眠折叠出新定案后，自动为项目建立 `decided_as` 现役新边，并按 `node_id` 失效旧边；`update_decision` 强制增量合并 `metadata`，永久保留 `aliases` 别名库。
 
 ---
@@ -104,12 +159,107 @@
 
 ### 6.1 MemoryProvider 基类契约对齐
 Hermes 网关核心的 `sync_turn` 采用 `(user_content, assistant_content, *, session_id, ...)` 签名调用。`plugins/cortex/__init__.py` 必须严格拆解：
-- 用户消息以 `role="user"` 写入，并由轻量正则/PhaseDetector 动态嗅探打标 `approval` 或 `rejection`；
+- 用户消息以 `role="user"` 写入，并由 PhaseDetector 动态嗅探打标 `approval` 或 `rejection`；
 - 助手消息以 `role="assistant"` 写入，`phase_hint=None`，杜绝角色错位与死锁。
 
-### 6.2 环境变量无感模型注入
-System 1 与 System 2 真实模型完全通过环境变量声明注入：
-- `CORTEX_LLM_URL`：兼容 OpenAI 协议的网关出口；
-- `CORTEX_LLM_KEY`：鉴权令牌；
-- `CORTEX_DECISION_MODEL`：决策嗅探模型（如 `cbcn/deepseek-v4.1-flash`）；
-- `CORTEX_REASONING_MODEL`：慢波睡眠深度折叠模型。
+### 6.2 环境变量
+
+| 变量 | 作用 | 未配置时 |
+|---|---|---|
+| `CORTEX_LLM_URL` / `CORTEX_LLM_KEY` | System 2 网关地址与令牌（需同时配置） | 慢波合成降级为正则规则 |
+| `CORTEX_REASONING_MODEL` | 慢波合成使用的模型 | 默认 `cbcn/deepseek-v4.1-flash` |
+| `CORTEX_SYSTEMONE_DREX_URL` / `_KEY` | Drex-Max 门神 | 跳过该门 |
+| `CORTEX_SYSTEMONE_OPENJEV_URL` / `_KEY` | OpenJev 门神 | 跳过该门 |
+| `CORTEX_SYSTEMONE_PROXY` | 门神请求使用的代理 | 直连 |
+| `CORTEX_AGENT_TOKENS` | 凭据表，格式 `token:agent_id,token2:agent_id2` | 不校验，所有写入归属 `default` |
+
+> 历史变量 `CORTEX_DECISION_MODEL` 自 Phase 7 起已不再使用，被 SystemOne 双门神变量取代。
+
+---
+
+## 7. 记忆外溢通道与可靠投递 (Phase A)
+
+### 7.1 背景
+
+Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限时返回 `2426/2200` 这类含动态数字的报错。Agent 循环缺少同类错误熔断，字面比对无法识别为同一错误，曾出现连续 80+ 次重试、单轮耗时超 120 秒。同时客户端没有向 Cortex 主动写入的通道。
+
+### 7.2 服务端写入接口
+
+| 接口 | 说明 |
+|---|---|
+| `POST /v1/cortex/add` | 显式沉淀：`content`（≤2000 字符）、`category ∈ {fact, preference, rule, lesson}`、`reason`（≤500 字符）、可选 `supersedes_id` |
+| `POST /v1/scratchpad/log` | 草稿追加；携带 `idempotency_key` 时同样走幂等与长度校验 |
+
+约束：
+- **凭据**：配置 `CORTEX_AGENT_TOKENS` 后要求 `Authorization: Bearer <token>`，服务端据此确定 `agent_id`，忽略请求体里伪造的 `source`、信任等级、`agent_id` 字段；缺凭据 `401`，凭据无效 `403`；
+- **幂等**：`idempotency_key` 命中已有记录返回 `200`，响应含已存 `id` 与 `deduplicated: true`；若该键已被其他 `agent_id` 占用返回 `409`；
+- **状态码语义**：`413` 内容超长，`422` 内容不可接受，`401/403` 凭据问题，`409` 幂等键被其他 agent 占用，`5xx` 服务端临时故障。服务端当前不主动返回 `429`；客户端 Outbox 已按 `429` + `Retry-After` 实现遵守逻辑，供前置网关限流时使用；
+- **`supersedes_id`**：同一事务内校验“目标存在、非自身、同 `agent_id`”，通过后将旧记录的 `expired_at` 置为当前时间、`invalid_at` 置为新记录的 `valid_at`，并写入一条 `superseded_by` 图谱边。不带 `supersedes_id` 时不凭空造边。
+
+### 7.3 规范化与幂等键
+
+`baize/core/normalization.py` 为客户端与服务端共用实现：
+- 规范化：NFKC → `strip` → 连续空白折叠为单个空格；
+- 幂等键：`sha256(session_id + "\x00" + normalized_content).hexdigest()[:32]`（128 位）；
+- 契约夹具：`tests/fixtures/normalization_vectors.json`（golden vectors），两端由同一份夹具锁定一致。
+
+### 7.4 客户端参考实现 `baize/client/`（纯标准库）
+
+| 模块 | 职责 |
+|---|---|
+| `outbox.py` | `~/.hermes/outbox.jsonl`，每行一条信封（`idempotency_key / payload / created_at / attempts / next_retry_at`）。追加使用 `O_APPEND` 单次 `os.write`；flush 时在锁内原子 rename 为 `outbox.sending.<时间戳>` 再逐行投递；崩溃后重放遗留的 `sending` 文件。跨进程锁：POSIX 用 `fcntl.flock`，Windows 用 `msvcrt.locking` |
+| `plugin.py` | `CortexClient.cortex_add(content, category, reason, supersedes_id=None)`：3 秒超时或网络异常、`5xx`、`429` 时不报错，自动入队并返回 `{"status": "queued", ...}`；`on_memory_write(action, target, content, metadata)`：`MEMORY.md` / `USER.md` 写入后把单条条目入队，标记 `origin="hermes_builtin_mirror"`，遇到 `origin="writeback"` 直接跳过以切断回环，钩子内部异常一律吞掉 |
+| `breaker.py` | 错误签名归一化与熔断 |
+
+**Outbox 错误分类**：
+- `2xx`（含去重命中）：ACK；
+- `400 / 413 / 422`：进入 `outbox.dead.jsonl` 死信并记 WARNING；
+- `401 / 403`：不丢弃，暂停本轮投递并按退避重试；
+- `429`：遵守 `Retry-After`；`5xx` 与超时：指数退避加抖动；
+- 后台线程 `daemon=True`，捕获所有内部异常，不向主会话抛出。
+
+### 7.5 错误签名归一化与熔断
+
+签名生成按顺序做正则替换：UUID → `<UUID>`，ISO 时间戳与 epoch → `<TS>`，文件路径 → `<PATH>`，长度 ≥ 8 且含字母的十六进制串 → `<HEX>`，其余数字（含 `2426/2200`）→ `<N>`；最终签名为 `tool_name | error_class | 归一化模板`。
+
+熔断规则：
+- 同一会话、同一工具、同一签名连续失败 2 次立即触发；
+- 触发后短路后续调用，合成返回：“MEMORY.md 空间不足，本轮禁止继续重试 memory 工具。请改用 cortex_add 工具将内容沉淀至白泽 Cortex 长期库。”
+- 一次成功调用或新用户回合开始（`new_turn`）时复位。
+
+### 7.6 部署与归属
+
+插件代码在本仓库 `baize/client/` 完成自闭环测试后，由 NAS / 云机部署通道同步至 Hermes 的 `plugins/cortex/`。构建、容器重启与数据库迁移的实际执行由 NAS 侧（夭夭）负责。
+
+---
+
+## 8. REST 与 MCP 接口总览
+
+### 8.1 REST（`baize/server/app.py`）
+
+| 路径 | 方法 | 说明 |
+|---|---|---|
+| `/health` | GET | 健康检查 |
+| `/v1/scratchpad/log` | POST | 草稿流追加（支持幂等） |
+| `/v1/cortex/add` | POST | 显式沉淀（幂等、可推翻旧记录） |
+| `/v1/living-states` | GET | 列出现役活体卡 |
+| `/v1/living-state/{entity_id}` | GET | 读取单张活体卡 |
+| `/v1/living-state/decision` | POST | 就地更新定案并写墓碑 |
+| `/v1/graph/node` · `/v1/graph/edge` · `/v1/graph/invalidate` | POST | 图谱节点、边与失效 |
+| `/v1/graph/active-subgraph` | GET | 现役有效子图 |
+| `/v1/recall/ppr` | POST | PPR 能量扩散 |
+| `/v1/recall` | POST | 统一认知召回 |
+| `/v1/sleep/consolidate` | POST | 触发慢波合成（`dry_run` 仅返回空报告） |
+| `/v1/admin/backfill-display-names` | POST | 黑户展示名转正，默认 `dry_run` |
+| `/v1/admin/purge-scratchpad` | POST | 草稿清洗，默认 `dry_run`，先归档再删除 |
+| `/v1/admin/seed` | POST | 预置核心工程资产 |
+
+### 8.2 MCP stdio 工具（`baize/server/mcp_server.py`）
+
+`baize_get_living_state`、`baize_list_active_states`、`baize_update_decision`、`baize_scratchpad_log`、`baize_recall_ppr`、`baize_consolidate_sleep`、`baize_recall`。
+
+---
+
+## 9. 验证套件
+
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 15 个套件：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，以及 Phase A 的六个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断）。

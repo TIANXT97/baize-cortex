@@ -20,7 +20,8 @@
 
 - `baize/core/`:Layer 0–3 的管理器与 `seeds.py`
 - `baize/intelligence/`:`phase_detector.py`(System 1)、`ppr_engine.py`、`recall_router.py`
-- `baize/storage/`:`schema.sql`、`db.py`
+- `baize/storage/`:`schema.sql`、`db.py`、`migrations.py`(只做增量加法迁移)
+- `baize/client/`:cortex 插件参考实现(Outbox、`cortex_add`、镜像钩子、熔断),只用标准库
 - `baize/server/`:REST 与 MCP 入口
 - `tests/`:按阶段命名的集成测试,每个文件都支持 `python tests/xxx.py` 直接运行
 
@@ -34,6 +35,11 @@ python tests/test_phase1_mvp.py
 python tests/test_phase2_mcp_graph.py
 python tests/test_phase3_consolidation.py
 python tests/test_phase4_recall_router.py
+python tests/test_phase5_hardening.py
+python tests/test_phase6_semantic_alias.py
+python tests/test_phase7_systemone_gates.py
+python tests/test_phase8_consolidation_closure.py
+python tests/test_phase_a_migration.py   # 另有 test_phase_a_{outbox,cortex_add,normalization,mirror,circuit_breaker}.py
 python -m py_compile <改动的文件>
 ```
 
@@ -59,5 +65,6 @@ python -m py_compile <改动的文件>
 ## 文档约定
 
 - 代码默认不写注释;只在"为什么"不明显时写一行。
-- README 的路线图与目录结构随阶段完成同步更新。
+- 每个功能 PR 合并后,必须跟一个 `docs/*` 分支同步 `README.md`(路线图、目录结构)、`docs/ARCHITECTURE.md` 与 `docs/CHANGELOG.md`,同样走 PR 并合并,保证项目演进有迹可循。
+- 时间戳统一 `YYYY-MM-DD HH:MM:SS`(UTC),不使用带 `T` 的 ISO 格式,否则会破坏 `v_active_graph_edges` 的字符串比较。
 - 不新增规划类或分析类文档,除非用户明确要求。
