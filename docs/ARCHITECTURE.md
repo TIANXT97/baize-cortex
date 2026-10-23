@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-23（同步至 PR #35 / Issue #34，草稿归档待固化记录保护）  
+**最近同步**：2026-10-23（同步至 Issue #37，新增 `RECENT_TURNS_CONTEXT` 末级召回层；含 PR #35 / Issue #34 的草稿归档待固化记录保护、Issue #32 的召回打分排序与草稿流时间窗归档）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -122,9 +122,12 @@
 | 2 | `PPR_SPREADING` | 图谱节点 `label` 出现在查询中，得到种子节点 | 在有效子图上做 PPR 扩散，返回能量排序与 `resolved_state` |
 | 3 | `DECISION_TEXT_MATCH` | 没有任何种子节点时的兜底 | 用「原词 + 中文 2-gram」双通道分词，对全部现役卡打分，达到命中门槛的按 §3.3 排序后取前 `top_k`，不再首个命中即返回。置信度 0.6 |
 | 4 | `SCRATCHPAD_EXPLICIT_FALLBACK` | 以上都未命中 | 末级只读兜底：检索 `scratchpad_log` 中 `phase_hint='explicit_addition'` 且 `expired_at IS NULL` 的未固化记录，复用分词、转义 LIKE 通配符，按 `created_at` 倒序取 `top_k`。置信度 0.5，响应带 `provisional=True`、`authoritative=False`、`source_log_ids`、`facts` |
-| 5 | `NO_MATCH` | 全部未命中 | 返回空结果，置信度 0.0 |
+| 5 | `RECENT_TURNS_CONTEXT` | 以上都未命中，且窗口内有 token 命中的普通对话轮（Issue #37） | 会话短期连续性兜底：检索 `scratchpad_log` 中 `role='user'`、`phase_hint IS NULL`、`expired_at IS NULL`、`created_at >= now - 72h` 的行，按 `created_at` 倒序取 `min(top_k, 3)` 条，每条文本裁剪到 400 字符。置信度 0.35，`provisional=True`、`authoritative=False`，带 `source_log_ids`、`facts`；严格只读 |
+| 6 | `NO_MATCH` | 全部未命中 | 返回空结果，置信度 0.0 |
 
 兜底的约束：Layer 1 活体卡始终是唯一权威，草稿事实只作为未固化窗口期的明确标注回退；草稿兜底纯只读，不进入 PPR 扩散、不修改 `scratchpad_log`；活体卡直达命中时绝不触发兜底；慢波固化之后，同一事实改由活体卡策略命中。
+
+**为什么需要第 5 层（Issue #37）**：网关插件 `sync_turn` 每轮都写 Layer 0，但 `phase_hint` 只在 PhaseDetector 判 `decision_approved` 时才非空，而第 4 层与固化器都只认 `phase_hint IS NOT NULL`，于是普通对话永久「只写不读」：新会话开场拿不到上一轮的任务上下文，只能回翻原始会话库。第 5 层绕开 `phase_hint` 语义，按 `role` + 时间窗 + token 命中取行，只服务跨会话短期连续性，因此窗口短（72h）、条数少（≤3）、文本裁剪（400 字符）、置信度低（0.35），不会与权威记忆争夺排序。**否决的替代方案**：给普通轮次写 `phase_hint='turn'`——`phase_hint IS NOT NULL` 是固化器入队条件（`export_pending_phase_logs`），会把闲聊灌进 `living_states`。
 
 ### 3.3 活体卡打分与时效排序（Issue #32）
 
@@ -303,4 +306,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 21 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本）。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的六个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 22 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本）。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的六个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
