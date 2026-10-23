@@ -35,6 +35,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--archive-dir", default="cold_archive")
     parser.add_argument("--days", type=_non_negative_int, default=30)
     parser.add_argument("--role", default=None)
+    parser.add_argument(
+        "--include-pending-phase",
+        action="store_true",
+        help="连同 phase_hint 非空的待固化记录(approval / explicit_addition 等)一并归档,默认豁免",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="只列出将被归档的记录(默认)")
     mode.add_argument("--execute", action="store_true", help="先写入 cold_archive 再删除")
@@ -46,7 +51,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     conn = init_db(args.db)
     try:
         report = DreamConsolidator(conn, archive_dir=args.archive_dir).purge_scratchpad(
-            role=args.role, dry_run=not args.execute, before_date=cutoff_from_days(args.days)
+            role=args.role,
+            dry_run=not args.execute,
+            before_date=cutoff_from_days(args.days),
+            include_pending_phase=args.include_pending_phase,
         )
     finally:
         conn.close()

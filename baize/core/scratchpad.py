@@ -125,21 +125,32 @@ class ScratchpadManager:
         before_id: Optional[int] = None,
         role: Optional[str] = None,
         before_date: Optional[str] = None,
+        include_pending_phase: bool = False,
     ) -> List[Dict[str, Any]]:
-        if before_date is not None:
-            validate_timestamp(before_date)
+        where, params = _purge_filter(before_id, role, before_date)
+        if not include_pending_phase:
+            where += " AND phase_hint IS NULL"
         rows = self.conn.execute(
-            """
+            f"""
             SELECT id, session_id, role, raw_text, phase_hint, noul_score, created_at, category, reason
             FROM scratchpad_log
-            WHERE (? IS NULL OR id < ?)
-              AND (? IS NULL OR role = ?)
-              AND (? IS NULL OR created_at < ?)
+            WHERE {where}
             ORDER BY id ASC
             """,
-            (before_id, before_id, role, role, before_date, before_date),
+            params,
         ).fetchall()
         return [{**_row_to_log(r), "category": r[7], "reason": r[8]} for r in rows]
+
+    def count_pending_for_purge(
+        self,
+        before_id: Optional[int] = None,
+        role: Optional[str] = None,
+        before_date: Optional[str] = None,
+    ) -> int:
+        where, params = _purge_filter(before_id, role, before_date)
+        return self.conn.execute(
+            f"SELECT COUNT(*) FROM scratchpad_log WHERE {where} AND phase_hint IS NOT NULL", params
+        ).fetchone()[0]
 
     def export_pending_phase_logs(self, date_str: Optional[str] = None) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
@@ -154,6 +165,15 @@ class ScratchpadManager:
             (date_str, date_str),
         ).fetchall()
         return [{**_row_to_log(r), "expired_at": r[7], "category": r[8], "reason": r[9]} for r in rows]
+
+
+def _purge_filter(
+    before_id: Optional[int], role: Optional[str], before_date: Optional[str]
+) -> Tuple[str, Tuple[Any, ...]]:
+    if before_date is not None:
+        validate_timestamp(before_date)
+    where = "(? IS NULL OR id < ?) AND (? IS NULL OR role = ?) AND (? IS NULL OR created_at < ?)"
+    return where, (before_id, before_id, role, role, before_date, before_date)
 
 
 def _row_to_log(row) -> Dict[str, Any]:
