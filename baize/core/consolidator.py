@@ -26,6 +26,7 @@ _ALIAS_SPLIT_RE = re.compile(r"[,,、]")
 _EXPLORATION_RE = re.compile(r"假设|如果|要不|探讨|尚未批准|[?？]|呢$")
 _LEADING_PUNCT = " \t\r\n:："
 _GENERAL_ENTITY = "proj:general_decisions"
+_DELETE_CHUNK = 500
 _LLM_SYSTEM_PROMPT = (
     "从对话中提取最终定案 decision、被推翻的方案 superseded、简洁中文名 display_name "
     "与别名数组 aliases,只输出 JSON。"
@@ -168,11 +169,14 @@ class DreamConsolidator:
         before_id: Optional[int] = None,
         role: Optional[str] = None,
         dry_run: bool = True,
+        before_date: Optional[str] = None,
     ) -> Dict[str, Any]:
-        rows = self.scratchpad.find_for_purge(before_id, role)
+        rows = self.scratchpad.find_for_purge(before_id, role, before_date)
+        ids = [r["id"] for r in rows]
         report: Dict[str, Any] = {
             "dry_run": dry_run,
             "matched": len(rows),
+            "ids": ids,
             "sample": [
                 {"id": r["id"], "role": r["role"], "raw_text": r["raw_text"][:60]} for r in rows[:10]
             ],
@@ -182,11 +186,12 @@ class DreamConsolidator:
         if dry_run or not rows:
             return report
         report["archive_file"] = self._write_archive(rows, "purged")
-        ids = [r["id"] for r in rows]
-        placeholders = ",".join("?" * len(ids))
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            self.conn.execute(f"DELETE FROM scratchpad_log WHERE id IN ({placeholders})", ids)
+            for start in range(0, len(ids), _DELETE_CHUNK):
+                chunk = ids[start:start + _DELETE_CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                self.conn.execute(f"DELETE FROM scratchpad_log WHERE id IN ({placeholders})", chunk)
             self.conn.commit()
         except Exception:
             self.conn.rollback()

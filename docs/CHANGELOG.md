@@ -4,6 +4,17 @@
 
 ## 2026-10-23
 
+### 召回精度与时效排序、草稿流时间窗归档（Issue #32）
+- **召回漏召回**：连续中文原先被整体当作一个 token，`recall("飞书卡片")` 无法命中『飞书流式卡片』。分词改为「原词 + 中文 2-gram」双通道，不需要用户手动加空格。
+- **召回错召回**：原先按 `list_active_states()` 的物理顺序遍历、首个命中即返回，`recall("飞书 流式")` 会被排在第一的模具知识库抢占。改为对全部现役卡打分，`Score = 3×display_name + 2×alias + 1×decision/facts + 2×命中 token 数 + max(0, 1 − 0.05×距上次更新天数)`，按 Score 降序、同分取 `updated_at` 新者、再按 `entity_id` 取前 `top_k`。每条 `living_states` 带 `score`。
+- **命中门槛**：`DECISION_TEXT_MATCH` 要求至少一个原词命中或至少两个不同的 2-gram 命中，单个 2-gram 巧合不足以入选。这一条超出批复的字面公式，是为了让 2-gram 引入后不产生通用词噪声而加的，已在白皮书 §3.3 写明。
+- **时效回写**：被返回的活体卡 `hit_count += 1`、`last_recalled_at` 写入当前 UTC，不改 `updated_at`；未命中与草稿兜底不回写；回写失败回滚并忽略，召回照常返回。Phase A 预留的这两列从此启用，`pinned` 仍为预留。
+- **草稿流归档**：`POST /v1/admin/purge-scratchpad` 新增 `before_date`（`YYYY-MM-DD HH:MM:SS`，带 `T` 或非法日期返回 `422`），与 `before_id`、`role` 为 AND 关系；`dry_run` 默认 true 并返回完整 `ids` 清单；真实执行先写 `cold_archive/purged_*.jsonl.gz` 再分块删除。冷归档新增 `category`、`reason` 两个字段。
+- **一键脚本**：`python -m baize.cortex_purge --days 30`，默认 dry-run，`--execute` 才真正归档删除。
+- **决策记录**：`CORTEX_AGENT_TOKENS` 暂缓启用（总监裁定选 A），触发条件与启用步骤已写入白皮书 §6.2，本次不改配置。
+- 新增测试：`test_recall_scoring.py`、`test_purge_before_date.py`；`test_prefetch_contract_and_fusion.py` 的只读断言改为「草稿与活体卡内容不变」，因为命中回写会改变 `total_changes`。
+- 未验证：没有在生产副本上复现；`PRAGMA integrity_check` 只在测试库上验证；`hit_count` 的写入会让每次召回多一次短事务，未做压测。
+
 ### 修复：对齐 Hermes MemoryProvider 字符串契约与召回指示器（PR #31，Issue #30）
 - 现象：美西生产环境排查发现，`prefetch()` 返回 `List[Dict]` 违反 Hermes `MemoryProvider -> str` 契约，导致消费端 `result.strip()` 抛出 `AttributeError`，该异常被 `turn_context.py` 中的 `suppress` 静默吞噬，全库记忆自动注入计数恒为 0。
 - 契约对齐：`prefetch()` 对齐基类标准关键字签名 `(self, query: str, *, session_id: str = "") -> str`，将召回条目格式化为自然文本行，无命中返回空字符串 `""`。

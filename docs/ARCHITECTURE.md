@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-23（同步至 PR #31，MemoryProvider 契约与透出指示器）  
+**最近同步**：2026-10-23（同步至 Issue #32，召回打分排序与草稿流时间窗归档）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -41,7 +41,8 @@
 - **表结构**：`scratchpad_log (id, session_id, role, raw_text, phase_hint, noul_score, created_at)`，Phase A 起增补见 §2.5；
 - **特性**：微秒级追加，零向量化，零阻断；
 - **生命周期**：夜间慢波合成时，被折叠的记录先无损冷归档再清退；未折叠的草稿继续留在热表；
-- **清洗接口**：`POST /v1/admin/purge-scratchpad`（默认 `dry_run`），真实清洗前先归档至 `cold_archive/purged_*.jsonl.gz`。
+- **清洗接口**：`POST /v1/admin/purge-scratchpad`（默认 `dry_run`），真实清洗前先归档至 `cold_archive/purged_*.jsonl.gz`，再分块（每块 500）在同一事务内删除。过滤条件 `before_id`、`role`、`before_date` 为 AND 关系；`before_date` 严格小于比较，格式必须是 `YYYY-MM-DD HH:MM:SS`，带 `T` 的 ISO 格式或非法日期返回 `422`。`dry_run` 返回 `matched`、完整 `ids` 清单与最多 10 条 `sample`，不落任何删除；
+- **一键归档脚本**：`python -m baize.cortex_purge --db baize.db --days 30`，默认 dry-run，加 `--execute` 才真正归档并删除，`--days` 默认 30，数据库不存在时退出码 2。冷归档 jsonl 逐行含 `category`、`reason`，可 `gzip -d` 还原。
 
 ### 2.2 Layer 1: 项目活体状态卡 (Living State Vault)
 - **表结构**：`living_states (entity_id PRIMARY KEY, display_name, version, status, current_decision, metadata_json, tombstones_json, updated_at)`；
@@ -87,7 +88,7 @@
 | `valid_at` / `invalid_at` | TEXT | 事实现实生效 / 失效时点 |
 | `ingested_at` / `expired_at` | TEXT | 认知入库 / 认知废弃时点 |
 | `supersedes_id` | INTEGER | 被本记录推翻的旧记录 ID |
-| `pinned` / `hit_count` / `last_recalled_at` | INTEGER / INTEGER / TEXT | 预留列，Phase A 只建列，不读写 |
+| `pinned` / `hit_count` / `last_recalled_at` | INTEGER / INTEGER / TEXT | Phase A 只建列；`hit_count`、`last_recalled_at` 自 Issue #32 起由召回路由对 `living_states` 回写，`pinned` 仍为预留 |
 | `agent_id` | TEXT | 写入方归属，由服务端凭据确定 |
 
 另有 `scratchpad_log.category`、`scratchpad_log.reason`，保存 `cortex_add` 的分类与原因。`graph_edges` 已存在的 `valid_at / invalid_at / expired_at` 保持原样，迁移自动跳过。
@@ -116,13 +117,29 @@
 
 | 顺序 | 路由 | 触发 | 说明 |
 |---|---|---|---|
-| 1 | `LIVING_STATE_DIRECT` | 查询命中活体卡的 `display_name` 或 `aliases` | 名称出现在原查询或剥离语气助词后的查询中即命中；反向包含（剥离后的查询是名称的子串）仅在名称长度不少于 4 时生效。置信度 1.0 |
+| 1 | `LIVING_STATE_DIRECT` | 查询命中活体卡的 `display_name` 或 `aliases` | 名称出现在原查询或剥离语气助词后的查询中即命中；反向包含（剥离后的查询是名称的子串）仅在名称长度不少于 4 时生效。可能命中多张卡，按 §3.3 打分排序后取前 `top_k`，`state` 为第一名。置信度 1.0 |
 | 2 | `PPR_SPREADING` | 图谱节点 `label` 出现在查询中，得到种子节点 | 在有效子图上做 PPR 扩散，返回能量排序与 `resolved_state` |
-| 3 | `DECISION_TEXT_MATCH` | 没有任何种子节点时的兜底 | 剥离助词后长度不少于 2，用分词（`[一-鿿A-Za-z0-9_]{2,}`）匹配现役 `current_decision` 与 `metadata.facts` 文本。置信度 0.6 |
+| 3 | `DECISION_TEXT_MATCH` | 没有任何种子节点时的兜底 | 用「原词 + 中文 2-gram」双通道分词，对全部现役卡打分，达到命中门槛的按 §3.3 排序后取前 `top_k`，不再首个命中即返回。置信度 0.6 |
 | 4 | `SCRATCHPAD_EXPLICIT_FALLBACK` | 以上都未命中 | 末级只读兜底：检索 `scratchpad_log` 中 `phase_hint='explicit_addition'` 且 `expired_at IS NULL` 的未固化记录，复用分词、转义 LIKE 通配符，按 `created_at` 倒序取 `top_k`。置信度 0.5，响应带 `provisional=True`、`authoritative=False`、`source_log_ids`、`facts` |
 | 5 | `NO_MATCH` | 全部未命中 | 返回空结果，置信度 0.0 |
 
-兜底的约束：Layer 1 活体卡始终是唯一权威，草稿事实只作为未固化窗口期的明确标注回退；兜底纯只读，不更新热度计数、不进入 PPR 扩散、不修改任何数据库状态；活体卡命中时绝不触发兜底；慢波固化之后，同一事实改由活体卡策略命中。
+兜底的约束：Layer 1 活体卡始终是唯一权威，草稿事实只作为未固化窗口期的明确标注回退；草稿兜底纯只读，不进入 PPR 扩散、不修改 `scratchpad_log`；活体卡直达命中时绝不触发兜底；慢波固化之后，同一事实改由活体卡策略命中。
+
+### 3.3 活体卡打分与时效排序（Issue #32）
+
+**分词**：`_scoring_tokens` 先剥离语气助词，再产出「原词 + 中文 2-gram 滑窗」，去重保序。例如 `飞书卡片` → `飞书卡片 / 飞书 / 书卡 / 卡片`，不需要用户手动加空格；英文与数字只保留原词。
+
+**打分**：对每张现役卡计算
+
+$$\text{Score} = 3\,[\text{display\_name 命中}] + 2\,[\text{alias 命中}] + 1\,[\text{current\_decision 或 facts 命中}] + 2\,N_{\text{hit}} + \max(0,\ 1 - 0.05 \times \text{days\_since\_update})$$
+
+方括号为「任一 token 命中即记 1」，$N_{\text{hit}}$ 为命中的不同 token 个数，匹配不区分大小写。时效因子在更新 20 天后衰减到 0，不会为负。
+
+**命中门槛（`DECISION_TEXT_MATCH`）**：至少一个原词命中，或至少两个不同的 2-gram 命中。单个 2-gram 的偶然巧合（如「方案」「飞书」中的某一对字）不足以让一张卡入选，避免通用词制造噪声。
+
+**排序**：Score 降序；同分取 `updated_at` 新的；再同分按 `entity_id` 升序，结果确定。输出严格遵守调用方 `top_k`（小于 1 按 1 处理），每条 `living_states` 带 `score`。
+
+**时效回写**：被返回的活体卡执行 `hit_count += 1` 与 `last_recalled_at = 当前 UTC`，不改动 `updated_at`；未命中和草稿兜底不回写。回写失败（如被锁或被触发器拒绝）时回滚并忽略，召回照常返回（Fail-open）。PPR 策略中只对最终解析出的那张卡回写。
 
 ---
 
@@ -181,6 +198,15 @@ Hermes 网关核心的 `sync_turn` 采用 `(user_content, assistant_content, *, 
 | `CORTEX_AGENT_TOKENS` | 凭据表，格式 `token:agent_id,token2:agent_id2` | 不校验，所有写入归属 `default` |
 
 > 历史变量 `CORTEX_DECISION_MODEL` 自 Phase 7 起已不再使用，被 SystemOne 双门神变量取代。
+
+**`CORTEX_AGENT_TOKENS` 启用决策（Issue #32，总监裁定：暂缓启用）**：服务仅绑定 `127.0.0.1:8768`，当前唯一写入方是 Hermes 网关，属于单机回环，不是漏洞敞口而是隔离能力未启用；此时配置只会多出两端需同步维护的 token（轮换与排障成本翻倍），收益拿不到。不存在“只记归属但不强制鉴权”的中间档，该变量非空即强制校验。
+
+满足任一条件时必须切换为启用：
+1. 接入第二个写入方（NAS 实例、第二分身或其他服务）；
+2. 需要按 agent 回溯写入来源；
+3. Cortex 对本机以外的地址可达，哪怕仅在局域网内。
+
+启用时服务端设 `CORTEX_AGENT_TOKENS=<token>:<agent_id>`，插件端设 `CORTEX_TOKEN=<token>`，两端必须同时改，且先重启 Cortex 再重启网关，反向会在窗口期产生 `401`，插件 Fail-open 静默入 Outbox，不易察觉。历史 `agent_id IS NULL` 的行需按 `session_id` 回填，token 轮换写入运维手册。
 
 ---
 
@@ -265,7 +291,7 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 | `/v1/recall` | POST | 统一认知召回 |
 | `/v1/sleep/consolidate` | POST | 触发慢波合成（`dry_run` 仅返回空报告） |
 | `/v1/admin/backfill-display-names` | POST | 黑户展示名转正，默认 `dry_run` |
-| `/v1/admin/purge-scratchpad` | POST | 草稿清洗，默认 `dry_run`，先归档再删除 |
+| `/v1/admin/purge-scratchpad` | POST | 草稿清洗，默认 `dry_run`，先归档再删除；过滤参数 `before_id`、`role`、`before_date`（`YYYY-MM-DD HH:MM:SS`）为 AND 关系 |
 | `/v1/admin/seed` | POST | 预置核心工程资产 |
 
 ### 8.2 MCP stdio 工具（`baize/server/mcp_server.py`）
@@ -276,4 +302,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 17 个套件：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的六个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断），以及 Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 20 个套件，其中 Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本）。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的六个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。

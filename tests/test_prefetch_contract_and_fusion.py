@@ -130,12 +130,15 @@ def test_fusion_is_read_only():
             sp = ScratchpadManager(conn)
             text = "修复上线实测 commit 0b8b352 已验收"
             sp.add_explicit("s", text, "fact", "r", idempotency_key("s", text), "default")
-            before = conn.total_changes
             rows = conn.execute("SELECT * FROM scratchpad_log").fetchall()
+            card = "SELECT entity_id, display_name, version, status, current_decision, metadata_json, updated_at FROM living_states"
+            cards = conn.execute(card).fetchall()
             out = CognitiveRecallRouter(conn).recall(NATURAL_QUERY)
             assert out["strategy"] == "DECISION_TEXT_MATCH" and out["provisional_facts"]
-            assert conn.total_changes == before and not conn.in_transaction
+            assert not conn.in_transaction
             assert conn.execute("SELECT * FROM scratchpad_log").fetchall() == rows
+            assert conn.execute(card).fetchall() == cards
+            assert conn.execute("SELECT hit_count FROM living_states WHERE entity_id = 'proj:baize'").fetchone()[0] == 1
         finally:
             conn.close()
 
