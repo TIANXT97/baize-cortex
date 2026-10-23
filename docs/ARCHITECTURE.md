@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-23（同步至 PR #26，explicit_addition 固化与兜底召回）  
+**最近同步**：2026-10-23（同步至 PR #31，MemoryProvider 契约与透出指示器）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -235,7 +235,13 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 - 触发后短路后续调用，合成返回：“MEMORY.md 空间不足，本轮禁止继续重试 memory 工具。请改用 cortex_add 工具将内容沉淀至白泽 Cortex 长期库。”
 - 一次成功调用或新用户回合开始（`new_turn`）时复位。
 
-### 7.6 部署与归属
+### 7.6 插件端预取契约与记忆透出（Issue #27 / Issue #30）
+
+- **Hermes MemoryProvider 契约对齐**：Hermes 核心调度层 `agent/turn_context.py` 与 `MemoryManager` 要求 `prefetch(self, query: str, *, session_id: str = "") -> str`。若返回非字符串（如 `List`），消费端执行 `.strip()` 会抛出 `AttributeError` 并被调度层 `suppress(Exception)` 静默吞噬。因此插件端将结构化提取出的记忆格式化为换行分隔自然文本（`- [source] [display_name] content`），空召回返回 `""`；
+- **状态指示器透明化**：实现 `recall_status() -> Optional[RecallStatus]`，在上轮命中记忆条数 $>0$ 时返回 `RecallStatus(provider_label="baize-cortex", count=N, glyph="🧠")`，驱动前端渲染召回提示；
+- **群聊安全闸门（Fail-closed）**：对含 `:group:` 或以 `oc_` 开头的群聊会话，`prefetch` 恒返回 `""`，严格阻断私域记忆向群聊外溢。
+
+### 7.7 部署与归属
 
 插件代码在本仓库 `baize/client/` 完成自闭环测试后，由 NAS / 云机部署通道同步至 Hermes 的 `plugins/cortex/`。构建、容器重启与数据库迁移的实际执行由 NAS 侧（夭夭）负责。
 
