@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-23（同步至 Issue #37，新增 `RECENT_TURNS_CONTEXT` 末级召回层；含 PR #35 / Issue #34 的草稿归档待固化记录保护、Issue #32 的召回打分排序与草稿流时间窗归档）  
+**最近同步**：2026-10-23（同步至 Issue #39，`RECENT_TURNS_CONTEXT` 三层收口：代理隔离、噪声过滤、命中数排序；含 Issue #37 的末级召回层、PR #35 / Issue #34 的草稿归档待固化记录保护、Issue #32 的召回打分排序与草稿流时间窗归档）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -122,7 +122,7 @@
 | 2 | `PPR_SPREADING` | 图谱节点 `label` 出现在查询中，得到种子节点 | 在有效子图上做 PPR 扩散，返回能量排序与 `resolved_state` |
 | 3 | `DECISION_TEXT_MATCH` | 没有任何种子节点时的兜底 | 用「原词 + 中文 2-gram」双通道分词，对全部现役卡打分，达到命中门槛的按 §3.3 排序后取前 `top_k`，不再首个命中即返回。置信度 0.6 |
 | 4 | `SCRATCHPAD_EXPLICIT_FALLBACK` | 以上都未命中 | 末级只读兜底：检索 `scratchpad_log` 中 `phase_hint='explicit_addition'` 且 `expired_at IS NULL` 的未固化记录，复用分词、转义 LIKE 通配符，按 `created_at` 倒序取 `top_k`。置信度 0.5，响应带 `provisional=True`、`authoritative=False`、`source_log_ids`、`facts` |
-| 5 | `RECENT_TURNS_CONTEXT` | 以上都未命中，且窗口内有 token 命中的普通对话轮（Issue #37） | 会话短期连续性兜底：检索 `scratchpad_log` 中 `role='user'`、`phase_hint IS NULL`、`expired_at IS NULL`、`created_at >= now - 72h` 的行，按 `created_at` 倒序取 `min(top_k, 3)` 条，每条文本裁剪到 400 字符。置信度 0.35，`provisional=True`、`authoritative=False`，带 `source_log_ids`、`facts`；严格只读 |
+| 5 | `RECENT_TURNS_CONTEXT` | 以上都未命中，且窗口内有 token 命中的普通对话轮（Issue #37 / #39） | 会话短期连续性兜底：检索 `scratchpad_log` 中 `role='user'`、`phase_hint IS NULL`、`expired_at IS NULL`、`created_at >= now - 72h`、`length(trim(raw_text)) >= 6`，且 `agent_id` 为空（未启用 token 时期的历史行）或与当前代理一致的行；查询侧先滤掉纯语气/指示/连接词（`RECENT_TURN_STOPWORDS`），并要求至少一个 ≥3 字的实义词，否则整层不触发。结果按命中 token 数倒序、再按 `created_at` 倒序取 `min(top_k, 3)` 条，每条文本裁剪到 400 字符。置信度 0.35，`provisional=True`、`authoritative=False`，带 `source_log_ids`、`facts`；严格只读 |
 | 6 | `NO_MATCH` | 全部未命中 | 返回空结果，置信度 0.0 |
 
 兜底的约束：Layer 1 活体卡始终是唯一权威，草稿事实只作为未固化窗口期的明确标注回退；草稿兜底纯只读，不进入 PPR 扩散、不修改 `scratchpad_log`；活体卡直达命中时绝不触发兜底；慢波固化之后，同一事实改由活体卡策略命中。

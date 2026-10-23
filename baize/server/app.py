@@ -330,9 +330,11 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         return report
 
     @app.post("/v1/recall")
-    def recall(body: RecallIn):
+    def recall(body: RecallIn, request: Request):
+        # Issue #39:读路径与写路径使用同一个 agent 身份,否则跨代理召回没有隔离依据。
+        agent_id = authenticate(request)
         with lock:
-            return app.state.router.recall(body.query, body.top_k)
+            return app.state.router.recall(body.query, body.top_k, agent_id=agent_id)
 
     @app.post("/v1/admin/backfill-display-names")
     def admin_backfill(body: BackfillIn):
