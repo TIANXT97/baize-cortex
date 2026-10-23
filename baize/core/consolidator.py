@@ -170,11 +170,17 @@ class DreamConsolidator:
         role: Optional[str] = None,
         dry_run: bool = True,
         before_date: Optional[str] = None,
+        include_pending_phase: bool = False,
     ) -> Dict[str, Any]:
-        rows = self.scratchpad.find_for_purge(before_id, role, before_date)
+        rows = self.scratchpad.find_for_purge(before_id, role, before_date, include_pending_phase)
+        protected = 0 if include_pending_phase else self.scratchpad.count_pending_for_purge(
+            before_id, role, before_date
+        )
         ids = [r["id"] for r in rows]
         report: Dict[str, Any] = {
             "dry_run": dry_run,
+            "include_pending_phase": include_pending_phase,
+            "protected_pending": protected,
             "matched": len(rows),
             "ids": ids,
             "sample": [

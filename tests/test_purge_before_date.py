@@ -96,7 +96,7 @@ def test_real_run_archives_losslessly_then_deletes_and_db_stays_healthy():
             conn.commit()
 
             report = DreamConsolidator(conn, archive_dir=arc).purge_scratchpad(
-                before_date="2026-10-01 00:00:00", dry_run=False)
+                before_date="2026-10-01 00:00:00", dry_run=False, include_pending_phase=True)
             assert report["purged"] == 3 and report["ids"] == [ids[0], ids[1], eid]
             assert _remaining(conn) == [ids[2], ids[3]]
             assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

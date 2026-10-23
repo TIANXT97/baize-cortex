@@ -115,6 +115,7 @@ class PurgeIn(BaseModel):
     before_id: Optional[int] = None
     role: Optional[str] = None
     before_date: Optional[str] = None
+    include_pending_phase: bool = False
     dry_run: bool = True
 
 
@@ -346,7 +347,8 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
             raise HTTPException(status_code=422, detail=str(exc))
         with lock:
             return app.state.consolidator.purge_scratchpad(
-                body.before_id, body.role, body.dry_run, before_date=before_date
+                body.before_id, body.role, body.dry_run, before_date=before_date,
+                include_pending_phase=body.include_pending_phase,
             )
 
     @app.post("/v1/admin/seed")
