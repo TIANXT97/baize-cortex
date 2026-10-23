@@ -3,9 +3,10 @@ import json
 import logging
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from baize.client.outbox import Outbox
+from baize.client.recall import extract_memories
 from baize.core.normalization import idempotency_key, normalize_content
 
 log = logging.getLogger("baize.cortex_plugin")
@@ -61,6 +62,7 @@ class CortexClient:
         path: str = "/v1/cortex/add",
     ):
         self._url = base_url.rstrip("/") + path
+        self._recall_url = base_url.rstrip("/") + "/v1/recall"
         self._token = token
         self._session_id = session_id
         self._outbox = outbox
@@ -91,6 +93,18 @@ class CortexClient:
         if len(reason or "") > MAX_REASON:
             return {"status": "error", "message": f"reason 超过 {MAX_REASON} 字符"}
         return self._deliver(normalized, category, reason or "", supersedes_id, None)
+
+    def prefetch(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        try:
+            status, body, _ = self._transport(
+                self._recall_url, {"query": query, "top_k": top_k}, self._headers(), self._timeout
+            )
+            if not 200 <= status < 300:
+                return []
+            return extract_memories(body)
+        except Exception:
+            log.exception("prefetch 失败,本轮不注入记忆")
+            return []
 
     def on_memory_write(
         self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None
