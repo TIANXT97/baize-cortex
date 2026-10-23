@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-22（同步至 Phase A，PR #23）  
+**最近同步**：2026-10-23（同步至 PR #26，explicit_addition 固化与兜底召回）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -70,6 +70,12 @@
 - **模型分工**：配置了 `CORTEX_LLM_URL/KEY` 时由 System 2 抽取 `decision / superseded / display_name / aliases`；未配置或调用失败时降级为正则规则。
 - **无锚点定案兜底（Phase 8）**：授权批准且不带 `proj:` 锚点的记录，依次归入同会话最近出现的实体、30 分钟内最近更新的 ACTIVE 实体，兜底为 `proj:general_decisions`，不再滞留热表。
 - **决策清洗**：定案文本去除半角 `:`、全角 `：` 与首尾空白。
+- **显式沉淀固化（Issue #25）**：`phase_hint="explicit_addition"` 的记录（由 `cortex_add` 写入）不走授权批准门，`_is_authoritative` 语义保持不变，另由 `_is_explicit_addition` 判定准入：
+  - **归属**：只认文本里的 `proj:` 锚点（含别名解析）命中已有合法实体；命中不了一律落入 `proj:general_decisions`。不使用 `_recent_entity()` 回退，不新建陌生实体、图谱节点或共现边；
+  - **无损合并**：同实体多条按 `(created_at, id)` 升序全部并入 `metadata.facts`（含来源 log id、`category`、`reason`），不做“后者胜出”；与 approval 同组时 approval 保持主结论，显式事实并列补充；只有显式事实时 `current_decision` 保持原值，新建的 `proj:general_decisions` 为空字符串（该列 NOT NULL）；
+  - **不固化的情形**：含探索或疑问措辞（`_EXPLORATION_RE`）、或已被 `supersedes_id` 推翻（`expired_at` 非空）的记录留在热表，并出现在慢波报告的 `skipped_explicit`（带 `id` 与原因），不静默丢弃；
+  - **模型边界**：LLM 路径只看到用户 approval 等日志，看不到显式事实；事实无论 LLM 是否可用都写入卡片；
+  - **幂等与原子性**：卡片写入与日志清退仍在同一个 `BEGIN IMMEDIATE` 事务内，失败整体回滚，重复运行不产生重复条目；冷归档 jsonl 额外保存 `category`、`reason`。
 
 ### 2.5 Phase A 增量列（三表共有）
 
@@ -106,16 +112,17 @@
 
 ### 3.2 统一认知召回路由 (Phase 4 / Phase 6)
 
-`CognitiveRecallRouter.recall(query, top_k)` 按优先级路由：
-
-按以下顺序依次尝试，命中即返回：
+`CognitiveRecallRouter.recall(query, top_k)` 按以下顺序依次尝试，命中即返回：
 
 | 顺序 | 路由 | 触发 | 说明 |
 |---|---|---|---|
 | 1 | `LIVING_STATE_DIRECT` | 查询命中活体卡的 `display_name` 或 `aliases` | 名称出现在原查询或剥离语气助词后的查询中即命中；反向包含（剥离后的查询是名称的子串）仅在名称长度不少于 4 时生效。置信度 1.0 |
 | 2 | `PPR_SPREADING` | 图谱节点 `label` 出现在查询中，得到种子节点 | 在有效子图上做 PPR 扩散，返回能量排序与 `resolved_state` |
-| 3 | `DECISION_TEXT_MATCH` | 没有任何种子节点时的兜底 | 剥离助词后长度不少于 2，用分词（`[一-鿿A-Za-z0-9_]{2,}`）匹配现役 `current_decision` 文本。置信度 0.6 |
-| 4 | `NO_MATCH` | 全部未命中 | 返回空结果，置信度 0.0 |
+| 3 | `DECISION_TEXT_MATCH` | 没有任何种子节点时的兜底 | 剥离助词后长度不少于 2，用分词（`[一-鿿A-Za-z0-9_]{2,}`）匹配现役 `current_decision` 与 `metadata.facts` 文本。置信度 0.6 |
+| 4 | `SCRATCHPAD_EXPLICIT_FALLBACK` | 以上都未命中 | 末级只读兜底：检索 `scratchpad_log` 中 `phase_hint='explicit_addition'` 且 `expired_at IS NULL` 的未固化记录，复用分词、转义 LIKE 通配符，按 `created_at` 倒序取 `top_k`。置信度 0.5，响应带 `provisional=True`、`authoritative=False`、`source_log_ids`、`facts` |
+| 5 | `NO_MATCH` | 全部未命中 | 返回空结果，置信度 0.0 |
+
+兜底的约束：Layer 1 活体卡始终是唯一权威，草稿事实只作为未固化窗口期的明确标注回退；兜底纯只读，不更新热度计数、不进入 PPR 扩散、不修改任何数据库状态；活体卡命中时绝不触发兜底；慢波固化之后，同一事实改由活体卡策略命中。
 
 ---
 
@@ -194,6 +201,7 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 - **凭据**：配置 `CORTEX_AGENT_TOKENS` 后要求 `Authorization: Bearer <token>`，服务端据此确定 `agent_id`，忽略请求体里伪造的 `source`、信任等级、`agent_id` 字段；缺凭据 `401`，凭据无效 `403`；
 - **幂等**：`idempotency_key` 命中已有记录返回 `200`，响应含已存 `id` 与 `deduplicated: true`；若该键已被其他 `agent_id` 占用返回 `409`；
 - **状态码语义**：`413` 内容超长，`422` 内容不可接受，`401/403` 凭据问题，`409` 幂等键被其他 agent 占用，`5xx` 服务端临时故障。服务端当前不主动返回 `429`；客户端 Outbox 已按 `429` + `Retry-After` 实现遵守逻辑，供前置网关限流时使用；
+- **`explicit_addition` 标记保护**：`phase_hint="explicit_addition"` 只能由 `cortex_add` 内部路径写入。`ScratchpadManager.append_log` 直接拒绝该值，`POST /v1/scratchpad/log` 返回 `422`，MCP `baize_scratchpad_log` 返回错误，防止客户端伪造显式沉淀；
 - **`supersedes_id`**：同一事务内校验“目标存在、非自身、同 `agent_id`”，通过后将旧记录的 `expired_at` 置为当前时间、`invalid_at` 置为新记录的 `valid_at`，并写入一条 `superseded_by` 图谱边。不带 `supersedes_id` 时不凭空造边。
 
 ### 7.3 规范化与幂等键
@@ -262,4 +270,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 15 个套件：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，以及 Phase A 的六个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 17 个套件：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的六个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断），以及 Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性）。

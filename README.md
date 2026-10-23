@@ -115,6 +115,8 @@ baize-cortex/
 │   ├── test_phase6_semantic_alias.py # Phase 6: 别名提纯与语义召回
 │   ├── test_phase7_systemone_gates.py # Phase 7: SystemOne 双门神
 │   ├── test_phase8_consolidation_closure.py # Phase 8: 慢波合成收口与管理接口
+│   ├── test_explicit_addition_consolidation.py # Issue #25: 显式沉淀慢波固化
+│   ├── test_explicit_addition_recall.py # Issue #25: 未固化事实的兜底召回
 │   ├── test_phase_a_*.py           # Phase A: 迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断
 │   └── fixtures/normalization_vectors.json # 规范化 golden vectors
 ├── README.md
