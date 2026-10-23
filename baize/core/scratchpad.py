@@ -1,13 +1,14 @@
 """Layer 0: 瞬态草稿流管理器"""
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
 EXPLICIT_HINT = "explicit_addition"
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 _MAX_SEARCH_TOKENS = 16
+RECENT_TURN_MAX_CHARS = 400
 _TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
 
 
@@ -73,6 +74,38 @@ class ScratchpadManager:
             (*params, limit),
         ).fetchall()
         return [{"id": r[0], "text": r[1], "category": r[2], "created_at": r[3]} for r in rows]
+
+    def search_recent_turns(
+        self, tokens: List[str], limit: int = 3, max_age_hours: float = 72.0,
+        max_chars: int = RECENT_TURN_MAX_CHARS,
+    ) -> List[Dict[str, Any]]:
+        """Issue #37:普通对话轮次的末级召回通道。
+
+        网关每轮都会把 user/assistant 文本写进 Layer 0,但 `phase_hint` 只在 PhaseDetector 判
+        decision_approved 时才非空,而固化器与 explicit 兜底都只认 `phase_hint IS NOT NULL`——
+        于是普通对话永久只写不读。这里绕开 phase_hint 语义直接按 role + 时间窗 + token 命中取行,
+        只服务"跨会话短期连续性",因此窗口短、条数少、文本裁剪,且严格只读。
+        """
+        words = [t for t in tokens if t][:_MAX_SEARCH_TOKENS]
+        if not words or limit <= 0 or max_age_hours <= 0:
+            return []
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).strftime(TIMESTAMP_FORMAT)
+        clause = " OR ".join("raw_text LIKE ? ESCAPE '\\'" for _ in words)
+        params: List[Any] = [f"%{_escape_like(t)}%" for t in words]
+        rows = self.conn.execute(
+            f"""
+            SELECT id, raw_text, created_at FROM scratchpad_log
+            WHERE role = 'user' AND phase_hint IS NULL AND expired_at IS NULL
+              AND created_at >= ? AND ({clause})
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (cutoff, *params, limit),
+        ).fetchall()
+        return [
+            {"id": r[0], "text": (r[1] or "")[:max_chars], "category": None, "created_at": r[2]}
+            for r in rows
+        ]
 
     def find_by_idempotency_key(self, key: str) -> Optional[Tuple[int, Optional[str]]]:
         row = self.conn.execute(

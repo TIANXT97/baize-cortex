@@ -12,6 +12,15 @@
 - 新增测试 `test_purge_protect_phase_hints.py`（6 条），其中一条验证默认归档之后 approval 仍能被下一次慢波合成固化；`test_purge_before_date.py` 中归档显式沉淀记录的用例改为显式打开开关。
 - 夭夭已在生产环境实测并完成部署。
 
+### 新增：普通对话轮次末级召回层 RECENT_TURNS_CONTEXT（Issue #37）
+- **现象**：美西生产实测，老板 `/new` 开新会话后要求验收上一轮改动，分身手里没有任何上一轮上下文，只能回翻会话库。`scratchpad_log` 里当轮 user/assistant 行（id=197/198）都在，但 `/v1/recall` 对「重启开新会话了，你测吧」返回 `NO_MATCH`——**写入正常，召回结构性不通**。
+- **根因**：插件 `sync_turn` 只在文本含「定案/决定/确认/批准/同意」且 PhaseDetector 判 `decision_approved` 时才写 `phase_hint`，普通轮次恒为 `NULL`；而第 4 层兜底 `SCRATCHPAD_EXPLICIT_FALLBACK` 与固化器都只查 `phase_hint` 非空（`scratchpad.py:69`/`:161`），于是普通对话只写不读。
+- **修复**：`ScratchpadManager.search_recent_turns()` 绕过 `phase_hint` 语义，按 `role='user'` + `expired_at IS NULL` + 72 小时窗口 + token 命中取行，文本裁剪到 400 字符；`CognitiveRecallRouter` 在其后新增末级策略 `RECENT_TURNS_CONTEXT`（置信度 0.35，`provisional=True`，`authoritative=False`，最多 3 条），只在活体卡、PPR、决策文本、显式事实全部落空后触发。
+- **否决方案**：给普通轮次写 `phase_hint='turn'`。`phase_hint IS NOT NULL` 是固化器入队条件（`export_pending_phase_logs`），会把闲聊灌进 `living_states`。
+- **不变式**：显式事实（`cortex_add`）优先级高于对话层；召回严格只读，不写库、不改 `hit_count`；无 token 命中仍返回 `NO_MATCH`，不会把旧对话整段倒出来。
+- 新增测试：`test_recent_turns_recall.py`（7 例）。全量 `138 passed`（原 131 + 7）。
+- 未验证：未在 24 小时以上的真实对话流上做召回精度抽样；72 小时窗口与 3 条上限是拍的初值，需要用实弹数据回调。
+
 ### 召回精度与时效排序、草稿流时间窗归档（PR #33，Issue #32）
 - **召回漏召回**：连续中文原先被整体当作一个 token，`recall("飞书卡片")` 无法命中『飞书流式卡片』。分词改为「原词 + 中文 2-gram」双通道，不需要用户手动加空格。
 - **召回错召回**：原先按 `list_active_states()` 的物理顺序遍历、首个命中即返回，`recall("飞书 流式")` 会被排在第一的模具知识库抢占。改为对全部现役卡打分，`Score = 3×display_name + 2×alias + 1×decision/facts + 2×命中 token 数 + max(0, 1 − 0.05×距上次更新天数)`，按 Score 降序、同分取 `updated_at` 新者、再按 `entity_id` 取前 `top_k`。每条 `living_states` 带 `score`。

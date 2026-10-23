@@ -16,6 +16,8 @@ _PARTICLES = ("的", "什么", "怎么", "定的", "呢", "吗", "吧", "啊")
 _TOKEN_RE = re.compile(r"[一-鿿A-Za-z0-9_]{2,}")
 _CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
 _DECAY_PER_DAY = 0.05
+_RECENT_TURNS_CONFIDENCE = 0.35
+_RECENT_TURNS_MAX = 3
 
 Scored = Tuple[Dict[str, Any], Optional[float]]
 
@@ -109,6 +111,10 @@ class CognitiveRecallRouter:
             provisional = self._explicit_fallback(query, top_k)
             if provisional is not None:
                 return self._finish(provisional, [], provisional["facts"])
+            # Issue #37:显式事实也没有时,退到普通对话轮次(短期连续性),这才接得上上一轮的任务。
+            recent = self._recent_turns_fallback(query, top_k)
+            if recent is not None:
+                return self._finish(recent, [], recent["facts"])
             result = {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
             return self._finish(result, [], [])
 
@@ -212,6 +218,31 @@ class CognitiveRecallRouter:
         return {
             "strategy": "SCRATCHPAD_EXPLICIT_FALLBACK",
             "confidence": 0.5,
+            "provisional": True,
+            "authoritative": False,
+            "source_log_ids": [r["id"] for r in rows],
+            "facts": rows,
+            "state": None,
+            "nodes": [],
+        }
+
+    def _recent_turns_fallback(self, query: str, top_k: int) -> Optional[Dict[str, Any]]:
+        """Issue #37:末级兜底——窗口内的普通 user 轮次。
+
+        只在活体卡、决策文本匹配、显式事实三路全部落空之后才轮到它,置信度压到 0.35 并标记
+        provisional,避免闲聊抢占权威记忆。
+        """
+        stripped = _strip_particles(query)
+        if len(stripped) < 2:
+            return None
+        rows = self.scratchpad.search_recent_turns(
+            _scoring_tokens(query), limit=min(top_k, _RECENT_TURNS_MAX)
+        )
+        if not rows:
+            return None
+        return {
+            "strategy": "RECENT_TURNS_CONTEXT",
+            "confidence": _RECENT_TURNS_CONFIDENCE,
             "provisional": True,
             "authoritative": False,
             "source_log_ids": [r["id"] for r in rows],
