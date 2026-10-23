@@ -4,6 +4,17 @@
 
 ## 2026-10-23
 
+### 修复：RECENT_TURNS_CONTEXT 三层收口（Issue #39）
+- **现象**：美西分身对 PR #38 做验收，七条标准全过、自动注入首次打通（`messages.id=2614` 带出跨 34 小时的两条历史对话），但新层自身带出三个缺陷。老板只发一句「好，按你说的办」，注入块就被拖进三条无关历史对话——`你说的` → 2-gram `你说`/`说的` → 命中三条闲聊，其中一条是群聊旧话。
+- **代理隔离**：`search_recent_turns` 原先没有 `agent_id` 条件，多代理配置 token 后 beta 代理的对话会进 default 代理的注入块。现在查询新增 `(? IS NULL OR agent_id IS NULL OR agent_id = ?)`，`agent_id IS NULL` 属于未启用 token 时期的历史行，放行以免记忆断层；`/v1/recall` 与写路径共用同一个 `authenticate(request)` 身份。
+- **噪声收口**：新增 `RECENT_TURN_STOPWORDS`（纯语气/指示/连接词：可以、这个、然后、好的、你说……），过滤后若没有至少一个 ≥3 字的实义词，整层不触发——单 token 或纯 2-gram 碎片不足以「接上上一轮」。
+- **零信息量行**：`RECENT_TURN_MIN_CHARS = 6`，整行只有两三个字的应答（实测库里 id=118 原文就是「可以」两个字）不再被当记忆注入。
+- **排序**：从 `created_at DESC` 改为 `hits DESC, created_at DESC`（SQL 侧 `sum(CASE WHEN LIKE ...)` 计算命中 token 数），高频词命中三条行时不再由「最新」决定谁上来。
+- **注入可读性**：插件侧注入行改为 `- [source · YYYY-MM-DD HH:MM] …`，34 小时前与 1 小时前的条目从此可区分。插件源码不在本仓库，改动落在部署副本，需与本仓库外维护的副本同步。
+- 新增测试：`test_recent_turns_hardening.py`（7 例，覆盖代理隔离、NULL 历史行仍可召回、零信息量行、四个纯语气词、口头禅不拖旧话、实质短查询仍召回、命中数排序）。全量 `145 passed`。
+- 回归探针：`cortex-memory-acceptance/scripts/cortex_rt_regression.py` 五段 19 断言，修复前基线 15/19（4 条 FAIL 精确对应本 issue），修复后复跑应为 19/19。
+- 未验证：停用词表是人工枚举的 20 个词，未在长周期真实对话流上统计误杀率；`min_chars=6` 是拍的初值。
+
 ### 修复：草稿归档默认豁免待固化记录（PR #35，Issue #34）
 - 现象：美西分身在生产副本上对 PR #33 做 `before_date=2026-10-22 00:00:00` 的归档演练，匹配出的 61 条里混入一条 `phase_hint='approval'` 的权威定案（id=35）。`find_for_purge` 只按 `before_id`、`role`、`before_date` 过滤，完全没有 `phase_hint` 维度，积压超过窗口的定案会被常规清理静默删除，慢波合成再也读不到。
 - 修复：`find_for_purge` 默认追加 `phase_hint IS NULL`，`ScratchpadManager`、`purge_scratchpad`、`PurgeIn` 与 CLI 新增 `include_pending_phase`（CLI 为 `--include-pending-phase`），默认关闭。

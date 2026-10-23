@@ -9,6 +9,7 @@ EXPLICIT_HINT = "explicit_addition"
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 _MAX_SEARCH_TOKENS = 16
 RECENT_TURN_MAX_CHARS = 400
+RECENT_TURN_MIN_CHARS = 6  # 行侧下限：整行只有「可以」「好的」这种两字应答不构成记忆
 _TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
 
 
@@ -77,7 +78,8 @@ class ScratchpadManager:
 
     def search_recent_turns(
         self, tokens: List[str], limit: int = 3, max_age_hours: float = 72.0,
-        max_chars: int = RECENT_TURN_MAX_CHARS,
+        max_chars: int = RECENT_TURN_MAX_CHARS, agent_id: Optional[str] = None,
+        min_chars: int = RECENT_TURN_MIN_CHARS,
     ) -> List[Dict[str, Any]]:
         """Issue #37:普通对话轮次的末级召回通道。
 
@@ -85,6 +87,12 @@ class ScratchpadManager:
         decision_approved 时才非空,而固化器与 explicit 兜底都只认 `phase_hint IS NOT NULL`——
         于是普通对话永久只写不读。这里绕开 phase_hint 语义直接按 role + 时间窗 + token 命中取行,
         只服务"跨会话短期连续性",因此窗口短、条数少、文本裁剪,且严格只读。
+
+        Issue #39 收口:
+        - `agent_id` 非空时按代理隔离;NULL 属于未启用 token 时期的历史行,放行以免记忆断层。
+        - `min_chars` 过滤零信息量的应答行(「可以」「好的」),这类行被召回只会污染上下文。
+        - 按命中 token 数排序再按时间排序,不再单纯"新的优先",否则一个高频词就能把
+          三条与当前话题无关的旧对话顶上来。
         """
         words = [t for t in tokens if t][:_MAX_SEARCH_TOKENS]
         if not words or limit <= 0 or max_age_hours <= 0:
@@ -92,18 +100,28 @@ class ScratchpadManager:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).strftime(TIMESTAMP_FORMAT)
         clause = " OR ".join("raw_text LIKE ? ESCAPE '\\'" for _ in words)
         params: List[Any] = [f"%{_escape_like(t)}%" for t in words]
+        hits_expr = " + ".join(
+            "(CASE WHEN raw_text LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)" for _ in words
+        )
         rows = self.conn.execute(
             f"""
-            SELECT id, raw_text, created_at FROM scratchpad_log
+            SELECT id, raw_text, created_at, ({hits_expr}) AS hits
+            FROM scratchpad_log
             WHERE role = 'user' AND phase_hint IS NULL AND expired_at IS NULL
-              AND created_at >= ? AND ({clause})
-            ORDER BY created_at DESC, id DESC
+              AND created_at >= ?
+              AND length(trim(raw_text)) >= ?
+              AND (? IS NULL OR agent_id IS NULL OR agent_id = ?)
+              AND ({clause})
+            ORDER BY hits DESC, created_at DESC, id DESC
             LIMIT ?
             """,
-            (cutoff, *params, limit),
+            (*params, cutoff, min_chars, agent_id, agent_id, *params, limit),
         ).fetchall()
         return [
-            {"id": r[0], "text": (r[1] or "")[:max_chars], "category": None, "created_at": r[2]}
+            {
+                "id": r[0], "text": (r[1] or "")[:max_chars], "category": None,
+                "created_at": r[2], "hits": r[3],
+            }
             for r in rows
         ]
 

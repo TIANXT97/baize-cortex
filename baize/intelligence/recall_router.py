@@ -18,6 +18,15 @@ _CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
 _DECAY_PER_DAY = 0.05
 _RECENT_TURNS_CONFIDENCE = 0.35
 _RECENT_TURNS_MAX = 3
+# Issue #39:纯语气/指示/连接词命中不算"接上了上一轮",它们在任何一句闲聊里都会出现。
+_RECENT_TURN_STOPWORDS = frozenset({
+    "可以", "好的", "好啊", "嗯嗯", "哦哦", "哈哈",
+    "这个", "那个", "这样", "那样", "这边", "那边",
+    "然后", "所以", "但是", "而且", "就是",
+    "你说", "说的", "我说",
+})
+# 只有 2-gram 碎片撑不起一次召回:至少一个 >= 3 字的实义词,否则整层不触发。
+_RECENT_TURN_MIN_CONTENT_LEN = 3
 
 Scored = Tuple[Dict[str, Any], Optional[float]]
 
@@ -85,7 +94,7 @@ class CognitiveRecallRouter:
         self.graph = BiTemporalGraphManager(conn)
         self.ppr = ppr_engine or PPREngine()
 
-    def recall(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+    def recall(self, query: str, top_k: int = 5, agent_id: Optional[str] = None) -> Dict[str, Any]:
         top_k = max(1, int(top_k))
         now = datetime.now(timezone.utc)
         tokens = _scoring_tokens(query)
@@ -112,7 +121,7 @@ class CognitiveRecallRouter:
             if provisional is not None:
                 return self._finish(provisional, [], provisional["facts"])
             # Issue #37:显式事实也没有时,退到普通对话轮次(短期连续性),这才接得上上一轮的任务。
-            recent = self._recent_turns_fallback(query, top_k)
+            recent = self._recent_turns_fallback(query, top_k, agent_id)
             if recent is not None:
                 return self._finish(recent, [], recent["facts"])
             result = {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
@@ -226,17 +235,25 @@ class CognitiveRecallRouter:
             "nodes": [],
         }
 
-    def _recent_turns_fallback(self, query: str, top_k: int) -> Optional[Dict[str, Any]]:
+    def _recent_turns_fallback(
+        self, query: str, top_k: int, agent_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """Issue #37:末级兜底——窗口内的普通 user 轮次。
 
         只在活体卡、决策文本匹配、显式事实三路全部落空之后才轮到它,置信度压到 0.35 并标记
         provisional,避免闲聊抢占权威记忆。
+
+        Issue #39:过滤掉纯语气/指示词,并要求 query 里至少有一个 >= 3 字的实义词,否则整层
+        不触发——「可以」「这个」「然后」这类词不该把三条无关旧对话拉进上下文。
         """
         stripped = _strip_particles(query)
         if len(stripped) < 2:
             return None
+        tokens = [t for t in _scoring_tokens(query) if t not in _RECENT_TURN_STOPWORDS]
+        if not any(len(t) >= _RECENT_TURN_MIN_CONTENT_LEN for t in tokens):
+            return None
         rows = self.scratchpad.search_recent_turns(
-            _scoring_tokens(query), limit=min(top_k, _RECENT_TURNS_MAX)
+            tokens, limit=min(top_k, _RECENT_TURNS_MAX), agent_id=agent_id
         )
         if not rows:
             return None
