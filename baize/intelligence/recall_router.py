@@ -25,6 +25,28 @@ def _tokens(text: str) -> List[str]:
     return _TOKEN_RE.findall(text)
 
 
+def _with_living_states(
+    result: Dict[str, Any], state: Optional[Dict[str, Any]], provisional_rows: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    entries: List[Dict[str, Any]] = []
+    if state is not None:
+        entries.append({**state, "provisional": False, "authoritative": True})
+    for row in provisional_rows:
+        entries.append({
+            "entity_id": f"scratchpad:{row['id']}",
+            "display_name": "未固化记录",
+            "current_decision": row["text"],
+            "metadata": {},
+            "provisional": True,
+            "authoritative": False,
+            "source_log_id": row["id"],
+            "category": row.get("category"),
+            "created_at": row.get("created_at"),
+        })
+    result["living_states"] = entries
+    return result
+
+
 class CognitiveRecallRouter:
     def __init__(self, conn: sqlite3.Connection, ppr_engine: Optional[PPREngine] = None):
         self.conn = conn
@@ -36,26 +58,36 @@ class CognitiveRecallRouter:
     def recall(self, query: str, top_k: int = 5) -> Dict[str, Any]:
         state = self._match_living_state(query)
         if state is not None:
-            return {"strategy": "LIVING_STATE_DIRECT", "confidence": 1.0, "state": state, "nodes": []}
+            result = {"strategy": "LIVING_STATE_DIRECT", "confidence": 1.0, "state": state, "nodes": []}
+            return _with_living_states(result, state, [])
 
         seeds = self._match_seed_nodes(query)
         if not seeds:
             state = self._match_decision_text(query)
             if state is not None:
-                return {"strategy": "DECISION_TEXT_MATCH", "confidence": 0.6, "state": state, "nodes": []}
+                result = {"strategy": "DECISION_TEXT_MATCH", "confidence": 0.6, "state": state, "nodes": []}
+                fallback = self._explicit_fallback(query, top_k)
+                rows = fallback["facts"] if fallback else []
+                if rows:
+                    result["provisional_facts"] = rows
+                    result["source_log_ids"] = [r["id"] for r in rows]
+                return _with_living_states(result, state, rows)
             provisional = self._explicit_fallback(query, top_k)
             if provisional is not None:
-                return provisional
-            return {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
+                return _with_living_states(provisional, None, provisional["facts"])
+            result = {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
+            return _with_living_states(result, None, [])
 
         energy = self.ppr.run_ppr(self.graph.get_active_subgraph(), seeds)
         ranking = [{"node_id": node, "energy": score} for node, score in energy.items() if score > 0][:top_k]
-        return {
+        resolved = self._resolve_first_active_state(ranking)
+        result = {
             "strategy": "PPR_SPREADING",
             "seed_nodes": seeds,
             "ranking": ranking,
-            "resolved_state": self._resolve_first_active_state(ranking),
+            "resolved_state": resolved,
         }
+        return _with_living_states(result, resolved, [])
 
     def _match_living_state(self, query: str) -> Optional[Dict[str, Any]]:
         stripped = _strip_particles(query)
