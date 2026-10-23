@@ -6,6 +6,7 @@ import sqlite3
 from typing import Any, Dict, List, Optional
 
 from baize.core.living_state import LivingStateManager
+from baize.core.scratchpad import ScratchpadManager
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.intelligence.ppr_engine import PPREngine
 
@@ -28,6 +29,7 @@ class CognitiveRecallRouter:
     def __init__(self, conn: sqlite3.Connection, ppr_engine: Optional[PPREngine] = None):
         self.conn = conn
         self.living = LivingStateManager(conn)
+        self.scratchpad = ScratchpadManager(conn)
         self.graph = BiTemporalGraphManager(conn)
         self.ppr = ppr_engine or PPREngine()
 
@@ -41,6 +43,9 @@ class CognitiveRecallRouter:
             state = self._match_decision_text(query)
             if state is not None:
                 return {"strategy": "DECISION_TEXT_MATCH", "confidence": 0.6, "state": state, "nodes": []}
+            provisional = self._explicit_fallback(query, top_k)
+            if provisional is not None:
+                return provisional
             return {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
 
         energy = self.ppr.run_ppr(self.graph.get_active_subgraph(), seeds)
@@ -70,10 +75,31 @@ class CognitiveRecallRouter:
         if len(stripped) < 2:
             return None
         for state in self.living.list_active_states():
-            decision = state["current_decision"] or ""
-            if any(len(tok) >= 2 and tok in decision for tok in _tokens(stripped)):
+            facts = state["metadata"].get("facts", [])
+            texts = [state["current_decision"] or ""]
+            texts += [f.get("text", "") for f in facts if isinstance(f, dict)]
+            haystack = "\n".join(texts)
+            if any(len(tok) >= 2 and tok in haystack for tok in _tokens(stripped)):
                 return state
         return None
+
+    def _explicit_fallback(self, query: str, top_k: int) -> Optional[Dict[str, Any]]:
+        stripped = _strip_particles(query)
+        if len(stripped) < 2:
+            return None
+        rows = self.scratchpad.search_explicit(_tokens(stripped), top_k)
+        if not rows:
+            return None
+        return {
+            "strategy": "SCRATCHPAD_EXPLICIT_FALLBACK",
+            "confidence": 0.5,
+            "provisional": True,
+            "authoritative": False,
+            "source_log_ids": [r["id"] for r in rows],
+            "facts": rows,
+            "state": None,
+            "nodes": [],
+        }
 
     def _match_seed_nodes(self, query: str) -> Dict[str, float]:
         rows = self.conn.execute("SELECT node_id, label FROM graph_nodes").fetchall()

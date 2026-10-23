@@ -4,6 +4,14 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
+EXPLICIT_HINT = "explicit_addition"
+_MAX_SEARCH_TOKENS = 16
+
+
+def _escape_like(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -22,6 +30,8 @@ class ScratchpadManager:
         idempotency_key: Optional[str] = None,
         agent_id: Optional[str] = None,
     ) -> int:
+        if phase_hint == EXPLICIT_HINT:
+            raise ValueError("phase_hint=explicit_addition 仅限 cortex_add 内部路径使用")
         now = _utc_now()
         cur = self.conn.execute(
             """
@@ -33,6 +43,23 @@ class ScratchpadManager:
         )
         self.conn.commit()
         return cur.lastrowid
+
+    def search_explicit(self, tokens: List[str], limit: int = 5) -> List[Dict[str, Any]]:
+        tokens = [t for t in tokens if t][:_MAX_SEARCH_TOKENS]
+        if not tokens or limit <= 0:
+            return []
+        clause = " OR ".join("raw_text LIKE ? ESCAPE '\\'" for _ in tokens)
+        params: List[Any] = [f"%{_escape_like(t)}%" for t in tokens]
+        rows = self.conn.execute(
+            f"""
+            SELECT id, raw_text, category, created_at FROM scratchpad_log
+            WHERE phase_hint = '{EXPLICIT_HINT}' AND expired_at IS NULL AND ({clause})
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [{"id": r[0], "text": r[1], "category": r[2], "created_at": r[3]} for r in rows]
 
     def find_by_idempotency_key(self, key: str) -> Optional[Tuple[int, Optional[str]]]:
         row = self.conn.execute(
@@ -96,7 +123,8 @@ class ScratchpadManager:
     def export_pending_phase_logs(self, date_str: Optional[str] = None) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
             """
-            SELECT id, session_id, role, raw_text, phase_hint, noul_score, created_at
+            SELECT id, session_id, role, raw_text, phase_hint, noul_score, created_at,
+                   expired_at, category, reason
             FROM scratchpad_log
             WHERE phase_hint IS NOT NULL
               AND (? IS NULL OR date(created_at) = ?)
@@ -104,7 +132,7 @@ class ScratchpadManager:
             """,
             (date_str, date_str),
         ).fetchall()
-        return [_row_to_log(r) for r in rows]
+        return [{**_row_to_log(r), "expired_at": r[7], "category": r[8], "reason": r[9]} for r in rows]
 
 
 def _row_to_log(row) -> Dict[str, Any]:

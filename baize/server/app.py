@@ -18,7 +18,7 @@ from baize.core.living_state import LivingStateManager
 from baize.core.normalization import idempotency_key as make_idempotency_key
 from baize.core.normalization import normalize_content
 from baize.core.supersession import supersede
-from baize.core.scratchpad import ScratchpadManager
+from baize.core.scratchpad import EXPLICIT_HINT, ScratchpadManager
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.core.seeds import seed_initial_assets
 from baize.intelligence.phase_detector import OpenAICompatClient, PhaseDetector, llm_settings_from_env
@@ -185,6 +185,8 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
     @app.post("/v1/scratchpad/log")
     def scratchpad_log(body: ScratchpadLogIn, request: Request):
         agent_id = authenticate(request)
+        if body.phase_hint == EXPLICIT_HINT:
+            raise HTTPException(status_code=422, detail="phase_hint=explicit_addition 仅限 /v1/cortex/add 内部使用")
         if body.idempotency_key:
             if not body.raw_text.strip():
                 raise HTTPException(status_code=422, detail="content 不能为空")

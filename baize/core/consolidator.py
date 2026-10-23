@@ -14,7 +14,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from baize.core.living_state import LivingStateManager
-from baize.core.scratchpad import ScratchpadManager
+from baize.core.scratchpad import EXPLICIT_HINT, ScratchpadManager
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.storage.db import init_db
 
@@ -40,8 +40,30 @@ def _is_authoritative(log: Dict[str, Any]) -> bool:
     )
 
 
+def _is_explicit_addition(log: Dict[str, Any]) -> bool:
+    return log.get("phase_hint") == EXPLICIT_HINT and not _EXPLORATION_RE.search(log["raw_text"])
+
+
 def _clean_decision(text: Optional[str]) -> Optional[str]:
     return (text or "").lstrip(_LEADING_PUNCT).strip() or None
+
+
+def _resolve_explicit_entity(text: str, index: Dict[str, str]) -> str:
+    for anchor in _ENTITY_RE.findall(text):
+        if anchor in index:
+            return index[anchor]
+        bare = anchor[len("proj:"):]
+        if bare in index:
+            return index[bare]
+    return _GENERAL_ENTITY
+
+
+def _merge_facts(current: Optional[Dict[str, Any]], new: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    existing = current["metadata"].get("facts", []) if current else []
+    if not isinstance(existing, list):
+        existing = []
+    seen = {fact.get("id") for fact in existing if isinstance(fact, dict)}
+    return existing + [fact for fact in new if fact["id"] not in seen]
 
 
 def _split_aliases(raw: str) -> List[str]:
@@ -86,10 +108,15 @@ class DreamConsolidator:
 
     def run_consolidation(self, target_date: Optional[str] = None) -> Dict[str, Any]:
         phase_logs = self.scratchpad.export_pending_phase_logs(target_date)
-        plans = self._analyze(phase_logs)
+        explicit_logs = [log for log in phase_logs if log["phase_hint"] == EXPLICIT_HINT]
+        plans = self._analyze([log for log in phase_logs if log["phase_hint"] != EXPLICIT_HINT])
+        skipped = self._merge_explicit(plans, explicit_logs)
         folded = [log for plan in plans for log in plan["logs"]]
         if not folded:
-            return {"status": "ok", "archived_logs": 0, "updated_states": [], "archive_file": None}
+            return {
+                "status": "ok", "archived_logs": 0, "updated_states": [],
+                "archive_file": None, "skipped_explicit": skipped,
+            }
         archive_file = self._write_archive(folded, f"scratchpad_{target_date or 'all'}")
         updated_states = self._apply(plans)
         return {
@@ -97,7 +124,44 @@ class DreamConsolidator:
             "archived_logs": len(folded),
             "updated_states": updated_states,
             "archive_file": archive_file,
+            "skipped_explicit": skipped,
         }
+
+    def _merge_explicit(self, plans: List[Dict[str, Any]], logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        skipped: List[Dict[str, Any]] = []
+        by_entity = {plan["entity_id"]: plan for plan in plans}
+        index = self._entity_index()
+        index.update({entity_id: entity_id for entity_id in by_entity})
+        for log in sorted(logs, key=lambda item: (item["created_at"], item["id"])):
+            if log.get("expired_at"):
+                skipped.append({"id": log["id"], "reason": "已被后续记录推翻(supersedes_id),不再固化"})
+                continue
+            if not _is_explicit_addition(log):
+                skipped.append({"id": log["id"], "reason": "含探索或疑问措辞,不作为事实固化"})
+                continue
+            entity_id = _resolve_explicit_entity(log["raw_text"], index)
+            plan = by_entity.get(entity_id)
+            if plan is None:
+                plan = {
+                    "entity_id": entity_id, "logs": [], "decision": None, "superseded": None,
+                    "display_name": None, "aliases": [], "facts": [],
+                }
+                by_entity[entity_id] = plan
+                plans.append(plan)
+            plan["logs"].append(log)
+            plan.setdefault("facts", []).append({
+                "id": log["id"], "text": log["raw_text"], "category": log.get("category"),
+                "reason": log.get("reason"), "created_at": log["created_at"],
+            })
+        return skipped
+
+    def _entity_index(self) -> Dict[str, str]:
+        index: Dict[str, str] = {}
+        for state in self.living.list_active_states():
+            index[state["entity_id"]] = state["entity_id"]
+            for alias in state["metadata"].get("aliases", []):
+                index.setdefault(alias, state["entity_id"])
+        return index
 
     def purge_scratchpad(
         self,
@@ -232,6 +296,7 @@ class DreamConsolidator:
                         "id": log["id"], "session_id": log["session_id"], "role": log["role"],
                         "raw_text": log["raw_text"], "phase_hint": log["phase_hint"],
                         "noul_score": log["noul_score"], "created_at": log["created_at"],
+                        "category": log.get("category"), "reason": log.get("reason"),
                     }, ensure_ascii=False) + "\n"
                     gz.write(line.encode("utf-8"))
             raw.flush()
@@ -250,6 +315,24 @@ class DreamConsolidator:
                 display = self.living.resolve_display_name(entity_id, plan["display_name"])
                 existing_aliases = current["metadata"].get("aliases", []) if current else []
                 aliases = _union(existing_aliases, plan["aliases"])
+                metadata: Dict[str, Any] = {}
+                if aliases:
+                    metadata["aliases"] = aliases
+                facts = _merge_facts(current, plan.get("facts", []))
+                if facts:
+                    metadata["facts"] = facts
+
+                if decision is None:
+                    self.living.update_decision(
+                        entity_id,
+                        display,
+                        current["current_decision"] if current else "",
+                        metadata=metadata or None,
+                        commit=False,
+                    )
+                    updated.append(entity_id)
+                    continue
+
                 plan_id = _plan_node_id(entity_id, decision)
 
                 self.graph.upsert_node(entity_id, display, "project", commit=False)
@@ -261,7 +344,7 @@ class DreamConsolidator:
                     decision,
                     superseded_plan=plan["superseded"],
                     killed_reason="睡眠合成:被新定案取代" if plan["superseded"] else None,
-                    metadata={"aliases": aliases} if aliases else None,
+                    metadata=metadata or None,
                     commit=False,
                 )
                 if not self._has_active_decision_edge(entity_id, plan_id):
