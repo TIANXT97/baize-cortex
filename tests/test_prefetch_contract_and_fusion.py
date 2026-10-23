@@ -194,7 +194,33 @@ def test_prefetch_injects_memories_end_to_end_and_fails_open():
             assert bad.prefetch("x") == []
 
 
+def test_prefetch_as_text_contract_and_group_fail_closed():
+    with tempfile.TemporaryDirectory() as d:
+        app = _app(d)
+        with TestClient(app) as tc:
+            _card(tc)
+            fid = _add(tc, "修复上线实测 commit 0b8b352 已验收")
+
+            def transport(url, body, headers, timeout):
+                resp = tc.post(url.split("testserver", 1)[1], json=body, headers=headers)
+                return resp.status_code, resp.json(), dict(resp.headers)
+
+            ob = Outbox(os.path.join(d, "o.jsonl"))
+            client = CortexClient("http://testserver", None, "sess", ob, transport=transport)
+            # 1. 验证 as_text=True 契约返回 str
+            text_out = client.prefetch(NATURAL_QUERY, as_text=True)
+            assert isinstance(text_out, str), "as_text=True 时必须返回 str"
+            assert text_out.strip(), "命中记忆时不应为空串"
+            assert "commit 0b8b352" in text_out
+
+            # 2. 验证群聊 fail-closed
+            group_out = client.prefetch(NATURAL_QUERY, session_id="oc_group_123", as_text=True)
+            assert group_out == "", "群聊会话必须 fail-closed 返回空串"
+            group_raw = client.prefetch(NATURAL_QUERY, session_id="agent:session:group:456", as_text=False)
+            assert group_raw == [], "群聊会话 raw 模式必须返回空列表"
+
 if __name__ == "__main__":
+    test_prefetch_as_text_contract_and_group_fail_closed()
     test_every_strategy_exposes_living_states_list()
     test_fallback_facts_are_exposed_as_provisional_living_states()
     test_ppr_resolved_state_is_exposed()

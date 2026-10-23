@@ -94,17 +94,37 @@ class CortexClient:
             return {"status": "error", "message": f"reason 超过 {MAX_REASON} 字符"}
         return self._deliver(normalized, category, reason or "", supersedes_id, None)
 
-    def prefetch(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def prefetch(self, query: str, top_k: int = 5, *, session_id: str = "", as_text: bool = False) -> Any:
+        """Recall relevant memories via /v1/recall.
+        
+        When as_text=True, formats the memories into a newline-delimited prompt block
+        matching Hermes MemoryProvider -> str contract. When False, returns the raw List[Dict].
+        """
+        if not query or len(query.strip()) < 2:
+            return "" if as_text else []
+        if session_id and (":group:" in session_id or session_id.startswith("oc_")):
+            return "" if as_text else []
         try:
             status, body, _ = self._transport(
-                self._recall_url, {"query": query, "top_k": top_k}, self._headers(), self._timeout
+                self._recall_url, {"query": query.strip(), "top_k": top_k}, self._headers(), self._timeout
             )
             if not 200 <= status < 300:
-                return []
-            return extract_memories(body)
+                return "" if as_text else []
+            memories = extract_memories(body)
+            if not as_text:
+                return memories
+            if not memories:
+                return ""
+            lines = []
+            for item in memories:
+                kind = item.get("kind", "fact")
+                display = item.get("display_name")
+                prefix = f"[{display}] " if display else ""
+                lines.append(f"- [{kind}] {prefix}{item.get('text', '')}")
+            return "\n".join(lines)
         except Exception:
             log.exception("prefetch 失败,本轮不注入记忆")
-            return []
+            return "" if as_text else []
 
     def on_memory_write(
         self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None
