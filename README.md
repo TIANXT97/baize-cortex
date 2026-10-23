@@ -82,6 +82,7 @@ baize-cortex/
 │   └── PEER_REVIEWS.md        # 三方异构红蓝军同行评审报告实录
 ├── baize/                     # 核心源码骨架
 │   ├── __init__.py
+│   ├── cortex_purge.py        # 草稿流冷归档一键脚本 (默认 dry-run)
 │   ├── core/                  # 核心引擎层
 │   │   ├── living_state.py    # Layer 1: 项目活体状态卡管理器
 │   │   ├── temporal_graph.py  # Layer 2: 双时态图谱与有效子图切片
@@ -93,7 +94,7 @@ baize-cortex/
 │   ├── intelligence/          # 认知双系统与召回
 │   │   ├── phase_detector.py  # System 1: 毫秒级相变探测器 (Drex-Max)
 │   │   ├── ppr_engine.py      # 吸引子能量扩散检索引擎 (Personalized PageRank)
-│   │   └── recall_router.py   # 统一认知召回路由 (活体卡直达 / PPR 游走)
+│   │   └── recall_router.py   # 统一认知召回路由 (2-gram 分词 / 加权打分 / PPR 游走 / 草稿兜底)
 │   ├── storage/               # 存储底座 (SQLite WAL)
 │   │   ├── schema.sql         # 四层正交物理数据库 Schema
 │   │   ├── migrations.py      # Phase A 增量迁移 (可重复执行、迁移前备份)
@@ -117,6 +118,8 @@ baize-cortex/
 │   ├── test_phase8_consolidation_closure.py # Phase 8: 慢波合成收口与管理接口
 │   ├── test_explicit_addition_consolidation.py # Issue #25: 显式沉淀慢波固化
 │   ├── test_explicit_addition_recall.py # Issue #25: 未固化事实的兜底召回
+│   ├── test_recall_scoring.py      # Issue #32: 2-gram 分词、打分排序与命中回写
+│   ├── test_purge_before_date.py   # Issue #32: 草稿流时间窗归档与一键脚本
 │   ├── test_phase_a_*.py           # Phase A: 迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断
 │   └── fixtures/normalization_vectors.json # 规范化 golden vectors
 ├── README.md

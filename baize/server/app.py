@@ -18,7 +18,7 @@ from baize.core.living_state import LivingStateManager
 from baize.core.normalization import idempotency_key as make_idempotency_key
 from baize.core.normalization import normalize_content
 from baize.core.supersession import supersede
-from baize.core.scratchpad import EXPLICIT_HINT, ScratchpadManager
+from baize.core.scratchpad import EXPLICIT_HINT, ScratchpadManager, validate_timestamp
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.core.seeds import seed_initial_assets
 from baize.intelligence.phase_detector import OpenAICompatClient, PhaseDetector, llm_settings_from_env
@@ -114,6 +114,7 @@ class RecallIn(BaseModel):
 class PurgeIn(BaseModel):
     before_id: Optional[int] = None
     role: Optional[str] = None
+    before_date: Optional[str] = None
     dry_run: bool = True
 
 
@@ -339,8 +340,14 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
 
     @app.post("/v1/admin/purge-scratchpad")
     def admin_purge(body: PurgeIn):
+        try:
+            before_date = validate_timestamp(body.before_date) if body.before_date is not None else None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         with lock:
-            return app.state.consolidator.purge_scratchpad(body.before_id, body.role, body.dry_run)
+            return app.state.consolidator.purge_scratchpad(
+                body.before_id, body.role, body.dry_run, before_date=before_date
+            )
 
     @app.post("/v1/admin/seed")
     def admin_seed():

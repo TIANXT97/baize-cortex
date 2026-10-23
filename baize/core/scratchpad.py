@@ -1,11 +1,14 @@
 """Layer 0: 瞬态草稿流管理器"""
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
 EXPLICIT_HINT = "explicit_addition"
+TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 _MAX_SEARCH_TOKENS = 16
+_TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
 
 
 def _escape_like(text: str) -> str:
@@ -13,7 +16,17 @@ def _escape_like(text: str) -> str:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
+
+
+def validate_timestamp(value: str) -> str:
+    if not isinstance(value, str) or not _TIMESTAMP_RE.fullmatch(value):
+        raise ValueError("时间必须是 YYYY-MM-DD HH:MM:SS 格式,不接受带 T 的 ISO 格式")
+    try:
+        datetime.strptime(value, TIMESTAMP_FORMAT)
+    except ValueError:
+        raise ValueError(f"不是合法的日期时间: {value}")
+    return value
 
 
 class ScratchpadManager:
@@ -107,18 +120,26 @@ class ScratchpadManager:
         ).fetchall()
         return [_row_to_log(r) for r in rows]
 
-    def find_for_purge(self, before_id: Optional[int] = None, role: Optional[str] = None) -> List[Dict[str, Any]]:
+    def find_for_purge(
+        self,
+        before_id: Optional[int] = None,
+        role: Optional[str] = None,
+        before_date: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if before_date is not None:
+            validate_timestamp(before_date)
         rows = self.conn.execute(
             """
-            SELECT id, session_id, role, raw_text, phase_hint, noul_score, created_at
+            SELECT id, session_id, role, raw_text, phase_hint, noul_score, created_at, category, reason
             FROM scratchpad_log
             WHERE (? IS NULL OR id < ?)
               AND (? IS NULL OR role = ?)
+              AND (? IS NULL OR created_at < ?)
             ORDER BY id ASC
             """,
-            (before_id, before_id, role, role),
+            (before_id, before_id, role, role, before_date, before_date),
         ).fetchall()
-        return [_row_to_log(r) for r in rows]
+        return [{**_row_to_log(r), "category": r[7], "reason": r[8]} for r in rows]
 
     def export_pending_phase_logs(self, date_str: Optional[str] = None) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
