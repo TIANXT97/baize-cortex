@@ -2,6 +2,18 @@
 
 按合并时间倒序记录。每个功能 PR 合并后，补一个 `docs/*` 分支同步本文件、`README.md` 与 `docs/ARCHITECTURE.md`，同样走 PR 合并。
 
+## 2026-10-23
+
+### 修复：explicit_addition 慢波合成静默丢弃与召回端断链（PR #26，Issue #25）
+- 现象：美西生产副本实测，`cortex_add` 写入的事实召回 100% 返回 `NO_MATCH`，6 条 `explicit_addition` 滞留热表，被每次慢波静默丢弃。
+- 慢波合成：`explicit_addition` 单独分流，`_is_authoritative` 语义不变。归属只认 `proj:` 锚点（含别名），命中不了落入 `proj:general_decisions`，不使用最近活跃实体回退，不新建陌生实体、图谱节点或边。多条事实按 `(created_at, id)` 全部并入 `metadata.facts` 并记录来源 log id；与 approval 同组时 approval 保持主结论。
+- 不固化的情形：含探索或疑问措辞、或已被 `supersedes_id` 推翻的记录留在热表，并出现在慢波报告的 `skipped_explicit`（含原因）。
+- 召回：`NO_MATCH` 之前新增只读末级兜底 `SCRATCHPAD_EXPLICIT_FALLBACK`（置信度 0.5，`provisional=True`，`authoritative=False`，带 `source_log_ids`）；`DECISION_TEXT_MATCH` 同时匹配 `metadata.facts` 文本，保证固化后的事实能被召回。
+- 安全：`phase_hint="explicit_addition"` 此前没有任何防护，公开入口都能伪造。现在 `append_log` 拒绝，`POST /v1/scratchpad/log` 返回 `422`，MCP `baize_scratchpad_log` 返回错误。
+- 冷归档 jsonl 新增 `category`、`reason` 字段，旧字段不变。
+- 新增测试：`test_explicit_addition_consolidation.py`、`test_explicit_addition_recall.py`。
+- 未验证：没有在生产副本复现美西现场，三条现场查询用同形态数据在本地复现。
+
 ## 2026-10-22
 
 ### Phase A：记忆外溢通道与可靠投递（PR #23，Issue #22）
