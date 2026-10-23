@@ -4,7 +4,15 @@
 
 ## 2026-10-23
 
-### 召回精度与时效排序、草稿流时间窗归档（Issue #32）
+### 修复：草稿归档默认豁免待固化记录（PR #35，Issue #34）
+- 现象：美西分身在生产副本上对 PR #33 做 `before_date=2026-10-22 00:00:00` 的归档演练，匹配出的 61 条里混入一条 `phase_hint='approval'` 的权威定案（id=35）。`find_for_purge` 只按 `before_id`、`role`、`before_date` 过滤，完全没有 `phase_hint` 维度，积压超过窗口的定案会被常规清理静默删除，慢波合成再也读不到。
+- 修复：`find_for_purge` 默认追加 `phase_hint IS NULL`，`ScratchpadManager`、`purge_scratchpad`、`PurgeIn` 与 CLI 新增 `include_pending_phase`（CLI 为 `--include-pending-phase`），默认关闭。
+- 豁免范围是所有 `phase_hint` 非空的记录，比工单列出的 `approval`、`explicit_addition` 多了 `rejection`：慢波合成读取的正是这些记录，`rejection` 是推翻旧方案的依据，删掉同样丢信息。
+- 报告新增 `include_pending_phase` 与 `protected_pending`，dry-run 即可看到被保护的条数。
+- 新增测试 `test_purge_protect_phase_hints.py`（6 条），其中一条验证默认归档之后 approval 仍能被下一次慢波合成固化；`test_purge_before_date.py` 中归档显式沉淀记录的用例改为显式打开开关。
+- 夭夭已在生产环境实测并完成部署。
+
+### 召回精度与时效排序、草稿流时间窗归档（PR #33，Issue #32）
 - **召回漏召回**：连续中文原先被整体当作一个 token，`recall("飞书卡片")` 无法命中『飞书流式卡片』。分词改为「原词 + 中文 2-gram」双通道，不需要用户手动加空格。
 - **召回错召回**：原先按 `list_active_states()` 的物理顺序遍历、首个命中即返回，`recall("飞书 流式")` 会被排在第一的模具知识库抢占。改为对全部现役卡打分，`Score = 3×display_name + 2×alias + 1×decision/facts + 2×命中 token 数 + max(0, 1 − 0.05×距上次更新天数)`，按 Score 降序、同分取 `updated_at` 新者、再按 `entity_id` 取前 `top_k`。每条 `living_states` 带 `score`。
 - **命中门槛**：`DECISION_TEXT_MATCH` 要求至少一个原词命中或至少两个不同的 2-gram 命中，单个 2-gram 巧合不足以入选。这一条超出批复的字面公式，是为了让 2-gram 引入后不产生通用词噪声而加的，已在白皮书 §3.3 写明。

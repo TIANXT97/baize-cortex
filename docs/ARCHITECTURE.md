@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-23（同步至 Issue #32，召回打分排序与草稿流时间窗归档）  
+**最近同步**：2026-10-23（同步至 PR #35 / Issue #34，草稿归档待固化记录保护）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -42,7 +42,8 @@
 - **特性**：微秒级追加，零向量化，零阻断；
 - **生命周期**：夜间慢波合成时，被折叠的记录先无损冷归档再清退；未折叠的草稿继续留在热表；
 - **清洗接口**：`POST /v1/admin/purge-scratchpad`（默认 `dry_run`），真实清洗前先归档至 `cold_archive/purged_*.jsonl.gz`，再分块（每块 500）在同一事务内删除。过滤条件 `before_id`、`role`、`before_date` 为 AND 关系；`before_date` 严格小于比较，格式必须是 `YYYY-MM-DD HH:MM:SS`，带 `T` 的 ISO 格式或非法日期返回 `422`。`dry_run` 返回 `matched`、完整 `ids` 清单与最多 10 条 `sample`，不落任何删除；
-- **一键归档脚本**：`python -m baize.cortex_purge --db baize.db --days 30`，默认 dry-run，加 `--execute` 才真正归档并删除，`--days` 默认 30，数据库不存在时退出码 2。冷归档 jsonl 逐行含 `category`、`reason`，可 `gzip -d` 还原。
+- **待固化记录保护（Issue #34）**：清洗默认只处理 `phase_hint IS NULL` 的普通草稿。`approval`、`rejection`、`explicit_addition` 等带相态标记的记录是慢波合成的输入，若因积压滞留超过归档窗口被删，记忆会不可逆地丢失，因此一律豁免；不带任何过滤条件的清洗同样受保护。报告中 `protected_pending` 给出同一过滤条件下被豁免的条数，`include_pending_phase` 标明本次是否放行。只有显式传 `include_pending_phase=true`（CLI 为 `--include-pending-phase`）才会连同待固化记录一并归档，此时仍先写冷归档再删除，归档行保留 `phase_hint`；
+- **一键归档脚本**：`python -m baize.cortex_purge --db baize.db --days 30`，默认 dry-run，加 `--execute` 才真正归档并删除，`--days` 默认 30，`--include-pending-phase` 默认不带，数据库不存在时退出码 2。冷归档 jsonl 逐行含 `category`、`reason`，可 `gzip -d` 还原。
 
 ### 2.2 Layer 1: 项目活体状态卡 (Living State Vault)
 - **表结构**：`living_states (entity_id PRIMARY KEY, display_name, version, status, current_decision, metadata_json, tombstones_json, updated_at)`；
@@ -291,7 +292,7 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 | `/v1/recall` | POST | 统一认知召回 |
 | `/v1/sleep/consolidate` | POST | 触发慢波合成（`dry_run` 仅返回空报告） |
 | `/v1/admin/backfill-display-names` | POST | 黑户展示名转正，默认 `dry_run` |
-| `/v1/admin/purge-scratchpad` | POST | 草稿清洗，默认 `dry_run`，先归档再删除；过滤参数 `before_id`、`role`、`before_date`（`YYYY-MM-DD HH:MM:SS`）为 AND 关系 |
+| `/v1/admin/purge-scratchpad` | POST | 草稿清洗，默认 `dry_run`，先归档再删除；过滤参数 `before_id`、`role`、`before_date`（`YYYY-MM-DD HH:MM:SS`）为 AND 关系；默认豁免 `phase_hint` 非空的待固化记录，`include_pending_phase=true` 才放行 |
 | `/v1/admin/seed` | POST | 预置核心工程资产 |
 
 ### 8.2 MCP stdio 工具（`baize/server/mcp_server.py`）
@@ -302,4 +303,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 20 个套件，其中 Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本）。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的六个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 21 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本）。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的六个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
