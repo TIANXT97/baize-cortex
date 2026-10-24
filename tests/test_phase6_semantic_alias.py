@@ -89,9 +89,27 @@ def test_decision_text_fallback_when_no_alias():
             conn.close()
 
 
+def test_generic_words_are_blacklisted_from_alias_library():
+    # Issue #44 CTO 红线:纯通用词不得入库,已入库的由慢波下次触碰该卡时清洗
+    with tempfile.TemporaryDirectory() as d:
+        conn = init_db(os.path.join(d, "g.db"))
+        try:
+            living = LivingStateManager(conn)
+            living.update_decision("proj:x", "X", "旧定案", metadata={"aliases": ["记忆", "老别名"]})
+            ScratchpadManager(conn).append_log(
+                "s", "user", "proj:x alias:方案,模具知识库 定案:新定案", phase_hint="approval",
+            )
+            DreamConsolidator(conn, archive_dir=os.path.join(d, "arc")).run_consolidation()
+            state = living.get_state("proj:x")
+            assert state["metadata"]["aliases"] == ["老别名", "模具知识库"]
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":
     test_alias_line_folds_into_metadata_and_strips_colon()
     test_llm_extracts_display_name_and_aliases_and_keeps_existing()
     test_natural_language_recall_hits_alias_directly()
     test_decision_text_fallback_when_no_alias()
+    test_generic_words_are_blacklisted_from_alias_library()
     print("✅ Phase 6 语义别名专项测试全部通过")
