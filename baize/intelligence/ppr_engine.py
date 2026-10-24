@@ -37,7 +37,7 @@ class PPREngine:
         all_nodes = set(seed_nodes.keys())
 
         for src, dst, w in active_edges:
-            adj[src][dst] = w
+            adj[src][dst] = adj[src].get(dst, 0.0) + w
             out_degree[src] += w
             all_nodes.add(src)
             all_nodes.add(dst)

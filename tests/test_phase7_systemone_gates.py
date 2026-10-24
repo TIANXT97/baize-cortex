@@ -106,10 +106,17 @@ def test_requests_carry_waf_safe_headers():
     assert body["questions"]["should_memorize"]["type"] == "noul"
 
 
+def test_local_rules_detect_fullwidth_question_mark():
+    phase, conf, category = PhaseDetector().detect_phase("这样行吗？")
+    assert (phase, category) == ("exploration", "exploration")
+    assert conf == 0.6
+
+
 if __name__ == "__main__":
     test_drex_success_returns_high_confidence_approval()
     test_drex_failure_relays_to_openjev()
     test_ambiguous_drex_result_relays_to_openjev()
     test_both_gates_down_fail_open_to_local_rules()
+    test_local_rules_detect_fullwidth_question_mark()
     test_requests_carry_waf_safe_headers()
     print("✅ Phase 7 SystemOne 双门神专项测试全部通过")

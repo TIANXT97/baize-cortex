@@ -363,8 +363,10 @@ class DreamConsolidator:
                 updated.append(entity_id)
 
             folded_ids = [log["id"] for plan in plans for log in plan["logs"]]
-            placeholders = ",".join("?" * len(folded_ids))
-            self.conn.execute(f"DELETE FROM scratchpad_log WHERE id IN ({placeholders})", folded_ids)
+            for start in range(0, len(folded_ids), _DELETE_CHUNK):
+                chunk = folded_ids[start:start + _DELETE_CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                self.conn.execute(f"DELETE FROM scratchpad_log WHERE id IN ({placeholders})", chunk)
             self.conn.commit()
         except Exception:
             self.conn.rollback()
