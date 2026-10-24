@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-24（同步至 PR #47 / Issue #44 CTO 裁决红线 3：召回门槛回撤与别名库通用词黑名单；含 PR #45/#46 的 C 项首轮实现与文档同步）  
+**最近同步**：2026-10-24（同步至 PR #49 / Issue #44 PR1：门神 401/403 鉴权熔断；含 PR #47/#48 红线 3 门槛回撤与别名库黑名单）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -154,6 +154,7 @@ $$\text{Score} = 3\,[\text{display\_name 命中}] + 2\,[\text{alias 命中}] + 1
 - **职责**：会话入口意图分类、瞬时相变嗅探（`approval` / `rejection` / `exploration`）；
 - **协议**：向门神 POST `{model, state, questions: {should_memorize: {type: noul, ...}, category: {type: choice, criteria: {...}}}}`，请求头带 `User-Agent: Baize/Gate-v2.0 (TypeSafe-Client)`；
 - **仲裁**：先问 Drex-Max；其 `noul` 得分落在模糊区间 (0.4, 0.6) 时，再交 OpenJev 复判；
+- **鉴权熔断（Issue #44 PR1，PR #49）**：门神返回 401/403（永久性凭据失效）时进程内熔断该门神（`_GateBreaker`，TTL 600s），熔断期内直接跳过不再白等，到期自动恢复；熔断打 `WARNING`（logger `baize.phase_detector`），失败不再静默。5xx/超时属临时故障，不熔断；
 - **Fail-open**：两道门都不可用时，降级为本地关键词规则（`_detect_local`），不阻塞写入；
 - **返回**：`detect_phase(text) -> (phase, confidence, category)`。
 
@@ -310,4 +311,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 25 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）。PR #42 新增 `test_phase_a_auth_coverage`（12 个 `/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的七个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 25 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）；PR #49 在 `test_phase7_systemone_gates` 补鉴权熔断用例（401 熔断后跳过重试、TTL 到期恢复、5xx 不熔断）。PR #42 新增 `test_phase_a_auth_coverage`（12 个 `/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的七个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
