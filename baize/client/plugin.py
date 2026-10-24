@@ -1,8 +1,10 @@
 """cortex 插件:cortex_add 工具与本地便签镜像钩子。所有失败降级为入队,绝不阻塞主会话。"""
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from baize.client.outbox import Outbox
@@ -19,6 +21,20 @@ MIRROR_ORIGIN = "hermes_builtin_mirror"
 QUEUED_MESSAGE = "已保存到本地队列，将自动同步，无需重试"
 
 Transport = Callable[[str, Dict[str, Any], Dict[str, str], float], Tuple[int, Dict[str, Any], Dict[str, str]]]
+
+# Issue #44 E 项:敏感信息脱敏在写入前完成。key 名命中即整值掩蔽;值形态(sk-/长hex/长base64)兜底。
+_SECRET_KEY_RE = re.compile(r"token|key|secret|password|passwd|credential|auth", re.IGNORECASE)
+_SECRET_VALUE_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}|[A-Fa-f0-9]{32,}|[A-Za-z0-9+/]{40,}={0,2}")
+_MAX_VALUE_CHARS = 200
+
+
+def _mask_value(key: str, value: Any) -> str:
+    text = "" if value is None else str(value)
+    if not text:
+        return text
+    if _SECRET_KEY_RE.search(key or ""):
+        return "<REDACTED>"
+    return _SECRET_VALUE_RE.sub("<REDACTED>", text)[:_MAX_VALUE_CHARS]
 
 
 def _parse_json(raw: bytes) -> Dict[str, Any]:
@@ -125,6 +141,22 @@ class CortexClient:
         except Exception:
             log.exception("prefetch 失败,本轮不注入记忆")
             return "" if as_text else []
+
+    def record_config_change(
+        self, tool: str, key: str, before: Any, after: Any, stamp: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Issue #44 E 项(CTO 会诊 PR2):工具动作成功后的事后沉淀,不依赖事前判定是否定案。
+
+        网关在配置类工具动作成功后调用;before/after 为 None 分别表达「未设置」「已移除」。
+        """
+        now = stamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        before_text = _mask_value(key, before) or "(未设置)"
+        after_text = _mask_value(key, after) or "(已移除)"
+        content = (
+            f"配置变更: {tool or 'unknown'} 将 {key} 从「{before_text}」改为「{after_text}」({now} UTC)"
+        )
+        reason = f"config_change:{tool or 'unknown'}"[:MAX_REASON]
+        return self._deliver(content, "rule", reason, None, "tool_config_change")
 
     def on_memory_write(
         self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None
