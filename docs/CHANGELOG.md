@@ -4,6 +4,15 @@
 
 ## 2026-10-24
 
+### 新增：candidate 候选流与夜间批量判研状态机（PR #54，Issue #44 PR4 / CTO 会诊红线 1+2，含美西五点反馈修订）
+- **红线 1（candidate 候选流）**：高 noul 事实（`noul>=0.8` 且 exploration/chitchat）与「疑似计划」（`decision_approved` 但 `confidence<0.9`——美西反例「下周打算把机房迁到新加坡」差点变定案）统一进 `candidate`；召回以 `CANDIDATE_UNVERIFIED` 通道降权透出（置信度 0.45，排在 explicit 之后、recent_turns 之前，注入文本带「candidate·未核实」标注）；慢波由 System 2 二次核实——通过并入 `metadata.facts`（携带 noul 溯源），否决归档清退计入报告；**严禁参与定案改写**：不写 `decided_as` 边、不进墓碑、不改写 `current_decision`。
+- **红线 2（批量判研状态机）**：`scratchpad_log` 增量迁移 `judge_status`/`retry_count`/`judge_source` 三列；历史双 NULL 行永不自动回填（防存量风暴）；`BatchJudgeRunner` 按会话切片 10 条/批（批不跨会话防锚定）、每条裁 300 字符、批次 ID/条数严格校验、失败重试上限 3 次入 `failed` 终态（不进任何召回层，可随 purge 清退）；approval/rejection 走 **`confidence>=0.9` 双门槛**（美西否决 noul 门槛：noul 与「是否定案」反相关，真定案 0.004~0.128，0/6 误杀）。
+- **总开关 `CORTEX_BATCH_JUDGE` 默认 off**：System 2 判相态准召未经标注样本验证前不自动跑；关闭时普通行 `judge_status` 保持 NULL（与历史同语义、可被默认 purge，防关闭期 pending 无限积压）。
+- **配套**：`phase_detector` 透出 `category.confidence`（缺失按 1.0 fail-open），`detect_phase_rich()` 四元组富返回、`detect_phase` 三元组签名不变（部署副本兼容）；purge 默认豁免扩展至 `pending` 行；`POST /v1/admin/backfill-judge` 一次性存量回填（必须显式时间窗，dry-run 默认，补 4 条历史漏判定案）。
+- **测试**：新增 `test_batch_judge_candidates`（8 例），auth coverage 补 backfill-judge 端点（13 端点）。全量 27 套件通过。
+- **部署顺序硬约束**：仓库侧先上（批量判自产 candidate）、插件侧后上（白天快速规则产 candidate）；反序会让插件写入的 candidate 行静默堆积。
+- **未验证**：System 2 判相态准召（50~100 条人工标注，通过后再开开关）；confidence 0.9 线大样本定线；60 条重跑与 C 项别名回填（运维）。
+
 ### 新增：配置改动事后沉淀通道（PR #51，Issue #44 E 项 / CTO 会诊 PR2，优先级上调 P1）
 - **根因**：配置改动是「执行动作」而非「定案表述」，事前判定必然漏——#44 实测「改成北京时间凌晨3点」连关键词门都没开，本轮 4 条真实配置定案全靠人工 `cortex_add` 兜底。
 - **方案**：`CortexClient.record_config_change(tool, key, before, after)`——网关在配置类工具动作**成功后**调用，沉淀为 `explicit_addition`（`category=rule`、`reason=config_change:<tool>`），走既有 `_deliver` 通道（幂等、断网入 Outbox 重放）。内容含 key、before→after 与 UTC 时间戳（仓库无 T 格式约定）；`None` 分别表达「(未设置)」/「(已移除)」。

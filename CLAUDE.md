@@ -39,6 +39,7 @@ python tests/test_phase5_hardening.py
 python tests/test_phase6_semantic_alias.py
 python tests/test_phase7_systemone_gates.py
 python tests/test_phase8_consolidation_closure.py
+python tests/test_batch_judge_candidates.py
 python tests/test_phase_a_migration.py   # 另有 test_phase_a_{outbox,cortex_add,normalization,mirror,circuit_breaker,auth_coverage,config_sediment}.py
 python -m py_compile <改动的文件>
 ```
