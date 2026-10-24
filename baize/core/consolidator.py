@@ -27,6 +27,10 @@ _EXPLORATION_RE = re.compile(r"假设|如果|要不|探讨|尚未批准|[?？]|�
 _LEADING_PUNCT = " \t\r\n:："
 _GENERAL_ENTITY = "proj:general_decisions"
 _DELETE_CHUNK = 500
+# Issue #44 CTO 红线:纯通用词禁止作为别名入库,已入库的在慢波下次触碰该卡时清洗(精确匹配,不误伤「时间机器」类长词)
+_GENERIC_ALIAS_BLACKLIST = frozenset({
+    "记忆", "方案", "项目", "系统", "服务", "配置", "记录", "问题", "时间", "数据", "工具",
+})
 _LLM_SYSTEM_PROMPT = (
     "从对话中提取最终定案 decision、被推翻的方案 superseded、简洁中文名 display_name "
     "与别名数组 aliases,只输出 JSON。"
@@ -69,6 +73,10 @@ def _merge_facts(current: Optional[Dict[str, Any]], new: List[Dict[str, Any]]) -
 
 def _split_aliases(raw: str) -> List[str]:
     return [a.strip() for a in _ALIAS_SPLIT_RE.split(raw) if a.strip()]
+
+
+def _filter_generic_aliases(aliases: List[str]) -> List[str]:
+    return [a for a in aliases if a not in _GENERIC_ALIAS_BLACKLIST]
 
 
 def _union(*groups: List[str]) -> List[str]:
@@ -325,9 +333,9 @@ class DreamConsolidator:
                 current = self.living.get_state(entity_id)
                 display = self.living.resolve_display_name(entity_id, plan["display_name"])
                 existing_aliases = current["metadata"].get("aliases", []) if current else []
-                aliases = _union(existing_aliases, plan["aliases"])
+                aliases = _filter_generic_aliases(_union(existing_aliases, plan["aliases"]))
                 metadata: Dict[str, Any] = {}
-                if aliases:
+                if aliases or existing_aliases:
                     metadata["aliases"] = aliases
                 facts = _merge_facts(current, plan.get("facts", []))
                 if facts:
