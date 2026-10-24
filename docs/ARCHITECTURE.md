@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-24（同步至 PR #49 / Issue #44 PR1：门神 401/403 鉴权熔断；含 PR #47/#48 红线 3 门槛回撤与别名库黑名单）  
+**最近同步**：2026-10-24（同步至 PR #51 / Issue #44 E 项：配置改动事后沉淀通道；含 PR #49/#50 门神鉴权熔断与 PR #47/#48 红线 3 门槛回撤）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -249,7 +249,7 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 | 模块 | 职责 |
 |---|---|
 | `outbox.py` | `~/.hermes/outbox.jsonl`，每行一条信封（`idempotency_key / payload / created_at / attempts / next_retry_at`）。追加使用 `O_APPEND` 单次 `os.write`；flush 时在锁内原子 rename 为 `outbox.sending.<时间戳>` 再逐行投递；崩溃后重放遗留的 `sending` 文件。跨进程锁：POSIX 用 `fcntl.flock`，Windows 用 `msvcrt.locking` |
-| `plugin.py` | `CortexClient.cortex_add(content, category, reason, supersedes_id=None)`：3 秒超时或网络异常、`5xx`、`429` 时不报错，自动入队并返回 `{"status": "queued", ...}`；`on_memory_write(action, target, content, metadata)`：`MEMORY.md` / `USER.md` 写入后把单条条目入队，标记 `origin="hermes_builtin_mirror"`，遇到 `origin="writeback"` 直接跳过以切断回环，钩子内部异常一律吞掉 |
+| `plugin.py` | `CortexClient.cortex_add(content, category, reason, supersedes_id=None)`：3 秒超时或网络异常、`5xx`、`429` 时不报错，自动入队并返回 `{"status": "queued", ...}`；`record_config_change(tool, key, before, after)`（Issue #44 E 项）：配置类工具动作**成功后**事后沉淀 `explicit_addition`（`category=rule`、`reason=config_change:<tool>`、内容含 before→after 与 UTC 时间戳），密钥类 key 名整值掩蔽、`sk-`/长 hex/长 base64 值形态兜底掩蔽，脱敏在写入前完成；`on_memory_write(action, target, content, metadata)`：`MEMORY.md` / `USER.md` 写入后把单条条目入队，标记 `origin="hermes_builtin_mirror"`，遇到 `origin="writeback"` 直接跳过以切断回环，钩子内部异常一律吞掉 |
 | `breaker.py` | 错误签名归一化与熔断 |
 
 **Outbox 错误分类**：
@@ -311,4 +311,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 25 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）；PR #49 在 `test_phase7_systemone_gates` 补鉴权熔断用例（401 熔断后跳过重试、TTL 到期恢复、5xx 不熔断）。PR #42 新增 `test_phase_a_auth_coverage`（12 个 `/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的七个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 26 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 E 项新增 `test_phase_a_config_sediment`（沉淀五要素、脱敏零泄漏、None 标记、Outbox 重放、召回闭环），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）；PR #49 在 `test_phase7_systemone_gates` 补鉴权熔断用例（401 熔断后跳过重试、TTL 到期恢复、5xx 不熔断）。PR #42 新增 `test_phase_a_auth_coverage`（12 个 `/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的八个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
