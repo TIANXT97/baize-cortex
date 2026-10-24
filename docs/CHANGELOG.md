@@ -4,6 +4,12 @@
 
 ## 2026-10-24
 
+### 修复：召回单 2-gram 命中卡名/别名即放行（PR #45，Issue #44 C 项）
+- **现象**：卡片就在库里，长句查不到——`recall('你现在用得卡片是洋哥仓库最新的吗')` 落到 `RECENT_TURNS_CONTEXT`，权威记忆被末级兜底抢占。根因：无标点中文整句只切出一个原词 token，句中唯一的卡名 2-gram（「卡片」→「流式卡片」）满足不了「≥2 个 2-gram」门槛，整卡被 `DECISION_TEXT_MATCH` 刷掉。
+- **修复**：`qualifies` 增加第三析取——单个 2-gram 命中 `display_name` 或 `alias` 即放行（卡名短且独特，单 gram 命中名字是强信号）；仅命中正文（decision/facts）的单 gram 仍拦，通用词噪声不放大。`LIVING_STATE_DIRECT` / PPR / 兜底路径零改动。
+- **测试**：新增 `test_recall_single_gram_gate.py`（4 例：复现句命中卡名、命中别名、正文单 gram 仍 `NO_MATCH`、双 gram 正文命中不变）。全量 25 套件通过，无策略漂移。
+- **未验证**：60 条真实提问重跑（权威命中率 ≥57% 且误召回不增加）待美西机 `cortex_rt_regression` 复验。
+
 ### 修复：/v1 全端点鉴权收口与代码审核遗留（PR #42，Issue #41 裁决）
 - **裁决**：Issue #41 两项均选 A —— 慢波调度走本机 systemd timer（运维侧，含 `Persistent=true`、curl 超时、时区确认三处修正与月度 purge 配套建议）；`CORTEX_AGENT_TOKENS` 暂不启用，等第二个写入方。
 - **鉴权覆盖**：`authenticate()` 铺满全部 `/v1/*` 端点（`/health` 除外）。此前只盖 `/v1/scratchpad/log`、`/v1/cortex/add`、`/v1/recall`，`/v1/admin/*`、`/v1/graph/*`、`/v1/living-state/decision`、`/v1/sleep/consolidate` 等破坏性端点即使配置 token 也无保护。token 未配置时行为不变（fail-open 归 `default`），当前部署零影响；切启用当天只剩配置工作。
