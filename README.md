@@ -93,6 +93,7 @@ baize-cortex/
 │   │   └── seeds.py           # 核心工程资产预置
 │   ├── intelligence/          # 认知双系统与召回
 │   │   ├── phase_detector.py  # System 1: 毫秒级相变探测器 (Drex-Max)
+│   │   ├── batch_judge.py     # Issue #44: 夜间批量判研引擎 (System 2, 会话切片/状态机/confidence 门槛)
 │   │   ├── ppr_engine.py      # 吸引子能量扩散检索引擎 (Personalized PageRank)
 │   │   └── recall_router.py   # 统一认知召回路由 (2-gram 分词 / 加权打分 / PPR 游走 / 草稿兜底)
 │   ├── storage/               # 存储底座 (SQLite WAL)
@@ -120,6 +121,7 @@ baize-cortex/
 │   ├── test_explicit_addition_recall.py # Issue #25: 未固化事实的兜底召回
 │   ├── test_recall_scoring.py      # Issue #32: 2-gram 分词、打分排序与命中回写
 │   ├── test_recall_single_gram_gate.py # Issue #44 红线: 门槛回撤锁定与别名库通用词黑名单
+│   ├── test_batch_judge_candidates.py # Issue #44 PR4: candidate 候选流与批量判研状态机
 │   ├── test_purge_before_date.py   # Issue #32: 草稿流时间窗归档与一键脚本
 │   ├── test_purge_protect_phase_hints.py # Issue #34: 草稿归档默认豁免待固化记录
 │   ├── test_phase_a_*.py           # Phase A: 迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀
@@ -143,6 +145,7 @@ baize-cortex/
 - [x] **Phase 7: System 1 双门神** —— `PhaseDetector` 切换为 Drex-Max / OpenJev 的 SystemOne 协议,全部失败时 Fail-open 降级本地规则
 - [x] **Phase 8: 慢波合成收口** —— 全角冒号清洗、无锚点定案兜底、黑户展示名转正,新增 `backfill-display-names` 与 `purge-scratchpad` 管理接口
 - [x] **Phase A: 记忆外溢通道与可靠投递** —— Schema 增量迁移、`POST /v1/cortex/add` 幂等写入、Outbox 投递、memory 镜像钩子与错误签名熔断
+- [x] **Issue #44: 相态判研去关键词化** —— candidate 候选流（高 noul 事实/疑似计划经 System 2 核实后固化,严禁改写定案）、judge_status 批量判研状态机（会话切片/ID 校验/重试上限/failed 终态,`CORTEX_BATCH_JUDGE` 默认 off）、门神 401 鉴权熔断、配置改动事后沉淀通道与召回门槛红线纠偏
 - [ ] **后续: 全量生产平滑割接** —— 现役存量数据提纯与全场景持续演化(原路线图中的 Phase 6 编号已被别名提纯占用,此项改为不编号待排期)
 
 ---
