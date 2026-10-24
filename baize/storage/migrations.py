@@ -23,7 +23,14 @@ NEW_COLUMNS: List[Tuple[str, str]] = [
 ]
 
 EXTRA_COLUMNS: Dict[str, List[Tuple[str, str]]] = {
-    "scratchpad_log": [("category", "TEXT"), ("reason", "TEXT")],
+    # Issue #44 PR4:批量判研状态机——NULL 表示历史存量行,永不自动回填(防存量风暴)
+    "scratchpad_log": [
+        ("category", "TEXT"),
+        ("reason", "TEXT"),
+        ("judge_status", "TEXT"),
+        ("retry_count", "INTEGER DEFAULT 0"),
+        ("judge_source", "TEXT"),
+    ],
 }
 
 _BATCH_SIZE = 500

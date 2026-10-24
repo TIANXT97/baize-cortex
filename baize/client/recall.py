@@ -28,13 +28,13 @@ def _state_items(state: Any) -> List[Dict[str, Any]]:
     return items
 
 
-def _provisional_items(rows: Any) -> List[Dict[str, Any]]:
+def _provisional_items(rows: Any, kind: str = "fact") -> List[Dict[str, Any]]:
     if not isinstance(rows, list):
         return []
     return [
         {
             "id": f"scratchpad:{row['id']}",
-            "kind": "fact",
+            "kind": kind,
             "text": str(row["text"]),
             "display_name": None,
             "provisional": True,
@@ -66,7 +66,11 @@ def extract_memories(response: Any) -> List[Dict[str, Any]]:
         for entry in living_states:
             items += _entry_items(entry)
     items += _provisional_items(response.get("provisional_facts"))
-    items += _provisional_items(response.get("facts"))
+    # Issue #44 PR4 硬要求:candidate 候选注入必须显式标注「未核实」,防止被当定案引用
+    items += _provisional_items(
+        response.get("facts"),
+        kind="candidate·未核实" if response.get("strategy") == "CANDIDATE_UNVERIFIED" else "fact",
+    )
 
     seen = set()
     unique = []

@@ -1,6 +1,8 @@
 """Layer 3: 慢波合成睡眠引擎 (Dream Consolidation)
 
 两段式执行:只读分析 -> 先归档落盘 -> 单一短事务回写卡片与图谱并清退已折叠草稿。
+Issue #44 PR4:折叠前先跑批量判研(总开关 CORTEX_BATCH_JUDGE,默认 off);
+candidate 候选经 System 2 二次核实后并入 facts,严禁参与定案改写(红线 1)。
 """
 import argparse
 import gzip
@@ -14,8 +16,11 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from baize.core.living_state import LivingStateManager
-from baize.core.scratchpad import EXPLICIT_HINT, ScratchpadManager
+from baize.core.scratchpad import (
+    CANDIDATE_HINT, EXPLICIT_HINT, ScratchpadManager, batch_judge_enabled,
+)
 from baize.core.temporal_graph import BiTemporalGraphManager
+from baize.intelligence.batch_judge import BatchJudgeRunner
 from baize.storage.db import init_db
 
 _ENTITY_RE = re.compile(r"(proj:[\w\-]+)")
@@ -34,6 +39,11 @@ _GENERIC_ALIAS_BLACKLIST = frozenset({
 _LLM_SYSTEM_PROMPT = (
     "从对话中提取最终定案 decision、被推翻的方案 superseded、简洁中文名 display_name "
     "与别名数组 aliases,只输出 JSON。"
+)
+_CANDIDATE_VERIFY_SYSTEM_PROMPT = (
+    "你是记忆核实器。判断候选文本是否为可永久固化的客观事实"
+    "(个人档案/硬件配置/网络拓扑/否定修正/长期偏好/明确的既成事实),"
+    '疑似计划、猜测、观点一律否决。只输出 JSON:{"is_fact": true|false, "entity": "实体ID或空串"}。'
 )
 
 
@@ -116,25 +126,43 @@ class DreamConsolidator:
         self.graph = BiTemporalGraphManager(conn)
 
     def run_consolidation(self, target_date: Optional[str] = None) -> Dict[str, Any]:
+        judge_report = self._batch_judge_step()
         phase_logs = self.scratchpad.export_pending_phase_logs(target_date)
         explicit_logs = [log for log in phase_logs if log["phase_hint"] == EXPLICIT_HINT]
-        plans = self._analyze([log for log in phase_logs if log["phase_hint"] != EXPLICIT_HINT])
+        candidate_logs = [log for log in phase_logs if log["phase_hint"] == CANDIDATE_HINT]
+        plans = self._analyze([
+            log for log in phase_logs if log["phase_hint"] not in (EXPLICIT_HINT, CANDIDATE_HINT)
+        ])
         skipped = self._merge_explicit(plans, explicit_logs)
+        candidates = self._merge_candidates(plans, candidate_logs)
         folded = [log for plan in plans for log in plan["logs"]]
-        if not folded:
+        if not folded and not candidates["rejected"]:
             return {
                 "status": "ok", "archived_logs": 0, "updated_states": [],
                 "archive_file": None, "skipped_explicit": skipped,
+                "batch_judge": judge_report, "candidates": candidates,
             }
-        archive_file = self._write_archive(folded, f"scratchpad_{target_date or 'all'}")
-        updated_states = self._apply(plans)
+        archive_file = self._write_archive(
+            folded + candidates["rejected"], f"scratchpad_{target_date or 'all'}"
+        )
+        updated_states = self._apply(plans, candidates["rejected"])
         return {
             "status": "ok",
-            "archived_logs": len(folded),
+            "archived_logs": len(folded) + len(candidates["rejected"]),
             "updated_states": updated_states,
             "archive_file": archive_file,
             "skipped_explicit": skipped,
+            "batch_judge": judge_report,
+            "candidates": candidates,
         }
+
+    def _batch_judge_step(self) -> Dict[str, Any]:
+        # Issue #44 PR4:System 2 判相态准召未经标注样本验证前默认不跑,防夜间误判改写定案
+        if not batch_judge_enabled():
+            return {"status": "disabled"}
+        if self.llm_client is None:
+            return {"status": "skipped_no_llm"}
+        return BatchJudgeRunner(self.conn, self.llm_client).run()
 
     def _merge_explicit(self, plans: List[Dict[str, Any]], logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         skipped: List[Dict[str, Any]] = []
@@ -163,6 +191,65 @@ class DreamConsolidator:
                 "reason": log.get("reason"), "created_at": log["created_at"],
             })
         return skipped
+
+    def _merge_candidates(self, plans: List[Dict[str, Any]], logs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """红线 1:candidate 经 System 2 二次核实——通过并入 facts,否决归档清退,不参与定案改写。"""
+        report: Dict[str, Any] = {"verified": 0, "rejected": [], "skipped": []}
+        if not logs:
+            return report
+        if self.llm_client is None:
+            report["skipped"] = [{"id": log["id"], "reason": "无 System 2 可核实,保留待下次"} for log in logs]
+            return report
+        by_entity = {plan["entity_id"]: plan for plan in plans}
+        index = self._entity_index()
+        index.update({entity_id: entity_id for entity_id in by_entity})
+        for log in sorted(logs, key=lambda item: (item["created_at"], item["id"])):
+            if log.get("expired_at"):
+                continue
+            try:
+                verdict = self._verify_candidate(log["raw_text"], index)
+            except Exception:
+                report["skipped"].append({"id": log["id"], "reason": "核实调用失败,保留待下次"})
+                continue
+            if not verdict.get("is_fact"):
+                report["rejected"].append(log)
+                continue
+            entity_id = self._resolve_verified_entity(verdict.get("entity"), log["raw_text"], index)
+            plan = by_entity.get(entity_id)
+            if plan is None:
+                plan = {
+                    "entity_id": entity_id, "logs": [], "decision": None, "superseded": None,
+                    "display_name": None, "aliases": [], "facts": [],
+                }
+                by_entity[entity_id] = plan
+                plans.append(plan)
+            plan["logs"].append(log)
+            plan.setdefault("facts", []).append({
+                "id": log["id"], "text": log["raw_text"], "category": "fact",
+                "reason": f"candidate:{log.get('reason') or 'verified'}",
+                "created_at": log["created_at"], "noul": log["noul_score"],
+            })
+            report["verified"] += 1
+        return report
+
+    def _verify_candidate(self, text: str, index: Dict[str, str]) -> Dict[str, Any]:
+        catalog = "; ".join(
+            f"{state['entity_id']}({','.join(state['metadata'].get('aliases', []))})"
+            for state in self.living.list_active_states()
+        )
+        raw = self.llm_client.chat(
+            _CANDIDATE_VERIFY_SYSTEM_PROMPT,
+            f"候选文本:{text}\n\n已知实体:{catalog or '无'}",
+        )
+        data = json.loads(raw)
+        return {"is_fact": bool(data.get("is_fact")), "entity": data.get("entity") or ""}
+
+    def _resolve_verified_entity(
+        self, proposed: Any, text: str, index: Dict[str, str]
+    ) -> str:
+        if isinstance(proposed, str) and proposed in index:
+            return index[proposed]
+        return _resolve_explicit_entity(text, index)
 
     def _entity_index(self) -> Dict[str, str]:
         index: Dict[str, str] = {}
@@ -322,7 +409,7 @@ class DreamConsolidator:
             os.fsync(raw.fileno())
         return path
 
-    def _apply(self, plans: List[Dict[str, Any]]) -> List[str]:
+    def _apply(self, plans: List[Dict[str, Any]], rejected_logs: Optional[List[Dict[str, Any]]] = None) -> List[str]:
         updated: List[str] = []
         now = self._now()
         self.conn.execute("BEGIN IMMEDIATE")
@@ -371,6 +458,7 @@ class DreamConsolidator:
                 updated.append(entity_id)
 
             folded_ids = [log["id"] for plan in plans for log in plan["logs"]]
+            folded_ids += [log["id"] for log in (rejected_logs or [])]
             for start in range(0, len(folded_ids), _DELETE_CHUNK):
                 chunk = folded_ids[start:start + _DELETE_CHUNK]
                 placeholders = ",".join("?" * len(chunk))

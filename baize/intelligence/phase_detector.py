@@ -54,7 +54,7 @@ def _systemone_call(
     text: str,
     timeout: float,
     proxy: Optional[str],
-) -> Tuple[str, float]:
+) -> Tuple[str, float, float]:
     body = json.dumps({
         "model": model,
         "state": text,
@@ -74,10 +74,14 @@ def _systemone_call(
     opener = urllib.request.build_opener(*handlers)
     with opener.open(req, timeout=timeout) as resp:
         answers = json.loads(resp.read().decode("utf-8"))["answers"]
-    phase = answers["category"]["choice"]
+    category = answers["category"]
+    phase = category["choice"]
     if phase not in PHASE_CATEGORY:
         raise ValueError(f"unknown phase_type: {phase}")
-    return phase, float(answers["should_memorize"]["noul"])
+    # Issue #44 PR4:category.confidence 此前被丢弃;noul 度量信息价值,与「是否定案」反相关,不能当门槛
+    confidence = category.get("confidence")
+    noul = float(answers["should_memorize"]["noul"])
+    return phase, noul, (float(confidence) if confidence is not None else 1.0)
 
 
 class OpenAICompatClient:
@@ -149,17 +153,27 @@ class PhaseDetector:
         )
 
     def detect_phase(self, text: str) -> Tuple[str, float, str]:
+        phase, noul, _ = self._decide(text)
+        return phase, noul, PHASE_CATEGORY[phase]
+
+    def detect_phase_rich(self, text: str) -> Tuple[str, float, str, float]:
+        """Issue #44 PR4:带 category.confidence 的富返回;detect_phase 三元组保持不变(部署副本兼容)。"""
+        phase, noul, confidence = self._decide(text)
+        return phase, noul, PHASE_CATEGORY[phase], confidence
+
+    def _decide(self, text: str) -> Tuple[str, float, float]:
         drex = self._try("drex", self.drex_url, self.drex_key, self.drex_model, text)
         if drex is not None and not _is_ambiguous(drex[1]):
-            return _result(*drex)
+            return drex
         openjev = self._try("openjev", self.openjev_url, self.openjev_key, self.openjev_model, text)
         if openjev is not None:
-            return _result(*openjev)
+            return openjev
         if drex is not None:
-            return _result(*drex)
-        return self._detect_local(text)
+            return drex
+        phase, confidence, _ = self._detect_local(text)
+        return phase, confidence, confidence
 
-    def _try(self, gate: str, url: Optional[str], key: Optional[str], model: str, text: str) -> Optional[Tuple[str, float]]:
+    def _try(self, gate: str, url: Optional[str], key: Optional[str], model: str, text: str) -> Optional[Tuple[str, float, float]]:
         if not url or not key:
             return None
         if self.breaker.is_open(gate):
@@ -187,10 +201,6 @@ class PhaseDetector:
 
 def _is_ambiguous(noul: float) -> bool:
     return _AMBIGUOUS_NOUL[0] <= noul <= _AMBIGUOUS_NOUL[1]
-
-
-def _result(phase: str, noul: float) -> Tuple[str, float, str]:
-    return phase, noul, PHASE_CATEGORY[phase]
 
 
 class _GateBreaker:

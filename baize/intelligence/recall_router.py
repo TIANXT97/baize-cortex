@@ -18,6 +18,8 @@ _CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
 _DECAY_PER_DAY = 0.05
 _RECENT_TURNS_CONFIDENCE = 0.35
 _RECENT_TURNS_MAX = 3
+_CANDIDATE_CONFIDENCE = 0.45
+_CANDIDATE_MAX = 3
 # Issue #39:纯语气/指示/连接词命中不算"接上了上一轮",它们在任何一句闲聊里都会出现。
 _RECENT_TURN_STOPWORDS = frozenset({
     "可以", "好的", "好啊", "嗯嗯", "哦哦", "哈哈",
@@ -120,7 +122,10 @@ class CognitiveRecallRouter:
             provisional = self._explicit_fallback(query, top_k)
             if provisional is not None:
                 return self._finish(provisional, [], provisional["facts"])
-            # Issue #37:显式事实也没有时,退到普通对话轮次(短期连续性),这才接得上上一轮的任务。
+            # Issue #44 PR4 红线1:candidate 候选降权召回(0.45),排在 explicit 之后、普通轮次之前
+            candidate = self._candidate_fallback(query, top_k)
+            if candidate is not None:
+                return self._finish(candidate, [], candidate["facts"])
             recent = self._recent_turns_fallback(query, top_k, agent_id)
             if recent is not None:
                 return self._finish(recent, [], recent["facts"])
@@ -230,6 +235,33 @@ class CognitiveRecallRouter:
             "confidence": 0.5,
             "provisional": True,
             "authoritative": False,
+            "source_log_ids": [r["id"] for r in rows],
+            "facts": rows,
+            "state": None,
+            "nodes": [],
+        }
+
+    def _candidate_fallback(self, query: str, top_k: int) -> Optional[Dict[str, Any]]:
+        """Issue #44 PR4:candidate 候选通道——未核实事实的降权透出,带 unverified 标记。
+
+        高 noul 行与「疑似计划」(decision_approved 但 confidence<0.9)都落这里;
+        慢波核实通过后改走活体卡,被否决的行已清退,不会再进本层。
+        """
+        stripped = _strip_particles(query)
+        if len(stripped) < 2:
+            return None
+        tokens = [t for t in _scoring_tokens(query) if t not in _RECENT_TURN_STOPWORDS]
+        if not any(len(t) >= _RECENT_TURN_MIN_CONTENT_LEN for t in tokens):
+            return None
+        rows = self.scratchpad.search_candidates(tokens, limit=min(top_k, _CANDIDATE_MAX))
+        if not rows:
+            return None
+        return {
+            "strategy": "CANDIDATE_UNVERIFIED",
+            "confidence": _CANDIDATE_CONFIDENCE,
+            "provisional": True,
+            "authoritative": False,
+            "unverified": True,
             "source_log_ids": [r["id"] for r in rows],
             "facts": rows,
             "state": None,

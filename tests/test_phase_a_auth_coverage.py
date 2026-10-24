@@ -32,6 +32,7 @@ def _requests():
         ("post", "/v1/sleep/consolidate", {"dry_run": True}),
         ("post", "/v1/admin/backfill-display-names", {"dry_run": True}),
         ("post", "/v1/admin/purge-scratchpad", {"dry_run": True}),
+        ("post", "/v1/admin/backfill-judge", {"after_date": "2026-10-23 00:00:00", "dry_run": True}),
         ("post", "/v1/admin/seed", None),
     ]
 
