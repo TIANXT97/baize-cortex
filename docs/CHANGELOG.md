@@ -4,6 +4,13 @@
 
 ## 2026-10-24
 
+### 新增：配置改动事后沉淀通道（PR #51，Issue #44 E 项 / CTO 会诊 PR2，优先级上调 P1）
+- **根因**：配置改动是「执行动作」而非「定案表述」，事前判定必然漏——#44 实测「改成北京时间凌晨3点」连关键词门都没开，本轮 4 条真实配置定案全靠人工 `cortex_add` 兜底。
+- **方案**：`CortexClient.record_config_change(tool, key, before, after)`——网关在配置类工具动作**成功后**调用，沉淀为 `explicit_addition`（`category=rule`、`reason=config_change:<tool>`），走既有 `_deliver` 通道（幂等、断网入 Outbox 重放）。内容含 key、before→after 与 UTC 时间戳（仓库无 T 格式约定）；`None` 分别表达「(未设置)」/「(已移除)」。
+- **脱敏在写入前完成**：key 名命中 `token|key|secret|password|passwd|credential|auth` 整值 `<REDACTED>`；值形态兜底（`sk-` 前缀、≥32 位 hex、≥40 位 base64）；值裁剪 200 字符。IP、模型名等非秘密配置保留可召回性。
+- **测试**：新增 `test_phase_a_config_sediment.py`（沉淀行为五要素、密钥类与值形态脱敏零泄漏、None 标记、Outbox 重放、验收闭环——沉淀后 `recall` 立即命中 `SCRATCHPAD_EXPLICIT_FALLBACK`，无需人工 `cortex_add`）。全量 26 套件通过。
+- **未验证**：真实配置改动端到端——网关接线属部署副本侧，同步时照抄本参考实现。
+
 ### 新增：SystemOne 门神 401/403 鉴权熔断（PR #49，Issue #44 PR1 代码半边）
 - **现象**：OpenJev 密钥与本机 systemd 环境脱节期间，Drex `noul` 落入模糊区 (0.4, 0.6) 的每条样本白等 0.4s 收 401 再回退 Drex 答案，成本白付收益为零；且 `_try` 吞掉一切异常，失败完全静默（靠 #44 直连探针才发现）。
 - **修复**：新增 `_GateBreaker` 进程内熔断——401/403（永久性凭据失效）首次命中即熔断该门神并打 `WARNING`（logger `baize.phase_detector`，未配置日志时经 lastResort 直出 stderr，失败不再静默）；熔断期内 `detect_phase` 直接跳过该门神，模糊区立即降级；TTL 600s（monotonic 时钟可注入）到期自动恢复，密钥修好无需重启进程；5xx/超时仍按临时故障处理不熔断；线程安全。

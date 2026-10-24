@@ -122,7 +122,7 @@ baize-cortex/
 │   ├── test_recall_single_gram_gate.py # Issue #44 红线: 门槛回撤锁定与别名库通用词黑名单
 │   ├── test_purge_before_date.py   # Issue #32: 草稿流时间窗归档与一键脚本
 │   ├── test_purge_protect_phase_hints.py # Issue #34: 草稿归档默认豁免待固化记录
-│   ├── test_phase_a_*.py           # Phase A: 迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖
+│   ├── test_phase_a_*.py           # Phase A: 迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀
 │   └── fixtures/normalization_vectors.json # 规范化 golden vectors
 ├── README.md
 ├── LICENSE
