@@ -214,7 +214,12 @@ class CognitiveRecallRouter:
             + _decay(state["updated_at"], now)
         )
         gram_hits = [t for t in hits if t not in words]
-        qualifies = any(t in words for t in hits) or len(gram_hits) >= 2
+        # Issue #44 C:单个 2-gram 命中卡名/别名即是强信号,放行;仅命中正文的仍需 ≥2 个,防通用词噪声
+        qualifies = (
+            any(t in words for t in hits)
+            or len(gram_hits) >= 2
+            or any(t.lower() in name or t.lower() in alias_text for t in gram_hits)
+        )
         return float(score), qualifies
 
     def _explicit_fallback(self, query: str, top_k: int) -> Optional[Dict[str, Any]]:
