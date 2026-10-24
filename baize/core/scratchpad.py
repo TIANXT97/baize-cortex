@@ -1,4 +1,5 @@
 """Layer 0: 瞬态草稿流管理器"""
+import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -6,11 +7,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 EXPLICIT_HINT = "explicit_addition"
+CANDIDATE_HINT = "candidate"
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 _MAX_SEARCH_TOKENS = 16
 RECENT_TURN_MAX_CHARS = 400
 RECENT_TURN_MIN_CHARS = 6  # 行侧下限：整行只有「可以」「好的」这种两字应答不构成记忆
 _TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
+
+
+def batch_judge_enabled() -> bool:
+    """Issue #44 PR4:批量判管线总开关。
+
+    关闭时普通 user 行 judge_status 保持 NULL(与历史存量同语义,可被默认 purge 清退),
+    开启时才置 pending 进入夜间判研管线——防止开关关闭期间 pending 行无限积压且永不可清。
+    """
+    return os.environ.get("CORTEX_BATCH_JUDGE", "").strip().lower() in ("1", "true", "on")
 
 
 def _escape_like(text: str) -> str:
@@ -48,13 +59,20 @@ class ScratchpadManager:
         if phase_hint == EXPLICIT_HINT:
             raise ValueError("phase_hint=explicit_addition 仅限 cortex_add 内部路径使用")
         now = _utc_now()
+        # Issue #44 PR4:judge_status 状态机——已打标行与非 user 行视为已判;
+        # 普通 user 行仅在批量判管线开启时进 pending,关闭时保持 NULL(历史同语义,可被 purge)
+        judge_status = (
+            "done" if (phase_hint or role != "user")
+            else ("pending" if batch_judge_enabled() else None)
+        )
         cur = self.conn.execute(
             """
             INSERT INTO scratchpad_log
-                (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id, ingested_at, valid_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id,
+                 ingested_at, valid_at, judge_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id, now, now),
+            (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id, now, now, judge_status),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -111,6 +129,7 @@ class ScratchpadManager:
               AND created_at >= ?
               AND length(trim(raw_text)) >= ?
               AND (? IS NULL OR agent_id IS NULL OR agent_id = ?)
+              AND COALESCE(judge_status, '') <> 'failed'
               AND ({clause})
             ORDER BY hits DESC, created_at DESC, id DESC
             LIMIT ?
@@ -124,6 +143,113 @@ class ScratchpadManager:
             }
             for r in rows
         ]
+
+    def search_candidates(self, tokens: List[str], limit: int = 3) -> List[Dict[str, Any]]:
+        """Issue #44 PR4:candidate 候选流的只读召回(降权通道),复用 recent_turns 的命中数排序。"""
+        words = [t for t in tokens if t][:_MAX_SEARCH_TOKENS]
+        if not words or limit <= 0:
+            return []
+        clause = " OR ".join("raw_text LIKE ? ESCAPE '\\'" for _ in words)
+        params: List[Any] = [f"%{_escape_like(t)}%" for t in words]
+        hits_expr = " + ".join(
+            "(CASE WHEN raw_text LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)" for _ in words
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT id, raw_text, created_at, noul_score, ({hits_expr}) AS hits
+            FROM scratchpad_log
+            WHERE phase_hint = '{CANDIDATE_HINT}' AND expired_at IS NULL AND ({clause})
+            ORDER BY hits DESC, created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (*params, *params, limit),
+        ).fetchall()
+        return [
+            {"id": r[0], "text": (r[1] or "")[:RECENT_TURN_MAX_CHARS], "created_at": r[2],
+             "noul": r[3], "hits": r[4]}
+            for r in rows
+        ]
+
+    def fetch_pending_judgement(self, limit: int = 500, max_retry: int = 3) -> List[Dict[str, Any]]:
+        """Issue #44 PR4:捞待批量判的 user 行,按会话分组、id 时间正序(缓解批次锚定效应)。"""
+        rows = self.conn.execute(
+            """
+            SELECT id, session_id, raw_text FROM scratchpad_log
+            WHERE judge_status = 'pending' AND retry_count < ? AND role = 'user'
+              AND phase_hint IS NULL AND expired_at IS NULL
+            ORDER BY session_id, id
+            LIMIT ?
+            """,
+            (max_retry, limit),
+        ).fetchall()
+        return [{"id": r[0], "session_id": r[1], "raw_text": r[2]} for r in rows]
+
+    def mark_judged(self, row_id: int, phase_hint: Optional[str], noul: float, source: str) -> None:
+        self.conn.execute(
+            """
+            UPDATE scratchpad_log
+            SET judge_status = 'done', judge_source = ?, phase_hint = COALESCE(?, phase_hint),
+                noul_score = ?
+            WHERE id = ?
+            """,
+            (source, phase_hint, noul, row_id),
+        )
+
+    def mark_judge_retry(self, row_ids: List[int], max_retry: int) -> None:
+        if not row_ids:
+            return
+        placeholders = ",".join("?" * len(row_ids))
+        self.conn.execute(
+            f"""
+            UPDATE scratchpad_log
+            SET retry_count = retry_count + 1,
+                judge_status = CASE WHEN retry_count + 1 >= ? THEN 'failed' ELSE 'pending' END
+            WHERE id IN ({placeholders})
+            """,
+            (max_retry, *row_ids),
+        )
+
+    def backfill_judge(
+        self,
+        after_date: Optional[str] = None,
+        before_date: Optional[str] = None,
+        limit: int = 500,
+        dry_run: bool = True,
+    ) -> Dict[str, Any]:
+        """Issue #44 PR4 盲区1:一次性存量回填——显式时间窗 + 条数上限,默认 dry-run 出清单。
+
+        只把历史双 NULL 行(user 且未打标且未过期)置为 pending,交给夜间批量判;
+        不带窗口则拒绝执行,防止全量存量风暴。
+        """
+        if after_date is None and before_date is None:
+            raise ValueError("必须显式指定 after_date 或 before_date 时间窗,防止全量存量回填风暴")
+        if after_date is not None:
+            validate_timestamp(after_date)
+        if before_date is not None:
+            validate_timestamp(before_date)
+        where = (
+            "phase_hint IS NULL AND judge_status IS NULL AND role = 'user' AND expired_at IS NULL "
+            "AND (? IS NULL OR created_at >= ?) AND (? IS NULL OR created_at < ?)"
+        )
+        params: List[Any] = [after_date, after_date, before_date, before_date]
+        if dry_run:
+            rows = self.conn.execute(
+                f"SELECT id, raw_text FROM scratchpad_log WHERE {where} ORDER BY id LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+            return {
+                "dry_run": True, "matched": len(rows), "ids": [r[0] for r in rows],
+                "sample": [{"id": r[0], "raw_text": (r[1] or "")[:60]} for r in rows[:10]],
+            }
+        cur = self.conn.execute(
+            f"""
+            UPDATE scratchpad_log SET judge_status = 'pending'
+            WHERE id IN (SELECT id FROM scratchpad_log WHERE {where} ORDER BY id LIMIT ?)
+            """,
+            (*params, limit),
+        )
+        self.conn.commit()
+        return {"dry_run": False, "queued": cur.rowcount}
 
     def find_by_idempotency_key(self, key: str) -> Optional[Tuple[int, Optional[str]]]:
         row = self.conn.execute(
@@ -146,8 +272,8 @@ class ScratchpadManager:
             """
             INSERT INTO scratchpad_log
                 (session_id, role, raw_text, phase_hint, noul_score, category, reason,
-                 idempotency_key, agent_id, ingested_at, valid_at)
-            VALUES (?, 'user', ?, 'explicit_addition', 0.0, ?, ?, ?, ?, ?, ?)
+                 idempotency_key, agent_id, ingested_at, valid_at, judge_status)
+            VALUES (?, 'user', ?, 'explicit_addition', 0.0, ?, ?, ?, ?, ?, ?, 'done')
             """,
             (session_id, content, category, reason, idempotency_key, agent_id, now, now),
         )
@@ -180,7 +306,8 @@ class ScratchpadManager:
     ) -> List[Dict[str, Any]]:
         where, params = _purge_filter(before_id, role, before_date)
         if not include_pending_phase:
-            where += " AND phase_hint IS NULL"
+            # Issue #44 PR4:待批量判(pending)的行同样豁免——未判完被删等于记忆丢失;failed 不豁免(有冷归档)
+            where += " AND phase_hint IS NULL AND COALESCE(judge_status, '') <> 'pending'"
         rows = self.conn.execute(
             f"""
             SELECT id, session_id, role, raw_text, phase_hint, noul_score, created_at, category, reason
@@ -200,7 +327,9 @@ class ScratchpadManager:
     ) -> int:
         where, params = _purge_filter(before_id, role, before_date)
         return self.conn.execute(
-            f"SELECT COUNT(*) FROM scratchpad_log WHERE {where} AND phase_hint IS NOT NULL", params
+            f"SELECT COUNT(*) FROM scratchpad_log WHERE {where} "
+            f"AND (phase_hint IS NOT NULL OR judge_status = 'pending')",
+            params,
         ).fetchone()[0]
 
     def export_pending_phase_logs(self, date_str: Optional[str] = None) -> List[Dict[str, Any]]:

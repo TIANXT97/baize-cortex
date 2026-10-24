@@ -123,6 +123,13 @@ class BackfillIn(BaseModel):
     dry_run: bool = True
 
 
+class JudgeBackfillIn(BaseModel):
+    after_date: Optional[str] = None
+    before_date: Optional[str] = None
+    limit: int = 500
+    dry_run: bool = True
+
+
 def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> FastAPI:
     lock = threading.Lock()
     ppr = PPREngine()
@@ -362,6 +369,22 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
                 body.before_id, body.role, body.dry_run, before_date=before_date,
                 include_pending_phase=body.include_pending_phase,
             )
+
+    @app.post("/v1/admin/backfill-judge")
+    def admin_backfill_judge(body: JudgeBackfillIn, request: Request):
+        authenticate(request)
+        try:
+            after_date = validate_timestamp(body.after_date) if body.after_date is not None else None
+            before_date = validate_timestamp(body.before_date) if body.before_date is not None else None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        with lock:
+            try:
+                return app.state.scratchpad.backfill_judge(
+                    after_date, before_date, max(1, body.limit), body.dry_run
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
 
     @app.post("/v1/admin/seed")
     def admin_seed(request: Request):
