@@ -119,7 +119,7 @@ baize-cortex/
 │   ├── test_explicit_addition_consolidation.py # Issue #25: 显式沉淀慢波固化
 │   ├── test_explicit_addition_recall.py # Issue #25: 未固化事实的兜底召回
 │   ├── test_recall_scoring.py      # Issue #32: 2-gram 分词、打分排序与命中回写
-│   ├── test_recall_single_gram_gate.py # Issue #44: 单 2-gram 命中卡名/别名放行门槛
+│   ├── test_recall_single_gram_gate.py # Issue #44 红线: 门槛回撤锁定与别名库通用词黑名单
 │   ├── test_purge_before_date.py   # Issue #32: 草稿流时间窗归档与一键脚本
 │   ├── test_purge_protect_phase_hints.py # Issue #34: 草稿归档默认豁免待固化记录
 │   ├── test_phase_a_*.py           # Phase A: 迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖
