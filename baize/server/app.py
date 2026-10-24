@@ -21,7 +21,7 @@ from baize.core.supersession import supersede
 from baize.core.scratchpad import EXPLICIT_HINT, ScratchpadManager, validate_timestamp
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.core.seeds import seed_initial_assets
-from baize.intelligence.phase_detector import OpenAICompatClient, PhaseDetector, llm_settings_from_env
+from baize.intelligence.phase_detector import OpenAICompatClient, llm_settings_from_env
 from baize.intelligence.ppr_engine import PPREngine
 from baize.intelligence.recall_router import CognitiveRecallRouter
 from baize.storage.db import init_db
@@ -140,7 +140,6 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         if settings is not None:
             url, key, reasoning_model = settings
             llm_client = OpenAICompatClient(url, key, reasoning_model)
-        app.state.detector = PhaseDetector.from_env()
         app.state.consolidator = DreamConsolidator(conn, archive_dir=archive_dir, llm_client=llm_client)
         app.state.router = CognitiveRecallRouter(conn, ppr)
         try:
@@ -261,12 +260,14 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         return {"id": new_id, "deduplicated": False, "idempotency_key": key}
 
     @app.get("/v1/living-states")
-    def list_living_states():
+    def list_living_states(request: Request):
+        authenticate(request)
         with lock:
             return app.state.living.list_active_states()
 
     @app.get("/v1/living-state/{entity_id}")
-    def get_living_state(entity_id: str):
+    def get_living_state(entity_id: str, request: Request):
+        authenticate(request)
         with lock:
             state = app.state.living.get_state(entity_id)
         if state is None:
@@ -274,7 +275,8 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         return state
 
     @app.post("/v1/living-state/decision")
-    def post_decision(body: DecisionIn):
+    def post_decision(body: DecisionIn, request: Request):
+        authenticate(request)
         with lock:
             return app.state.living.update_decision(
                 body.entity_id,
@@ -286,13 +288,15 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
             )
 
     @app.post("/v1/graph/node")
-    def graph_node(body: GraphNodeIn):
+    def graph_node(body: GraphNodeIn, request: Request):
+        authenticate(request)
         with lock:
             app.state.graph.upsert_node(body.node_id, body.label, body.node_type, body.properties)
         return {"node_id": body.node_id}
 
     @app.post("/v1/graph/edge")
-    def graph_edge(body: GraphEdgeIn):
+    def graph_edge(body: GraphEdgeIn, request: Request):
+        authenticate(request)
         with lock:
             try:
                 app.state.graph.add_edge(
@@ -303,26 +307,30 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         return {"status": "created"}
 
     @app.post("/v1/graph/invalidate")
-    def graph_invalidate(body: GraphInvalidateIn):
+    def graph_invalidate(body: GraphInvalidateIn, request: Request):
+        authenticate(request)
         with lock:
             app.state.graph.invalidate_edge(body.src_id, body.dst_id, body.rel_type, body.invalid_at)
         return {"status": "invalidated"}
 
     @app.get("/v1/graph/active-subgraph")
-    def active_subgraph():
+    def active_subgraph(request: Request):
+        authenticate(request)
         with lock:
             edges = app.state.graph.get_active_subgraph()
         return {"edges": [{"src_id": s, "dst_id": d, "weight": w} for s, d, w in edges]}
 
     @app.post("/v1/recall/ppr")
-    def recall_ppr(body: PPRIn):
+    def recall_ppr(body: PPRIn, request: Request):
+        authenticate(request)
         with lock:
             edges = app.state.graph.get_active_subgraph()
         energy = ppr.run_ppr(edges, body.seed_nodes)
         return {"ranking": [{"node_id": node, "energy": score} for node, score in energy.items()]}
 
     @app.post("/v1/sleep/consolidate")
-    def sleep_consolidate(body: SleepIn):
+    def sleep_consolidate(body: SleepIn, request: Request):
+        authenticate(request)
         if body.dry_run:
             return {"status": "dry_run", "archived_logs": 0, "updated_states": [], "archive_file": None}
         with lock:
@@ -337,12 +345,14 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
             return app.state.router.recall(body.query, body.top_k, agent_id=agent_id)
 
     @app.post("/v1/admin/backfill-display-names")
-    def admin_backfill(body: BackfillIn):
+    def admin_backfill(body: BackfillIn, request: Request):
+        authenticate(request)
         with lock:
             return app.state.consolidator.backfill_display_names(body.dry_run)
 
     @app.post("/v1/admin/purge-scratchpad")
-    def admin_purge(body: PurgeIn):
+    def admin_purge(body: PurgeIn, request: Request):
+        authenticate(request)
         try:
             before_date = validate_timestamp(body.before_date) if body.before_date is not None else None
         except ValueError as exc:
@@ -354,7 +364,8 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
             )
 
     @app.post("/v1/admin/seed")
-    def admin_seed():
+    def admin_seed(request: Request):
+        authenticate(request)
         with lock:
             seed_initial_assets(app.state.conn)
         return {"status": "seeded"}

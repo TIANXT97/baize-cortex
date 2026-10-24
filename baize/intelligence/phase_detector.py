@@ -16,7 +16,7 @@ PHASE_CATEGORY = {
 
 _REJECTION_KEYWORDS = ("不对", "记错了", "推翻", "作废", "不行", "否定")
 _APPROVAL_KEYWORDS = ("就按这个", "定案", "拍板", "就这么定", "明天开搞", "就这样做")
-_EXPLORATION_KEYWORDS = ("怎么", "能不能", "是否", "探讨", "思路", "如果", "?", "?")
+_EXPLORATION_KEYWORDS = ("怎么", "能不能", "是否", "探讨", "思路", "如果", "?", "？")
 
 _USER_AGENT = "Baize/Gate-v2.0 (TypeSafe-Client)"
 _AMBIGUOUS_NOUL = (0.4, 0.6)

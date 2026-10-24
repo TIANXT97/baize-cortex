@@ -52,5 +52,13 @@ def test_bitemporal_ppr_convergence():
     print("能量分布:", energy)
 
 
+def test_ppr_parallel_edges_accumulate_weight():
+    ppr = PPREngine()
+    single = ppr.run_ppr([("a", "b", 2.0)], seed_nodes={"a": 1.0})
+    doubled = ppr.run_ppr([("a", "b", 1.0), ("a", "b", 1.0)], seed_nodes={"a": 1.0})
+    assert abs(single["b"] - doubled["b"]) < 1e-9
+
+
 if __name__ == "__main__":
     test_bitemporal_ppr_convergence()
+    test_ppr_parallel_edges_accumulate_weight()
