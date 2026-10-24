@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-24（同步至 PR #45 / Issue #44 C 项：召回命中门槛放宽为单 2-gram 命中卡名/别名即放行；含 PR #42 / Issue #41 裁决的 `/v1/*` 全端点鉴权收口与启用清单勘误）  
+**最近同步**：2026-10-24（同步至 PR #47 / Issue #44 CTO 裁决红线 3：召回门槛回撤与别名库通用词黑名单；含 PR #45/#46 的 C 项首轮实现与文档同步）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -50,7 +50,7 @@
 - **特性**：一项目一文档，硬上限限制在 20~30 个核心工程实体；
 - **查询复杂度**：$O(1)$ 主键直连，直接旁路所有图检索与向量比对；
 - **展示名保护**：`display_name == entity_id` 视为“黑户”，慢波合成或 `POST /v1/admin/backfill-display-names` 可将其转正为自然语言名称；已有的良好名称不会被覆盖；
-- **别名库**：`metadata.aliases` 增量取并集，永久保留。
+- **别名库**：`metadata.aliases` 增量取并集，永久保留；纯通用词（记忆/方案/项目/系统/服务/配置/记录/问题/时间/数据/工具）经黑名单**精确匹配**禁止入库，已入库的在该卡下次被慢波触碰时自动清洗，不误伤「时间机器」类长词（Issue #44 CTO 裁决，PR #47）。
 
 ### 2.3 Layer 2: 双时态实体拓扑图 (Bi-temporal Graph)
 - **表结构**：
@@ -139,7 +139,7 @@ $$\text{Score} = 3\,[\text{display\_name 命中}] + 2\,[\text{alias 命中}] + 1
 
 方括号为「任一 token 命中即记 1」，$N_{\text{hit}}$ 为命中的不同 token 个数，匹配不区分大小写。时效因子在更新 20 天后衰减到 0，不会为负。
 
-**命中门槛（`DECISION_TEXT_MATCH`）**：至少一个原词命中、至少两个不同的 2-gram 命中，或单个 2-gram 命中 `display_name` / `alias`（Issue #44 C）。第三条的理由：卡名短且独特，单 gram 命中名字是强信号；而无标点中文整句只切出一个原词 token，长句中唯一的卡名 2-gram（如「卡片」→「流式卡片」）靠这条放行。仅命中正文（`current_decision` / `facts`）的单个 2-gram 偶然巧合（如「方案」「飞书」中的某一对字）仍不足以让一张卡入选，避免通用词制造噪声。
+**命中门槛（`DECISION_TEXT_MATCH`）**：至少一个原词命中，或至少两个不同的 2-gram 命中。单个 2-gram 的偶然巧合（如「方案」「飞书」中的某一对字）不足以让一张卡入选，避免通用词制造噪声。**名称 2-gram 碎片严禁放行**（Issue #44 CTO 裁决红线 3，PR #47 纠偏）：「记忆」⊂「白泽记忆」这类高频词碎片会把纯闲聊误召成卡片——全词命中由 `LIVING_STATE_DIRECT` 的 name/alias 子串匹配承担，长句召回靠注册具体别名解决（通用词别名经黑名单清洗，见 §2.2）。
 
 **排序**：Score 降序；同分取 `updated_at` 新的；再同分按 `entity_id` 升序，结果确定。输出严格遵守调用方 `top_k`（小于 1 按 1 处理），每条 `living_states` 带 `score`。
 
@@ -310,4 +310,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 25 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 C 新增 `test_recall_single_gram_gate`（单 2-gram 命中卡名/别名放行、仅命中正文的单 gram 仍拦、双 gram 正文命中不变）。PR #42 新增 `test_phase_a_auth_coverage`（12 个 `/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的七个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 25 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）。PR #42 新增 `test_phase_a_auth_coverage`（12 个 `/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的七个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
