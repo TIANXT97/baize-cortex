@@ -106,6 +106,57 @@ def test_requests_carry_waf_safe_headers():
     assert body["questions"]["should_memorize"]["type"] == "noul"
 
 
+def test_auth_failure_trips_gate_breaker_and_skips_retries():
+    # Issue #44 PR1:Drex 401 是永久性凭据失效,首次熔断后后续调用直接跳过,只打 OpenJev
+    seen = []
+    routes = {
+        DREX: urllib.error.HTTPError(DREX, 401, "Unauthorized", {}, None),
+        OPENJEV: _answers("decision_approved", 0.9),
+    }
+    now = [0.0]
+    det = PhaseDetector(
+        drex_url=DREX, drex_key="dk", openjev_url=OPENJEV, openjev_key="ok", timeout=1.0,
+        breaker_ttl=600.0, clock=lambda: now[0],
+    )
+    with mock.patch("urllib.request.build_opener", return_value=_fake_opener(routes, seen)):
+        det.detect_phase("就这么定,明天开搞")
+        det.detect_phase("不对,我记错了")
+    assert [r.full_url for r in seen] == [DREX, OPENJEV, OPENJEV]
+
+
+def test_gate_breaker_recovers_after_ttl():
+    seen = []
+    routes = {
+        DREX: urllib.error.HTTPError(DREX, 401, "Unauthorized", {}, None),
+        OPENJEV: _answers("chitchat", 0.1),
+    }
+    now = [0.0]
+    det = PhaseDetector(
+        drex_url=DREX, drex_key="dk", openjev_url=OPENJEV, openjev_key="ok", timeout=1.0,
+        breaker_ttl=600.0, clock=lambda: now[0],
+    )
+    with mock.patch("urllib.request.build_opener", return_value=_fake_opener(routes, seen)):
+        det.detect_phase("就这么定,明天开搞")
+        now[0] = 600.1
+        det.detect_phase("就按这个做")
+    assert [r.full_url for r in seen] == [DREX, OPENJEV, DREX, OPENJEV]
+
+
+def test_server_errors_do_not_trip_breaker():
+    # 5xx 是临时故障,不熔断,每次仍双门尝试
+    seen = []
+    routes = {
+        DREX: urllib.error.HTTPError(DREX, 500, "boom", {}, None),
+        OPENJEV: urllib.error.HTTPError(OPENJEV, 500, "boom", {}, None),
+    }
+    det = _detector()
+    with mock.patch("urllib.request.build_opener", return_value=_fake_opener(routes, seen)):
+        phase, _, category = det.detect_phase("就按这个做")
+        phase2, _, _ = det.detect_phase("明天开搞")
+    assert (phase, category) == ("decision_approved", "approval") and phase2 == "decision_approved"
+    assert [r.full_url for r in seen] == [DREX, OPENJEV, DREX, OPENJEV]
+
+
 def test_local_rules_detect_fullwidth_question_mark():
     phase, conf, category = PhaseDetector().detect_phase("这样行吗？")
     assert (phase, category) == ("exploration", "exploration")
@@ -117,6 +168,9 @@ if __name__ == "__main__":
     test_drex_failure_relays_to_openjev()
     test_ambiguous_drex_result_relays_to_openjev()
     test_both_gates_down_fail_open_to_local_rules()
+    test_auth_failure_trips_gate_breaker_and_skips_retries()
+    test_gate_breaker_recovers_after_ttl()
+    test_server_errors_do_not_trip_breaker()
     test_local_rules_detect_fullwidth_question_mark()
     test_requests_carry_waf_safe_headers()
     print("✅ Phase 7 SystemOne 双门神专项测试全部通过")

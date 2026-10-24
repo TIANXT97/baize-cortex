@@ -1,11 +1,20 @@
 """System 1 决策嗅探器:Drex-Max 主力 + OpenJev 仲裁,经 SystemOne 原生协议调用
 
 云端不可用或调用失败时降级为本地规则,不抛错。
+鉴权类失败(401/403)触发进程内熔断:熔断期内直接跳过该门神,不再逐条白等。
 """
 import json
+import logging
 import os
+import threading
+import time
+import urllib.error
 import urllib.request
-from typing import Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
+
+log = logging.getLogger("baize.phase_detector")
+
+_AUTH_FAILURE_TTL = 600.0  # 密钥修好后无需重启进程即可恢复;期间该门神视为不可用
 
 PHASE_CATEGORY = {
     "decision_approved": "approval",
@@ -116,6 +125,8 @@ class PhaseDetector:
         timeout: float = 5.0,
         drex_model: str = "drex-max",
         openjev_model: str = "openjev-latest",
+        breaker_ttl: float = _AUTH_FAILURE_TTL,
+        clock: Optional[Callable[[], float]] = None,
     ):
         self.drex_url = drex_url
         self.drex_key = drex_key
@@ -125,6 +136,7 @@ class PhaseDetector:
         self.timeout = timeout
         self.drex_model = drex_model
         self.openjev_model = openjev_model
+        self.breaker = _GateBreaker(breaker_ttl, clock or time.monotonic)
 
     @classmethod
     def from_env(cls) -> "PhaseDetector":
@@ -137,21 +149,27 @@ class PhaseDetector:
         )
 
     def detect_phase(self, text: str) -> Tuple[str, float, str]:
-        drex = self._try(self.drex_url, self.drex_key, self.drex_model, text)
+        drex = self._try("drex", self.drex_url, self.drex_key, self.drex_model, text)
         if drex is not None and not _is_ambiguous(drex[1]):
             return _result(*drex)
-        openjev = self._try(self.openjev_url, self.openjev_key, self.openjev_model, text)
+        openjev = self._try("openjev", self.openjev_url, self.openjev_key, self.openjev_model, text)
         if openjev is not None:
             return _result(*openjev)
         if drex is not None:
             return _result(*drex)
         return self._detect_local(text)
 
-    def _try(self, url: Optional[str], key: Optional[str], model: str, text: str) -> Optional[Tuple[str, float]]:
+    def _try(self, gate: str, url: Optional[str], key: Optional[str], model: str, text: str) -> Optional[Tuple[str, float]]:
         if not url or not key:
+            return None
+        if self.breaker.is_open(gate):
             return None
         try:
             return _systemone_call(url, key, model, text, self.timeout, self.proxy)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                self.breaker.trip(gate, exc.code)
+            return None
         except Exception:
             return None
 
@@ -173,3 +191,23 @@ def _is_ambiguous(noul: float) -> bool:
 
 def _result(phase: str, noul: float) -> Tuple[str, float, str]:
     return phase, noul, PHASE_CATEGORY[phase]
+
+
+class _GateBreaker:
+    """Issue #44 PR1:门神鉴权熔断——401/403 是永久性凭据失效,重试只产生时延与噪声。"""
+
+    def __init__(self, ttl: float = _AUTH_FAILURE_TTL, clock: Callable[[], float] = time.monotonic):
+        self.ttl = ttl
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._tripped: Dict[str, float] = {}
+
+    def is_open(self, gate: str) -> bool:
+        with self._lock:
+            until = self._tripped.get(gate)
+            return until is not None and self.clock() < until
+
+    def trip(self, gate: str, status: int) -> None:
+        with self._lock:
+            self._tripped[gate] = self.clock() + self.ttl
+        log.warning("SystemOne 门神 %s 鉴权失败(HTTP %s),熔断 %.0f 秒", gate, status, self.ttl)
