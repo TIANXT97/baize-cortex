@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-23（同步至 Issue #39，`RECENT_TURNS_CONTEXT` 三层收口：代理隔离、噪声过滤、命中数排序；含 Issue #37 的末级召回层、PR #35 / Issue #34 的草稿归档待固化记录保护、Issue #32 的召回打分排序与草稿流时间窗归档）  
+**最近同步**：2026-10-24（同步至 PR #42 / Issue #41 裁决：`/v1/*` 全端点鉴权收口、启用清单勘误与 PPR/慢波/依赖修复；含 Issue #39 的 RECENT_TURNS 收口与 Issue #37 的末级召回层）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -120,7 +120,7 @@
 |---|---|---|---|
 | 1 | `LIVING_STATE_DIRECT` | 查询命中活体卡的 `display_name` 或 `aliases` | 名称出现在原查询或剥离语气助词后的查询中即命中；反向包含（剥离后的查询是名称的子串）仅在名称长度不少于 4 时生效。可能命中多张卡，按 §3.3 打分排序后取前 `top_k`，`state` 为第一名。置信度 1.0 |
 | 2 | `PPR_SPREADING` | 图谱节点 `label` 出现在查询中，得到种子节点 | 在有效子图上做 PPR 扩散，返回能量排序与 `resolved_state` |
-| 3 | `DECISION_TEXT_MATCH` | 没有任何种子节点时的兜底 | 用「原词 + 中文 2-gram」双通道分词，对全部现役卡打分，达到命中门槛的按 §3.3 排序后取前 `top_k`，不再首个命中即返回。置信度 0.6 |
+| 3 | `DECISION_TEXT_MATCH` | 没有任何种子节点时的兜底 | 用「原词 + 中文 2-gram」双通道分词，对全部现役卡打分，达到命中门槛的按 §3.3 排序后取前 `top_k`，不再首个命中即返回；命中时同步检索显式事实并作为 `provisional_facts` 融合返回（Issue #28），第 4 层的检索并非只在本层落空才执行。置信度 0.6 |
 | 4 | `SCRATCHPAD_EXPLICIT_FALLBACK` | 以上都未命中 | 末级只读兜底：检索 `scratchpad_log` 中 `phase_hint='explicit_addition'` 且 `expired_at IS NULL` 的未固化记录，复用分词、转义 LIKE 通配符，按 `created_at` 倒序取 `top_k`。置信度 0.5，响应带 `provisional=True`、`authoritative=False`、`source_log_ids`、`facts` |
 | 5 | `RECENT_TURNS_CONTEXT` | 以上都未命中，且窗口内有 token 命中的普通对话轮（Issue #37 / #39） | 会话短期连续性兜底：检索 `scratchpad_log` 中 `role='user'`、`phase_hint IS NULL`、`expired_at IS NULL`、`created_at >= now - 72h`、`length(trim(raw_text)) >= 6`，且 `agent_id` 为空（未启用 token 时期的历史行）或与当前代理一致的行；查询侧先滤掉纯语气/指示/连接词（`RECENT_TURN_STOPWORDS`），并要求至少一个 ≥3 字的实义词，否则整层不触发。结果按命中 token 数倒序、再按 `created_at` 倒序取 `min(top_k, 3)` 条，每条文本裁剪到 400 字符。置信度 0.35，`provisional=True`、`authoritative=False`，带 `source_log_ids`、`facts`；严格只读 |
 | 6 | `NO_MATCH` | 全部未命中 | 返回空结果，置信度 0.0 |
@@ -210,7 +210,9 @@ Hermes 网关核心的 `sync_turn` 采用 `(user_content, assistant_content, *, 
 2. 需要按 agent 回溯写入来源；
 3. Cortex 对本机以外的地址可达，哪怕仅在局域网内。
 
-启用时服务端设 `CORTEX_AGENT_TOKENS=<token>:<agent_id>`，插件端设 `CORTEX_TOKEN=<token>`，两端必须同时改，且先重启 Cortex 再重启网关，反向会在窗口期产生 `401`，插件 Fail-open 静默入 Outbox，不易察觉。历史 `agent_id IS NULL` 的行需按 `session_id` 回填，token 轮换写入运维手册。
+启用时服务端设 `CORTEX_AGENT_TOKENS=<token>:<agent_id>`，插件端设 `CORTEX_TOKEN=<token>`，两端必须同时改，且先重启 Cortex 再重启网关，反向会在窗口期产生 `401`，插件 Fail-open 静默入 Outbox，不易察觉。历史 `agent_id IS NULL` 的行需按 `session_id` 回填——注意回填的动机是**隔离卫生**（NULL 行对所有代理可见），而非召回缺失：`search_recent_turns` 对 NULL 行故意放行以防记忆断层（§3.2 第 5 层），启用 token 后老记忆照常召回。token 轮换写入运维手册。
+
+**鉴权覆盖面（PR #42）**：全部 `/v1/*` 端点统一经 `authenticate()` 凭据校验（`/health` 除外），`/v1/admin/*`、`/v1/graph/*`、`/v1/living-state/decision`、`/v1/sleep/consolidate` 等破坏性端点不再游离于凭据体系之外；未配置 `CORTEX_AGENT_TOKENS` 时全端点放行并归属 `default`，行为与既往一致。切启用当天只剩配置工作，无需再改代码。
 
 ---
 
@@ -298,6 +300,8 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 | `/v1/admin/purge-scratchpad` | POST | 草稿清洗，默认 `dry_run`，先归档再删除；过滤参数 `before_id`、`role`、`before_date`（`YYYY-MM-DD HH:MM:SS`）为 AND 关系；默认豁免 `phase_hint` 非空的待固化记录，`include_pending_phase=true` 才放行 |
 | `/v1/admin/seed` | POST | 预置核心工程资产 |
 
+全部 `/v1/*` 端点经 `authenticate()` 凭据校验（`/health` 除外）：未配置 `CORTEX_AGENT_TOKENS` 时放行并归属 `default`；配置后缺失凭据 `401`、凭据无效 `403`。PR #42 起覆盖全部端点，此前仅 `/v1/scratchpad/log`、`/v1/cortex/add`、`/v1/recall` 受保护。
+
 ### 8.2 MCP stdio 工具（`baize/server/mcp_server.py`）
 
 `baize_get_living_state`、`baize_list_active_states`、`baize_update_decision`、`baize_scratchpad_log`、`baize_recall_ppr`、`baize_consolidate_sleep`、`baize_recall`。
@@ -306,4 +310,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 22 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本）。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的六个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 24 个套件，其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本）。PR #42 新增 `test_phase_a_auth_coverage`（12 个 `/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的七个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
