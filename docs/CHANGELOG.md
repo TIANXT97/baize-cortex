@@ -2,6 +2,19 @@
 
 按合并时间倒序记录。每个功能 PR 合并后，补一个 `docs/*` 分支同步本文件、`README.md` 与 `docs/ARCHITECTURE.md`，同样走 PR 合并。
 
+## 2026-10-24
+
+### 修复：/v1 全端点鉴权收口与代码审核遗留（PR #42，Issue #41 裁决）
+- **裁决**：Issue #41 两项均选 A —— 慢波调度走本机 systemd timer（运维侧，含 `Persistent=true`、curl 超时、时区确认三处修正与月度 purge 配套建议）；`CORTEX_AGENT_TOKENS` 暂不启用，等第二个写入方。
+- **鉴权覆盖**：`authenticate()` 铺满全部 `/v1/*` 端点（`/health` 除外）。此前只盖 `/v1/scratchpad/log`、`/v1/cortex/add`、`/v1/recall`，`/v1/admin/*`、`/v1/graph/*`、`/v1/living-state/decision`、`/v1/sleep/consolidate` 等破坏性端点即使配置 token 也无保护。token 未配置时行为不变（fail-open 归 `default`），当前部署零影响；切启用当天只剩配置工作。
+- **勘误（Issue #41 原单）**：「回填前召回会漏掉老记忆」不成立 —— `search_recent_turns` 对 `agent_id IS NULL` 的历史行故意放行（防记忆断层），启用 token 后照常召回；回填的动机是隔离卫生（NULL 行对所有代理可见），不是召回缺失。
+- **本地规则笔误**：`_EXPLORATION_KEYWORDS` 两个问号都是半角 `?`，补全角 `？`；双门神都挂降级时，全角问号结尾的疑问句不再误判 chitchat。
+- **PPR 平行边**：同对节点多条边权重累加，不再互相覆盖（与单边同权重能量等价，测试锁定）。
+- **慢波折叠 DELETE**：按 `_DELETE_CHUNK=500` 分块，与 `purge_scratchpad` 对齐，摆脱 SQLite 变量数上限。
+- **依赖与死代码**：移除零引用的 scipy/numpy（httpx 保留并注明 TestClient 用途）；移除服务端未使用的 `app.state.detector` 初始化。
+- **测试**：新增 `test_phase_a_auth_coverage.py`（12 个 `/v1/*` 端点的 401/403/正确凭据三态 + 未配置时全放行）；`test_phase7_systemone_gates` 补全角问号用例；`test_bitemporal` 补 PPR 平行边能量等价用例。全量 24 套件通过，PPR 能量分布与改前逐位一致。
+- **未验证**：无生产副本回归（开发机无运行环境）；timer 尚未在美西机落地，落地后按 #41 验收标准（含 `Persistent` 补跑）复验再关单。
+
 ## 2026-10-23
 
 ### 修复：RECENT_TURNS_CONTEXT 三层收口（Issue #39）
