@@ -2,6 +2,16 @@
 
 按合并时间倒序记录。每个功能 PR 合并后，补一个 `docs/*` 分支同步本文件、`README.md` 与 `docs/ARCHITECTURE.md`，同样走 PR 合并。
 
+## 2026-10-25
+
+### 修复：批量判研切批空批 IndexError 与整步异常隔离（PR #57，Issue #56 PR 1 / P0-1 + P0-2）
+- **现象（P0-1）**：`BatchJudgeRunner._slice()` 的 `current_session` 初值为 `None`，首行 `session_id IS NULL` 时 `None != None` 为假、`or` 不短路，对空列表求 `batches[-1]` 抛 `IndexError`。`fetch_pending_judgement()` 按 `ORDER BY session_id, id` 排序，SQLite 升序把 NULL 排最前，只要待判集合里出现一行 NULL 会话就必然命中。
+- **现象（P0-2）**：`_batch_judge_step()` 无异常保护，`run()` 内只有 `_judge_batch` 有 try，切批与记账抛错会一路冒出 `run_consolidation()`——**整晚慢波全灭，折叠也不做**。
+- **修复**：切批条件前置 `not batches`；`_batch_judge_step` 包 try，异常时先 `rollback` 未提交半批、记 WARNING（logger `baize.consolidator`），返回 `{"status": "failed", "error": ...}`（截断 200 字符），主折叠照常执行。
+- **测试**：TDD 先红后绿，`test_batch_judge_candidates` 新增 2 例（两行 NULL 同批、首行 NULL 混合非 NULL 正确切批；打桩 `run` 抛错时 `run_consolidation()` 仍 `status: ok` 且定案照常折叠）。NAS 全量 **173 passed**（171 + 2）；工位 Windows 上 4 条 `recent_turns` 用例因临时 SQLite 文件占用报 `PermissionError`，`main @ 00923af` 基线同样失败，属既有平台问题。
+- **部署**：`fbaedea` 已上美西机，`CORTEX_BATCH_JUDGE` 保持 off。
+- **未完成**：Issue #56 PR 2（P1-3 candidate 核实按「事实类 / 定案类」分流）；开启批量判的另一前置条件——confidence 0.9 线大样本定线（≥100 条、负例 ≥30，0.85 / 0.875 / 0.9 / 0.925 四点曲线）。
+
 ## 2026-10-24
 
 ### 新增：candidate 候选流与夜间批量判研状态机（PR #54，Issue #44 PR4 / CTO 会诊红线 1+2，含美西五点反馈修订）
