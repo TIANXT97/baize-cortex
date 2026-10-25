@@ -212,6 +212,48 @@ def test_batch_judge_step_respects_switch():
             conn.close()
 
 
+def test_slice_tolerates_null_session_rows():
+    # Issue #56 P0-1:ORDER BY session_id 把 NULL 排最前,首行 NULL 曾触发 batches[-1] IndexError
+    runner = BatchJudgeRunner.__new__(BatchJudgeRunner)
+    runner.batch_size = 10
+    both_null = runner._slice([
+        {"session_id": None, "id": 1, "raw_text": "a"},
+        {"session_id": None, "id": 2, "raw_text": "b"},
+    ])
+    assert [[r["id"] for r in b] for b in both_null] == [[1, 2]]
+    mixed = runner._slice([
+        {"session_id": None, "id": 1, "raw_text": "a"},
+        {"session_id": "s1", "id": 2, "raw_text": "b"},
+        {"session_id": "s1", "id": 3, "raw_text": "c"},
+    ])
+    assert [[r["id"] for r in b] for b in mixed] == [[1], [2, 3]]
+
+
+def test_batch_judge_step_failure_does_not_block_consolidation():
+    # Issue #56 P0-2:增强项异常不得击杀慢波主折叠
+    with tempfile.TemporaryDirectory() as d:
+        conn, consolidator = _env(d, llm_client=_QueueLLM([]))
+        original_run = BatchJudgeRunner.run
+
+        def _boom(self):
+            raise RuntimeError("注入故障")
+
+        os.environ["CORTEX_BATCH_JUDGE"] = "on"
+        BatchJudgeRunner.run = _boom
+        try:
+            ScratchpadManager(conn).append_log("s", "user", "proj:x 定案:方案B", phase_hint="approval")
+            report = consolidator.run_consolidation()
+            assert report["status"] == "ok"
+            assert report["batch_judge"]["status"] == "failed"
+            assert "注入故障" in report["batch_judge"]["error"]
+            assert report["archived_logs"] == 1
+            assert LivingStateManager(conn).get_state("proj:x")["current_decision"] == "方案B"
+        finally:
+            BatchJudgeRunner.run = original_run
+            del os.environ["CORTEX_BATCH_JUDGE"]
+            conn.close()
+
+
 def test_candidate_recall_channel_is_lowest_authority_fallback():
     with tempfile.TemporaryDirectory() as d:
         conn, _ = _env(d)
@@ -285,6 +327,8 @@ if __name__ == "__main__":
     test_consolidation_verifies_and_folds_candidates_without_supersede()
     test_consolidation_without_llm_leaves_candidates_skipped()
     test_batch_judge_step_respects_switch()
+    test_slice_tolerates_null_session_rows()
+    test_batch_judge_step_failure_does_not_block_consolidation()
     test_candidate_recall_channel_is_lowest_authority_fallback()
     test_purge_protects_pending_and_backfill_requires_window()
     print("✅ 批量判研与 candidate 候选流测试全部通过")
