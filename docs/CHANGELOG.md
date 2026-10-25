@@ -4,6 +4,16 @@
 
 ## 2026-10-25
 
+### 修复：candidate 核实按事实类/定案类分流（PR #59，Issue #56 PR 2 / P1-3）
+- **现象**：`decision_approved` 但 `confidence<0.9` 的弱信号定案进 candidate 后，夜间核实问的是「这是可固化的客观事实吗」。定案不是事实，真定案（如「好,那就这样」conf 0.85）大概率被否决并归档清退。
+- **修复**：批量判入流时用现有 `category` 列记录候选类型（弱信号定案记 `decision`，高 noul 事实记 `fact`；`mark_judged` 新增可选 `category`，`COALESCE` 不覆盖已有值）。慢波核实按类型选 prompt，定案类问「是否正式定案、定的是哪件事、归属哪个实体」，通过后以 `category=decision`（及 `subject`）并入 facts。否决条目带 `reject_reason`，区分「核实为非客观事实」与「核实为非正式定案」。历史 `category` 为 NULL 的候选按 fact 处理。不新增列，不改 schema，不动 0.9 阈值。
+- **红线 1 不变**：定案类核实通过也只进 facts，不改写 `current_decision`，不写 `decided_as` 边，不进墓碑。
+- **验收口径修订**（审核方确认）：区分文案落在 `candidates.rejected[*].reject_reason`；`candidates.skipped` 语义保持「保留待下次核实」。
+- **列复用说明**：`scratchpad_log.category` 同时被 `cortex_add`（fact/preference/rule/lesson）使用，两者靠 `phase_hint` 区分，代码处已注明。
+- **测试**：TDD 先红后绿，`test_batch_judge_candidates` 新增 3 例（候选类型打标、定案类按定案问题核实且不改写定案、否决原因区分类型）。NAS 全量 **176 passed**。
+- **部署**：`f5ece15` 已上美西机，`CORTEX_BATCH_JUDGE` 保持 off。
+- **未完成**：P1-4 confidence 0.9 线大样本定线（美西侧准备样本中）；P2-5 插件同步，验收条件含插件写入的 candidate 必须带 `category ∈ {fact, decision}`（`/v1/scratchpad/log` 加可选字段，不改 schema）。
+
 ### 修复：批量判研切批空批 IndexError 与整步异常隔离（PR #57，Issue #56 PR 1 / P0-1 + P0-2）
 - **现象（P0-1）**：`BatchJudgeRunner._slice()` 的 `current_session` 初值为 `None`，首行 `session_id IS NULL` 时 `None != None` 为假、`or` 不短路，对空列表求 `batches[-1]` 抛 `IndexError`。`fetch_pending_judgement()` 按 `ORDER BY session_id, id` 排序，SQLite 升序把 NULL 排最前，只要待判集合里出现一行 NULL 会话就必然命中。
 - **现象（P0-2）**：`_batch_judge_step()` 无异常保护，`run()` 内只有 `_judge_batch` 有 try，切批与记账抛错会一路冒出 `run_consolidation()`——**整晚慢波全灭，折叠也不做**。

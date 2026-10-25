@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-25（同步至 PR #57 / Issue #56 PR 1：批量判研切批空批防护与整步异常隔离；此前 2026-10-24 同步至 PR #54 / Issue #44 PR4：candidate 候选流与夜间批量判研状态机，含 PR #51 E 项沉淀通道、PR #49 门神熔断、PR #47/#48 红线 3 纠偏与 C 项验收勘误）  
+**最近同步**：2026-10-25（同步至 PR #59 / Issue #56 PR 2：candidate 核实按事实类/定案类分流；含 PR #57 / Issue #56 PR 1：批量判研切批空批防护与整步异常隔离；此前 2026-10-24 同步至 PR #54 / Issue #44 PR4：candidate 候选流与夜间批量判研状态机，含 PR #51 E 项沉淀通道、PR #49 门神熔断、PR #47/#48 红线 3 纠偏与 C 项验收勘误）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -75,6 +75,7 @@
 - **无锚点定案兜底（Phase 8）**：授权批准且不带 `proj:` 锚点的记录，依次归入同会话最近出现的实体、30 分钟内最近更新的 ACTIVE 实体，兜底为 `proj:general_decisions`，不再滞留热表。
 - **决策清洗**：定案文本去除半角 `:`、全角 `：` 与首尾空白。
 - **candidate 候选核实（Issue #44 PR4，红线 1）**：`phase_hint='candidate'` 的行（白天快速规则或夜间批量判产出——`noul>=0.8` 的事实类、或 `decision_approved` 但 `confidence<0.9` 的疑似计划）由 System 2 二次核实：通过则并入对应卡 `metadata.facts`（携带 noul 溯源），否决则归档清退并计入报告 `candidates.rejected`；全程不写 `decided_as` 边、不进墓碑、不改写 `current_decision`（**严禁参与定案冲突覆盖**）。召回侧以 `CANDIDATE_UNVERIFIED` 通道降权透出（见 §3.2）。无 System 2 时候选保留待下次并计入报告，不静默丢弃。
+  - **按来源类型分流核实（Issue #56 P1-3）**：批量判入流时在 `category` 列记录候选类型——弱信号定案（`decision_approved` 且 `confidence<0.9`）记 `decision`，高 noul 事实记 `fact`；历史 `category` 为 NULL 的候选按 `fact` 处理。事实类问「是否可固化的客观事实」；定案类问「是否一次正式定案、定的是哪件事、归属哪个实体」，返回 `is_decision / subject / entity`，避免真定案因「不是客观事实」被否决。核实通过的定案类条目以 `category=decision`（及 `subject`）并入 facts，红线 1 不变。否决条目在 `candidates.rejected[*].reject_reason` 区分「核实为非客观事实」与「核实为非正式定案」；`candidates.skipped` 仍表示「保留待下次核实」，不区分类型。插件侧（白天）写入的 candidate 目前不带类型，待 P2-5 经 `/v1/scratchpad/log` 可选 `category` 字段补齐。
 - **显式沉淀固化（Issue #25）**：`phase_hint="explicit_addition"` 的记录（由 `cortex_add` 写入）不走授权批准门，`_is_authoritative` 语义保持不变，另由 `_is_explicit_addition` 判定准入：
   - **归属**：只认文本里的 `proj:` 锚点（含别名解析）命中已有合法实体；命中不了一律落入 `proj:general_decisions`。不使用 `_recent_entity()` 回退，不新建陌生实体、图谱节点或共现边；
   - **无损合并**：同实体多条按 `(created_at, id)` 升序全部并入 `metadata.facts`（含来源 log id、`category`、`reason`），不做“后者胜出”；与 approval 同组时 approval 保持主结论，显式事实并列补充；只有显式事实时 `current_decision` 保持原值，新建的 `proj:general_decisions` 为空字符串（该列 NOT NULL）；
@@ -96,7 +97,7 @@
 | `agent_id` | TEXT | 写入方归属，由服务端凭据确定 |
 | `judge_status` / `retry_count` / `judge_source` | TEXT / INTEGER / TEXT | Issue #44 PR4 批量判研状态机，语义见 §2.1 |
 
-另有 `scratchpad_log.category`、`scratchpad_log.reason`，保存 `cortex_add` 的分类与原因。`graph_edges` 已存在的 `valid_at / invalid_at / expired_at` 保持原样，迁移自动跳过。
+另有 `scratchpad_log.category`、`scratchpad_log.reason`，保存 `cortex_add` 的分类与原因。`category` 同时被 candidate 行用来记录候选类型（`fact` / `decision`，Issue #56 P1-3），两种用法靠 `phase_hint`（`explicit_addition` vs `candidate`）区分，不会互相读到。`graph_edges` 已存在的 `valid_at / invalid_at / expired_at` 保持原样，迁移自动跳过。
 
 **时间格式约定**：所有时间戳统一为 `YYYY-MM-DD HH:MM:SS`（UTC），与 SQLite `CURRENT_TIMESTAMP` 兼容。带 `T` 的 ISO 格式会破坏视图中 `valid_at <= datetime('now')` 的字符串比较，禁止使用。
 
