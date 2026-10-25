@@ -59,6 +59,7 @@ class ScratchpadManager:
         noul_score: float = 0.0,
         idempotency_key: Optional[str] = None,
         agent_id: Optional[str] = None,
+        category: Optional[str] = None,
     ) -> int:
         if phase_hint == EXPLICIT_HINT:
             raise ValueError("phase_hint=explicit_addition 仅限 cortex_add 内部路径使用")
@@ -73,10 +74,11 @@ class ScratchpadManager:
             """
             INSERT INTO scratchpad_log
                 (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id,
-                 ingested_at, valid_at, judge_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ingested_at, valid_at, judge_status, category)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id, now, now, judge_status),
+            (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id, now, now,
+             judge_status, category),
         )
         self.conn.commit()
         return cur.lastrowid

@@ -18,7 +18,10 @@ from baize.core.living_state import LivingStateManager
 from baize.core.normalization import idempotency_key as make_idempotency_key
 from baize.core.normalization import normalize_content
 from baize.core.supersession import supersede
-from baize.core.scratchpad import EXPLICIT_HINT, ScratchpadManager, validate_timestamp
+from baize.core.scratchpad import (
+    CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT, EXPLICIT_HINT, ScratchpadManager,
+    validate_timestamp,
+)
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.core.seeds import seed_initial_assets
 from baize.intelligence.phase_detector import OpenAICompatClient, llm_settings_from_env
@@ -29,6 +32,7 @@ from baize.storage.db import init_db
 VERSION = "2.0.0-alpha"
 
 CATEGORIES = {"fact", "preference", "rule", "lesson"}
+CANDIDATE_CATEGORIES = {CANDIDATE_FACT, CANDIDATE_DECISION}
 MAX_CONTENT = 2000
 MAX_REASON = 500
 DEFAULT_AGENT = "default"
@@ -54,6 +58,7 @@ class ScratchpadLogIn(BaseModel):
     phase_hint: Optional[str] = None
     noul_score: float = 0.0
     idempotency_key: Optional[str] = None
+    category: Optional[str] = None
 
 
 class CortexAddIn(BaseModel):
@@ -195,6 +200,14 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         agent_id = authenticate(request)
         if body.phase_hint == EXPLICIT_HINT:
             raise HTTPException(status_code=422, detail="phase_hint=explicit_addition 仅限 /v1/cortex/add 内部使用")
+        # Issue #56 P2-5:此处 category 只承载 candidate 的来源类型,与 cortex_add 的分类同列,不放开其他组合
+        if body.category is not None and (
+            body.phase_hint != CANDIDATE_HINT or body.category not in CANDIDATE_CATEGORIES
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"category 仅限 phase_hint=candidate 时取 {sorted(CANDIDATE_CATEGORIES)} 之一",
+            )
         if body.idempotency_key:
             if not body.raw_text.strip():
                 raise HTTPException(status_code=422, detail="content 不能为空")
@@ -208,7 +221,7 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
             try:
                 log_id = app.state.scratchpad.append_log(
                     body.session_id, body.role, body.raw_text, body.phase_hint, body.noul_score,
-                    idempotency_key=body.idempotency_key, agent_id=agent_id,
+                    idempotency_key=body.idempotency_key, agent_id=agent_id, category=body.category,
                 )
             except sqlite3.IntegrityError:
                 app.state.conn.rollback()
