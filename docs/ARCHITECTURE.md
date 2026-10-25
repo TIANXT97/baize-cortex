@@ -5,7 +5,7 @@
 **审定人**：田总监 (TIAN)  
 **架构执笔**：夭夭 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
-**最近同步**：2026-10-24（同步至 PR #54 / Issue #44 PR4：candidate 候选流与夜间批量判研状态机；含 PR #51 E 项沉淀通道、PR #49 门神熔断、PR #47/#48 红线 3 纠偏与 C 项验收勘误）  
+**最近同步**：2026-10-25（同步至 PR #57 / Issue #56 PR 1：批量判研切批空批防护与整步异常隔离；此前 2026-10-24 同步至 PR #54 / Issue #44 PR4：candidate 候选流与夜间批量判研状态机，含 PR #51 E 项沉淀通道、PR #49 门神熔断、PR #47/#48 红线 3 纠偏与 C 项验收勘误）  
 
 > 每个功能 PR 合并后，本文档与 `README.md`、`docs/CHANGELOG.md` 需同步更新，并走 `docs/*` 分支 PR 合并，保证演进可追溯。
 
@@ -66,7 +66,7 @@
 ### 2.4 Layer 3: 慢波合成睡眠 (Dream Consolidation)
 - **机制**：离线批处理，由 `POST /v1/sleep/consolidate` 或 `python -m baize.core.consolidator` 触发。
 - **流程**：
-  0. 批量判研（Issue #44 PR4，`CORTEX_BATCH_JUDGE` 开启时）：`BatchJudgeRunner` 捞 `judge_status='pending'` 的 user 行，按会话切片 10 条/批（批不跨会话，缓解锚定效应）、每条裁 300 字符交 System 2 判相态，批次 ID/条数严格校验；approval/rejection 需 `confidence>=0.9`，高 noul 事实与弱信号计划进 candidate；单批失败重试上限 3 次后入 `failed` 终态，不阻塞折叠；
+  0. 批量判研（Issue #44 PR4，`CORTEX_BATCH_JUDGE` 开启时）：`BatchJudgeRunner` 捞 `judge_status='pending'` 的 user 行，按会话切片 10 条/批（批不跨会话，缓解锚定效应）、每条裁 300 字符交 System 2 判相态，批次 ID/条数严格校验；approval/rejection 需 `confidence>=0.9`，高 noul 事实与弱信号计划进 candidate；单批失败重试上限 3 次后入 `failed` 终态，不阻塞折叠；切批对 `session_id IS NULL` 的行同样成立（`ORDER BY session_id` 把 NULL 排最前，Issue #56 P0-1）。整步异常隔离（Issue #56 P0-2）：`run()` 抛出的任何异常都会先 `rollback` 未提交批次、记 WARNING（logger `baize.consolidator`），报告 `batch_judge` 返回 `{"status": "failed", "error": ...}`（截断 200 字符），后续折叠照常执行——增强项无权击杀主流程；
   1. 只读分析：扫描 `phase_hint` 非空的草稿，按实体分组，判定授权批准门；
   2. 先落盘：把将被折叠的记录写入唯一命名的 gzip 归档并 `fsync`；
   3. 单一短事务（`BEGIN IMMEDIATE`）：更新 `living_states`、写图谱节点与 `decided_as` 边、失效旧边，并只删除本次真正折叠的记录 ID；
