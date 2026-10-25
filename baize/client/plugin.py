@@ -10,6 +10,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from baize.client.outbox import Outbox
 from baize.client.recall import extract_memories
 from baize.core.normalization import idempotency_key, normalize_content
+from baize.core.scratchpad import CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT
+from baize.intelligence.batch_judge import APPROVAL_CONFIDENCE_GATE, CANDIDATE_NOUL_GATE
+from baize.intelligence.phase_detector import (
+    _APPROVAL_KEYWORDS, _REJECTION_KEYWORDS, PhaseDetector,
+)
 
 log = logging.getLogger("baize.cortex_plugin")
 
@@ -19,6 +24,8 @@ MAX_REASON = 500
 MIRROR_TARGETS = {"MEMORY.md", "USER.md"}
 MIRROR_ORIGIN = "hermes_builtin_mirror"
 QUEUED_MESSAGE = "已保存到本地队列，将自动同步，无需重试"
+# Issue #56 P2-5(#44 B 项止血):白天快速门直接引用 PhaseDetector 本地规则词表,不再另写一份
+GATE_KEYWORDS = _APPROVAL_KEYWORDS + _REJECTION_KEYWORDS
 
 Transport = Callable[[str, Dict[str, Any], Dict[str, str], float], Tuple[int, Dict[str, Any], Dict[str, str]]]
 
@@ -76,9 +83,12 @@ class CortexClient:
         transport: Optional[Transport] = None,
         timeout: float = 3.0,
         path: str = "/v1/cortex/add",
+        phase_detector: Optional[Any] = None,
     ):
         self._url = base_url.rstrip("/") + path
         self._recall_url = base_url.rstrip("/") + "/v1/recall"
+        self._log_url = base_url.rstrip("/") + "/v1/scratchpad/log"
+        self._detector = phase_detector or PhaseDetector.from_env()
         self._token = token
         self._session_id = session_id
         self._outbox = outbox
@@ -157,6 +167,49 @@ class CortexClient:
         )
         reason = f"config_change:{tool or 'unknown'}"[:MAX_REASON]
         return self._deliver(content, "rule", reason, None, "tool_config_change")
+
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", **_: Any) -> None:
+        """Hermes MemoryProvider 契约:每轮写 Layer 0,user 行经快速门打标,assistant 行恒不打标。失败只记日志。"""
+        session = session_id or self._session_id
+        if user_content:
+            hint, category, noul = self._classify(user_content)
+            self._log_turn(session, "user", user_content, hint, noul, category)
+        if assistant_content:
+            self._log_turn(session, "assistant", assistant_content, None, 0.0, None)
+
+    def _classify(self, text: str) -> Tuple[Optional[str], Optional[str], float]:
+        # 快速门未命中留 NULL:批量判开启时自动 pending 等夜间判,关闭时归第 5 层普通轮次
+        if not any(k in text for k in GATE_KEYWORDS):
+            return None, None, 0.0
+        try:
+            phase, noul, _, confidence = self._detector.detect_phase_rich(text)
+        except Exception:
+            log.exception("PhaseDetector 判定失败,本轮不打标")
+            return None, None, 0.0
+        if phase == "decision_approved":
+            if confidence >= APPROVAL_CONFIDENCE_GATE:
+                return "approval", None, noul
+            return CANDIDATE_HINT, CANDIDATE_DECISION, noul
+        if phase == "rejection":
+            return "rejection", None, noul
+        if noul >= CANDIDATE_NOUL_GATE:
+            return CANDIDATE_HINT, CANDIDATE_FACT, noul
+        return None, None, noul
+
+    def _log_turn(
+        self, session: str, role: str, text: str, hint: Optional[str], noul: float, category: Optional[str]
+    ) -> None:
+        body: Dict[str, Any] = {
+            "session_id": session, "role": role, "raw_text": text, "phase_hint": hint, "noul_score": noul,
+        }
+        if category:
+            body["category"] = category
+        try:
+            status, resp, _ = self._transport(self._log_url, body, self._headers(), self._timeout)
+            if not 200 <= status < 300:
+                log.warning("scratchpad 写入被拒(HTTP %s): %s", status, resp.get("detail"))
+        except Exception:
+            log.exception("scratchpad 写入失败,已忽略")
 
     def on_memory_write(
         self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None
