@@ -8,6 +8,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -22,6 +23,8 @@ from baize.core.scratchpad import (
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.intelligence.batch_judge import BatchJudgeRunner
 from baize.storage.db import init_db
+
+logger = logging.getLogger("baize.consolidator")
 
 _ENTITY_RE = re.compile(r"(proj:[\w\-]+)")
 _DECISION_RE = re.compile(r"(?:定案|改为|敲定)[::]?\s*(.+)")
@@ -162,7 +165,13 @@ class DreamConsolidator:
             return {"status": "disabled"}
         if self.llm_client is None:
             return {"status": "skipped_no_llm"}
-        return BatchJudgeRunner(self.conn, self.llm_client).run()
+        # Issue #56 P0-2:增强项失败不得拖垮夜间主折叠
+        try:
+            return BatchJudgeRunner(self.conn, self.llm_client).run()
+        except Exception as exc:
+            self.conn.rollback()
+            logger.warning("batch judge step failed: %s", exc)
+            return {"status": "failed", "error": str(exc)[:200]}
 
     def _merge_explicit(self, plans: List[Dict[str, Any]], logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         skipped: List[Dict[str, Any]] = []

@@ -63,7 +63,7 @@ class BatchJudgeRunner:
         batches: List[List[Dict[str, Any]]] = []
         current_session = None
         for row in rows:
-            if row["session_id"] != current_session or len(batches[-1]) >= self.batch_size:
+            if not batches or row["session_id"] != current_session or len(batches[-1]) >= self.batch_size:
                 batches.append([])
                 current_session = row["session_id"]
             batches[-1].append(row)
