@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 EXPLICIT_HINT = "explicit_addition"
 CANDIDATE_HINT = "candidate"
 # Issue #56 P1-3:candidate 行的 category 记来源类型;历史 NULL 按 fact 处理(与 PR #54 行为一致)
+# 与 cortex_add 写入的 category(fact/preference/rule/lesson)共用同列,二者靠 phase_hint 区分,勿混用
 CANDIDATE_FACT = "fact"
 CANDIDATE_DECISION = "decision"
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
