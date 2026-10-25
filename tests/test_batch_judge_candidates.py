@@ -254,6 +254,86 @@ def test_batch_judge_step_failure_does_not_block_consolidation():
             conn.close()
 
 
+def test_batch_judge_tags_candidate_kind():
+    # Issue #56 P1-3:candidate 入流时记下来源类型,夜间核实据此分流
+    with tempfile.TemporaryDirectory() as d:
+        conn, _ = _env(d)
+        try:
+            os.environ["CORTEX_BATCH_JUDGE"] = "on"
+            try:
+                sp = ScratchpadManager(conn)
+                weak_decision = sp.append_log("s", "user", "好,那就这样")
+                fact = sp.append_log("s", "user", "我的服务器IP是101.200.45.220")
+            finally:
+                del os.environ["CORTEX_BATCH_JUDGE"]
+            llm = _QueueLLM(["[" + ",".join([
+                _verdict(weak_decision, "decision_approved", 0.2, 0.85),
+                _verdict(fact, "exploration", 0.98, 0.5),
+            ]) + "]"])
+            BatchJudgeRunner(conn, llm).run()
+            kinds = dict(conn.execute(
+                "SELECT id, category FROM scratchpad_log WHERE phase_hint = 'candidate'"
+            ).fetchall())
+            assert kinds == {weak_decision: "decision", fact: "fact"}
+        finally:
+            conn.close()
+
+
+def test_decision_candidate_verified_with_decision_question():
+    # Issue #56 P1-3:弱信号定案按「是否正式定案」核实,不得被「是否客观事实」静默否决
+    with tempfile.TemporaryDirectory() as d:
+        llm = _QueueLLM([json.dumps(
+            {"is_decision": True, "subject": "按方案B执行", "entity": "proj:x"}, ensure_ascii=False
+        )])
+        conn, consolidator = _env(d, llm_client=llm)
+        try:
+            LivingStateManager(conn).update_decision("proj:x", "X卡", "现役定案")
+            sp = ScratchpadManager(conn)
+            row_id = sp.append_log("s", "user", "好,那就这样")
+            sp.mark_judged(row_id, "candidate", 0.2, "batch_judge", category="decision")
+            conn.commit()
+
+            report = consolidator.run_consolidation()
+            system_prompt = llm.calls[0][0]
+            assert "定案" in system_prompt and "客观事实" not in system_prompt
+            assert report["candidates"]["verified"] == 1 and report["candidates"]["rejected"] == []
+
+            state = LivingStateManager(conn).get_state("proj:x")
+            fact = state["metadata"]["facts"][0]
+            assert fact["text"] == "好,那就这样" and fact["category"] == "decision"
+            assert fact["subject"] == "按方案B执行"
+            # 红线1:核实通过也只进 facts,不改写定案、不写 decided_as 边
+            assert state["current_decision"] == "现役定案"
+            assert conn.execute(
+                "SELECT COUNT(*) FROM graph_edges WHERE rel_type = 'decided_as'"
+            ).fetchone()[0] == 0
+        finally:
+            conn.close()
+
+
+def test_candidate_reject_reasons_distinguish_kind():
+    with tempfile.TemporaryDirectory() as d:
+        llm = _QueueLLM([
+            json.dumps({"is_fact": False, "entity": ""}, ensure_ascii=False),
+            json.dumps({"is_decision": False, "subject": "", "entity": ""}, ensure_ascii=False),
+        ])
+        conn, consolidator = _env(d, llm_client=llm)
+        try:
+            sp = ScratchpadManager(conn)
+            fact = sp.append_log("s", "user", "我觉得服务器可能是两台")
+            sp.mark_judged(fact, "candidate", 0.9, "batch_judge", category="fact")
+            plan = sp.append_log("s", "user", "下周打算把机房迁到新加坡")
+            sp.mark_judged(plan, "candidate", 0.36, "batch_judge", category="decision")
+            conn.commit()
+
+            rejected = consolidator.run_consolidation()["candidates"]["rejected"]
+            reasons = {log["id"]: log["reject_reason"] for log in rejected}
+            assert reasons[fact] == "核实为非客观事实"
+            assert reasons[plan] == "核实为非正式定案"
+        finally:
+            conn.close()
+
+
 def test_candidate_recall_channel_is_lowest_authority_fallback():
     with tempfile.TemporaryDirectory() as d:
         conn, _ = _env(d)
@@ -329,6 +409,9 @@ if __name__ == "__main__":
     test_batch_judge_step_respects_switch()
     test_slice_tolerates_null_session_rows()
     test_batch_judge_step_failure_does_not_block_consolidation()
+    test_batch_judge_tags_candidate_kind()
+    test_decision_candidate_verified_with_decision_question()
+    test_candidate_reject_reasons_distinguish_kind()
     test_candidate_recall_channel_is_lowest_authority_fallback()
     test_purge_protects_pending_and_backfill_requires_window()
     print("✅ 批量判研与 candidate 候选流测试全部通过")

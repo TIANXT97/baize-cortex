@@ -8,6 +8,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 EXPLICIT_HINT = "explicit_addition"
 CANDIDATE_HINT = "candidate"
+# Issue #56 P1-3:candidate 行的 category 记来源类型;历史 NULL 按 fact 处理(与 PR #54 行为一致)
+CANDIDATE_FACT = "fact"
+CANDIDATE_DECISION = "decision"
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 _MAX_SEARCH_TOKENS = 16
 RECENT_TURN_MAX_CHARS = 400
@@ -184,15 +187,18 @@ class ScratchpadManager:
         ).fetchall()
         return [{"id": r[0], "session_id": r[1], "raw_text": r[2]} for r in rows]
 
-    def mark_judged(self, row_id: int, phase_hint: Optional[str], noul: float, source: str) -> None:
+    def mark_judged(
+        self, row_id: int, phase_hint: Optional[str], noul: float, source: str,
+        category: Optional[str] = None,
+    ) -> None:
         self.conn.execute(
             """
             UPDATE scratchpad_log
             SET judge_status = 'done', judge_source = ?, phase_hint = COALESCE(?, phase_hint),
-                noul_score = ?
+                noul_score = ?, category = COALESCE(?, category)
             WHERE id = ?
             """,
-            (source, phase_hint, noul, row_id),
+            (source, phase_hint, noul, category, row_id),
         )
 
     def mark_judge_retry(self, row_ids: List[int], max_retry: int) -> None:

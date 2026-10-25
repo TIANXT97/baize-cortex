@@ -7,7 +7,7 @@
 import json
 from typing import Any, Dict, List
 
-from baize.core.scratchpad import ScratchpadManager
+from baize.core.scratchpad import CANDIDATE_DECISION, CANDIDATE_FACT, ScratchpadManager
 from baize.intelligence.phase_detector import PHASE_CATEGORY
 
 BATCH_SIZE = 10
@@ -96,11 +96,12 @@ class BatchJudgeRunner:
                 hint = "approval" if phase == "decision_approved" else "rejection"
                 self.scratchpad.mark_judged(row["id"], hint, noul, "batch_judge")
                 report["approved" if phase == "decision_approved" else "rejected"] += 1
-            elif (
-                (phase in ("exploration", "chitchat") and noul >= CANDIDATE_NOUL_GATE)
-                or (phase == "decision_approved" and confidence < APPROVAL_CONFIDENCE_GATE)
-            ):
-                self.scratchpad.mark_judged(row["id"], "candidate", noul, "batch_judge")
+            elif phase == "decision_approved" and confidence < APPROVAL_CONFIDENCE_GATE:
+                # Issue #56 P1-3:弱信号定案标 decision,夜间按「是否正式定案」核实而非事实标准
+                self.scratchpad.mark_judged(row["id"], "candidate", noul, "batch_judge", CANDIDATE_DECISION)
+                report["candidates"] += 1
+            elif phase in ("exploration", "chitchat") and noul >= CANDIDATE_NOUL_GATE:
+                self.scratchpad.mark_judged(row["id"], "candidate", noul, "batch_judge", CANDIDATE_FACT)
                 report["candidates"] += 1
             else:
                 self.scratchpad.mark_judged(row["id"], None, noul, "batch_judge")
