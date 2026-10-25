@@ -18,7 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import (
-    CANDIDATE_HINT, EXPLICIT_HINT, ScratchpadManager, batch_judge_enabled,
+    CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT, EXPLICIT_HINT, ScratchpadManager,
+    batch_judge_enabled,
 )
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.intelligence.batch_judge import BatchJudgeRunner
@@ -47,6 +48,11 @@ _CANDIDATE_VERIFY_SYSTEM_PROMPT = (
     "你是记忆核实器。判断候选文本是否为可永久固化的客观事实"
     "(个人档案/硬件配置/网络拓扑/否定修正/长期偏好/明确的既成事实),"
     '疑似计划、猜测、观点一律否决。只输出 JSON:{"is_fact": true|false, "entity": "实体ID或空串"}。'
+)
+_CANDIDATE_DECISION_VERIFY_SYSTEM_PROMPT = (
+    "你是定案核实器。判断候选文本是否为一次正式定案(对某件事明确拍板、同意执行或敲定方案),"
+    "定的是哪件事、归属哪个实体;未来计划、犹豫、试探、单纯附和闲聊一律否决。"
+    '只输出 JSON:{"is_decision": true|false, "subject": "定的是哪件事或空串", "entity": "实体ID或空串"}。'
 )
 
 
@@ -215,13 +221,15 @@ class DreamConsolidator:
         for log in sorted(logs, key=lambda item: (item["created_at"], item["id"])):
             if log.get("expired_at"):
                 continue
+            kind = CANDIDATE_DECISION if log.get("category") == CANDIDATE_DECISION else CANDIDATE_FACT
             try:
-                verdict = self._verify_candidate(log["raw_text"], index)
+                verdict = self._verify_candidate(log["raw_text"], kind)
             except Exception:
                 report["skipped"].append({"id": log["id"], "reason": "核实调用失败,保留待下次"})
                 continue
-            if not verdict.get("is_fact"):
-                report["rejected"].append(log)
+            if not verdict["ok"]:
+                reason = "核实为非正式定案" if kind == CANDIDATE_DECISION else "核实为非客观事实"
+                report["rejected"].append({**log, "reject_reason": reason})
                 continue
             entity_id = self._resolve_verified_entity(verdict.get("entity"), log["raw_text"], index)
             plan = by_entity.get(entity_id)
@@ -233,25 +241,33 @@ class DreamConsolidator:
                 by_entity[entity_id] = plan
                 plans.append(plan)
             plan["logs"].append(log)
-            plan.setdefault("facts", []).append({
-                "id": log["id"], "text": log["raw_text"], "category": "fact",
+            fact = {
+                "id": log["id"], "text": log["raw_text"], "category": kind,
                 "reason": f"candidate:{log.get('reason') or 'verified'}",
                 "created_at": log["created_at"], "noul": log["noul_score"],
-            })
+            }
+            if verdict["subject"]:
+                fact["subject"] = verdict["subject"]
+            plan.setdefault("facts", []).append(fact)
             report["verified"] += 1
         return report
 
-    def _verify_candidate(self, text: str, index: Dict[str, str]) -> Dict[str, Any]:
+    def _verify_candidate(self, text: str, kind: str) -> Dict[str, Any]:
         catalog = "; ".join(
             f"{state['entity_id']}({','.join(state['metadata'].get('aliases', []))})"
             for state in self.living.list_active_states()
         )
+        is_decision = kind == CANDIDATE_DECISION
         raw = self.llm_client.chat(
-            _CANDIDATE_VERIFY_SYSTEM_PROMPT,
+            _CANDIDATE_DECISION_VERIFY_SYSTEM_PROMPT if is_decision else _CANDIDATE_VERIFY_SYSTEM_PROMPT,
             f"候选文本:{text}\n\n已知实体:{catalog or '无'}",
         )
         data = json.loads(raw)
-        return {"is_fact": bool(data.get("is_fact")), "entity": data.get("entity") or ""}
+        return {
+            "ok": bool(data.get("is_decision" if is_decision else "is_fact")),
+            "entity": data.get("entity") or "",
+            "subject": (data.get("subject") or "").strip() if is_decision else "",
+        }
 
     def _resolve_verified_entity(
         self, proposed: Any, text: str, index: Dict[str, str]
