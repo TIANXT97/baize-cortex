@@ -263,8 +263,11 @@ class DreamConsolidator:
             f"候选文本:{text}\n\n已知实体:{catalog or '无'}",
         )
         data = json.loads(raw)
+        key = "is_decision" if is_decision else "is_fact"
+        if not isinstance(data, dict) or type(data.get(key)) is not bool:
+            raise ValueError("candidate verification requires a JSON boolean")
         return {
-            "ok": bool(data.get("is_decision" if is_decision else "is_fact")),
+            "ok": data[key],
             "entity": data.get("entity") or "",
             "subject": (data.get("subject") or "").strip() if is_decision else "",
         }
