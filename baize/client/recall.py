@@ -44,32 +44,33 @@ def _provisional_items(rows: Any, kind: str = "fact") -> List[Dict[str, Any]]:
     ]
 
 
-def _entry_items(entry: Any) -> List[Dict[str, Any]]:
+def _entry_items(entry: Any, kind: str = "fact") -> List[Dict[str, Any]]:
     if not isinstance(entry, dict):
         return []
     if entry.get("provisional"):
         source = entry.get("source_log_id")
         if source is None or not entry.get("current_decision"):
             return []
-        return _provisional_items([{"id": source, "text": entry["current_decision"]}])
+        return _provisional_items([{"id": source, "text": entry["current_decision"]}], kind=kind)
     return _state_items(entry)
 
 
 def extract_memories(response: Any) -> List[Dict[str, Any]]:
     if not isinstance(response, dict):
         return []
+    provisional_kind = "candidate·未核实" if response.get("strategy") == "CANDIDATE_UNVERIFIED" else "fact"
     items: List[Dict[str, Any]] = []
     items += _state_items(response.get("state"))
     items += _state_items(response.get("resolved_state"))
     living_states = response.get("living_states")
     if isinstance(living_states, list):
         for entry in living_states:
-            items += _entry_items(entry)
+            items += _entry_items(entry, kind=provisional_kind)
     items += _provisional_items(response.get("provisional_facts"))
     # Issue #44 PR4 硬要求:candidate 候选注入必须显式标注「未核实」,防止被当定案引用
     items += _provisional_items(
         response.get("facts"),
-        kind="candidate·未核实" if response.get("strategy") == "CANDIDATE_UNVERIFIED" else "fact",
+        kind=provisional_kind,
     )
 
     seen = set()

@@ -5,6 +5,7 @@
 (noul 与「是否定案」反相关,不能当门槛——美西实测真定案 noul 0.004~0.128)。
 """
 import json
+import math
 from typing import Any, Dict, List
 
 from baize.core.scratchpad import CANDIDATE_DECISION, CANDIDATE_FACT, ScratchpadManager
@@ -80,10 +81,16 @@ class BatchJudgeRunner:
         expected_ids = {row["id"] for row in batch}
         by_id: Dict[int, Dict[str, Any]] = {}
         for verdict in verdicts:
-            if not isinstance(verdict, dict) or verdict.get("id") not in expected_ids:
+            if not isinstance(verdict, dict) or type(verdict.get("id")) is not int:
+                raise ValueError("批次返回 ID 必须是整数")
+            if verdict["id"] not in expected_ids or verdict["id"] in by_id:
                 raise ValueError("批次返回 ID 与输入不一致")
             if verdict.get("phase") not in PHASE_CATEGORY:
                 raise ValueError(f"未知 phase: {verdict.get('phase')}")
+            for field in ("noul", "confidence"):
+                value = verdict.get(field)
+                if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+                    raise ValueError(f"{field} 必须是 0~1 的有限数值")
             by_id[verdict["id"]] = verdict
         return [by_id[row["id"]] for row in batch]
 
