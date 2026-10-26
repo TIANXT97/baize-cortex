@@ -2,6 +2,13 @@
 
 按合并时间倒序记录。每个功能 PR 合并后，补一个 `docs/*` 分支同步本文件、`README.md` 与 `docs/ARCHITECTURE.md`，同样走 PR 合并。
 
+### Issue #64 PR 1：只读批量判研评测与候选契约防护（PR #65，Refs #64）
+- 修复 candidate 核实中布尔值校验漏洞，严格要求 JSON boolean，拒绝字符串 "false" / "true" 伪真值提升。
+- 修复完整召回响应去重后丢「未核实」标签问题，守住 candidate·未核实 召回提示。
+- 批量判研在整批写入前严格校验 noul 与 confidence 为 0~1 有限数值，非法响应进入重试并转 failed 终态，防半批脏写入；批次 ID 严格限定唯一整数。
+- 新增标准库只读评测引擎 `baize.intelligence.judge_eval`（export/run/rescore），固定随机种子与双重 SHA-256 样本防篡改校验，离线重算不调模型、不改数据库。
+- 生产环境开关保持 `CORTEX_BATCH_JUDGE=off`，待 NAS 侧人工黄金集复核完成后定线。
+
 ## 2026-10-25
 
 ### 修复：candidate 核实按事实类/定案类分流（PR #59，Issue #56 PR 2 / P1-3）

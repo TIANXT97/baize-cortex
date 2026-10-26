@@ -146,7 +146,8 @@ baize-cortex/
 - [x] **Phase 8: 慢波合成收口** —— 全角冒号清洗、无锚点定案兜底、黑户展示名转正,新增 `backfill-display-names` 与 `purge-scratchpad` 管理接口
 - [x] **Phase A: 记忆外溢通道与可靠投递** —— Schema 增量迁移、`POST /v1/cortex/add` 幂等写入、Outbox 投递、memory 镜像钩子与错误签名熔断
 - [x] **Issue #44: 相态判研去关键词化** —— candidate 候选流（高 noul 事实/疑似计划经 System 2 核实后固化,严禁改写定案）、judge_status 批量判研状态机（会话切片/ID 校验/重试上限/failed 终态,`CORTEX_BATCH_JUDGE` 默认 off）、门神 401 鉴权熔断、配置改动事后沉淀通道与召回门槛红线纠偏
-- [ ] **Issue #56: 批量判研二审排险** —— 已完成 PR 1（切批空批防护、批量判步骤异常隔离不再击杀慢波折叠）与 PR 2（candidate 核实按事实类/定案类分流）；待办 confidence 线大样本定线与插件侧同步（含 candidate 带类型），完成前 `CORTEX_BATCH_JUDGE` 保持 off
+- [x] **Issue #56: 批量判研二审排险** —— PR 1（切批空批防护、步骤异常隔离）、PR 2（candidate 事实/定案分流）、PR 3（插件 candidate 透传与标准词表绑定、薄壳委托）全量闭环
+- [ ] **Issue #64: System 2 批量判研准召定线与慢波 candidate 闭环** —— 已完成 PR #65（只读评测引擎 judge_eval、布尔校验/标签保留契约硬化）；待完成 NAS 侧人工黄金集复核、准召定线与受控启用
 - [ ] **后续: 全量生产平滑割接** —— 现役存量数据提纯与全场景持续演化(原路线图中的 Phase 6 编号已被别名提纯占用,此项改为不编号待排期)
 
 ---
