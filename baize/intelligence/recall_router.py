@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from functools import lru_cache
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,6 +34,35 @@ _RECENT_TURN_STOPWORDS = frozenset({
 # 只有 2-gram 碎片撑不起一次召回:至少一个 >= 3 字的实义词,否则整层不触发。
 _RECENT_TURN_MIN_CONTENT_LEN = 3
 
+# Issue #93:文本兜底(DECISION_TEXT_MATCH)的准入与打分。
+# 通用词:任何一句话里都会出现的代词、连接词、助动词和高频虚化名词。命中它们不说明「问的是这张卡」,
+# 不计入准入证据。这是一张通用的语言功能词表,与具体卡片、具体题目无关。
+_GENERIC_TERMS = frozenset(_RECENT_TURN_STOPWORDS | {
+    "这些", "那些", "这里", "那里", "这么", "那么", "这种", "那种", "我们", "你们", "他们", "它们", "自己", "大家", "别人",
+    "但是", "而且", "所以", "因为", "如果", "虽然", "然后", "或者", "以及", "并且", "还是", "只是", "不过", "另外", "同时",
+    "否则", "既然", "即使", "除了", "要是", "其实", "当然",
+    "已经", "一直", "可能", "应该", "需要", "能够", "不能", "不会", "不要", "不用", "没有", "不是", "还有", "比较", "非常",
+    "真的", "一下", "一些", "一个", "一样", "一起", "有点", "有些", "再次", "马上", "刚才", "刚刚", "还要",
+    "现在", "目前", "当前", "之前", "之后", "以后", "以前", "最近", "今天", "昨天", "明天", "时候",
+    "知道", "觉得", "看看", "看到", "想要", "希望", "开始", "进行", "使用", "通过", "关于", "对于", "出现", "发现", "变成",
+    "成为", "起来", "出来", "过来", "下去", "上去",
+    "问题", "东西", "事情", "情况", "地方", "方面", "部分", "结果", "原因", "办法", "方式", "方法", "意思", "感觉", "样子",
+    "什么", "怎么", "为什么", "多少", "哪个", "哪里", "是否", "是不是", "有没有", "能不能", "会不会", "可不可以",
+})
+_GENERIC_ENGLISH = frozenset({
+    "the", "is", "to", "of", "and", "in", "it", "this", "that", "you", "are", "for", "with", "can", "not", "ok", "yes", "no",
+    "do", "be", "on", "at", "as", "an", "or", "if", "so", "we", "my", "me", "he", "she", "they", "was", "were", "has", "have",
+})
+_GENERIC_BY_LENGTH = sorted(_GENERIC_TERMS, key=len, reverse=True)
+_CJK_ONLY_RE = re.compile(r"[一-鿿]+")
+# 卡片自己的 facts 里:一个词出现在超过这个比例的条目里,说明它在这张卡内部没有区分度
+_FACT_COMMON_RATIO = 0.4
+_FACT_COMMON_MIN_FACTS = 5
+# facts 只在「同一条 fact」内累计证据:3 字以上的整词按 2 分、2-gram 按 1 分;命名卡要 2 分,无名无现行决策的卡要 3 分
+_FACT_MIN_WEIGHT = 2
+_FACT_MIN_WEIGHT_UNLABELED = 3
+_FACT_SCORE_CAP = 4
+
 Scored = Tuple[Dict[str, Any], Optional[float]]
 
 
@@ -56,6 +86,65 @@ def _scoring_tokens(text: str) -> List[str]:
                 out.setdefault(run[i:i + 2], None)
     return list(out)
 
+
+@lru_cache(maxsize=8192)
+def _is_generic_token(token: str) -> bool:
+    """整个词是通用词,或由通用词拼成(如「这个问题」)。"""
+    t = token.lower()
+    if t in _GENERIC_TERMS or t in _GENERIC_ENGLISH:
+        return True
+    if len(t) < 3 or not _CJK_ONLY_RE.fullmatch(t):
+        return False
+    rest = t
+    for term in _GENERIC_BY_LENGTH:
+        rest = rest.replace(term, "")
+        if not rest:
+            return True
+    return False
+
+def _disjoint_grams(words: set, allowed: set, text: Optional[str] = None) -> int:
+    """查询里命中的 2-gram 按「不重叠的片段」计数。
+
+    相邻的 2-gram 共用一个字(如「需要重启」切出的「要重」「重启」),来自同一处文字,只算一份证据。
+    allowed 限定可计入的 2-gram;text 不为空时还要求该 2-gram 出现在 text 里。
+    """
+    count = 0
+    for word in words:
+        for run in _CJK_RUN_RE.findall(word):
+            i = 0
+            while i < len(run) - 1:
+                gram = run[i:i + 2]
+                if gram in allowed and gram not in words and (text is None or gram.lower() in text):
+                    count += 1
+                    i += 2
+                else:
+                    i += 1
+    return count
+
+def _fact_evidence(facts: List[str], tokens: List[str], words: set) -> int:
+    """facts 里「单条 fact」能给出的最高证据分。
+
+    Issue #93:此前把全部 facts 拼成一个大文本再数命中,事实越多的卡越容易靠零散碎片被放行。
+    现在只看单条 fact 内的非通用词命中,并丢掉在这张卡自己的 facts 里过于普遍的词。
+    """
+    if not facts:
+        return 0
+    usable = [t for t in tokens if not _is_generic_token(t)]
+    if not usable:
+        return 0
+    texts = [f.lower() for f in facts]
+    if len(texts) >= _FACT_COMMON_MIN_FACTS:
+        usable = [t for t in usable if sum(1 for x in texts if t.lower() in x) <= _FACT_COMMON_RATIO * len(texts)]
+    keep = set(usable)
+    best = 0
+    for text in texts:
+        weight = 0
+        for t in usable:
+            if t in words and t.lower() in text:
+                weight += 2 if len(t) >= 3 else 1
+        weight += _disjoint_grams(words, keep, text)
+        best = max(best, weight)
+    return best
 
 def _decay(updated_at: Optional[str], now: datetime) -> float:
     try:
@@ -346,23 +435,34 @@ class CognitiveRecallRouter:
     ) -> Tuple[float, bool]:
         metadata = state["metadata"]
         aliases = [a for a in metadata.get("aliases", []) if isinstance(a, str)]
-        facts = [f.get("text", "") for f in metadata.get("facts", []) if isinstance(f, dict)]
+        raw_facts = metadata.get("facts")
+        facts = [f["text"] for f in raw_facts if isinstance(f, dict) and f.get("text")] if isinstance(raw_facts, list) else []
+        display = (state["display_name"] or "").strip()
+        # 黑户:展示名就是 id。它的「名字」不是语言,不能拿来当文本兜底的准入依据
+        unlabeled = not display or display.lower() == str(state["entity_id"]).lower()
         name = (state["display_name"] or "").lower()
         alias_text = "\n".join(aliases).lower()
-        body = "\n".join([state["current_decision"] or "", *facts]).lower()
-        haystack = "\n".join([name, alias_text, body])
+        decision_text = (state["current_decision"] or "").lower()
+        haystack = "\n".join([name, alias_text, decision_text])
 
         hits = [t for t in tokens if t.lower() in haystack]
         score = (
             3 * any(t.lower() in name for t in tokens)
             + 2 * any(t.lower() in alias_text for t in tokens)
-            + 1 * any(t.lower() in body for t in tokens)
+            + 1 * any(t.lower() in decision_text for t in tokens)
             + 2 * len(hits)
             + _decay(state["updated_at"], now)
         )
-        gram_hits = [t for t in hits if t not in words]
+        # 准入一:名字(无名卡除外)/别名/现行决策里,有非通用的整词命中,或至少两个不同的非通用 2-gram 命中
         # Issue #44 CTO 红线:单 2-gram 命中卡名/别名严禁放行(「记忆」⊂「白泽记忆」会被闲聊捞出),全词命中走 LIVING_STATE_DIRECT
-        qualifies = any(t in words for t in hits) or len(gram_hits) >= 2
+        identity = "\n".join(([] if unlabeled else [name]) + [alias_text, decision_text])
+        strong = [t for t in tokens if t.lower() in identity and not _is_generic_token(t)]
+        qualifies = any(t in words for t in strong) or _disjoint_grams(words, {t for t in strong if t not in words}) >= 2
+        # 准入二(Issue #93):facts 只能靠单条 fact 内足够多的非通用命中放行,且只给封顶的加分,大卡不能靠体量取胜
+        evidence = _fact_evidence(facts, tokens, words)
+        if evidence >= (_FACT_MIN_WEIGHT_UNLABELED if unlabeled else _FACT_MIN_WEIGHT):
+            qualifies = True
+            score += min(evidence, _FACT_SCORE_CAP)
         return float(score), qualifies
 
     def _explicit_fallback(self, query: str, top_k: int) -> Optional[Dict[str, Any]]:
