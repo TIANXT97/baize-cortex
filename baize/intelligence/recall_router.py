@@ -125,28 +125,40 @@ class CognitiveRecallRouter:
         visible = [group_view(s) for s in active if is_group_visible(s)]
         private = [s for s in active if not is_group_visible(s)]
 
+        by_id = {s["entity_id"]: s for s in visible}
+        traced_private: List[str] = []
+        ranked: List[Scored] = []
         direct = self._match_living_states(query, visible)
         if direct:
             ranked = self._rank(direct, tokens, words, now)[:top_k]
             result = {"strategy": "LIVING_STATE_DIRECT", "confidence": 1.0, "state": ranked[0][0], "nodes": []}
         else:
-            ranked = []
             seeds = self._match_seed_nodes(query)
             if seeds:
                 energy = self.ppr.run_ppr(self.graph.get_active_subgraph(), seeds)
                 order = [node for node, score in energy.items() if score > 0][:top_k]
-                by_id = {s["entity_id"]: s for s in visible}
                 ranked = [(by_id[node], None) for node in order if node in by_id][:1]
             if ranked:
                 result = {"strategy": "PPR_SPREADING", "resolved_state": ranked[0][0]}
             else:
-                ranked = self._rank(visible, tokens, words, now, require_match=True)[:top_k]
-                if ranked:
-                    result = {"strategy": "DECISION_TEXT_MATCH", "confidence": 0.6, "state": ranked[0][0], "nodes": []}
+                traced = self._plan_trace(seeds) if seeds else []
+                # Issue #84:方案节点追溯到的卡同样只放行 group_ok;私人卡只记 id,不返回任何内容
+                traced_private = [state["entity_id"] for state, _ in traced if state["entity_id"] not in by_id]
+                shown = [(by_id[state["entity_id"]], only_old) for state, only_old in traced if state["entity_id"] in by_id]
+                if shown:
+                    ranked = [(card, None) for card, _ in shown][:top_k]
+                    result = {
+                        "strategy": "PLAN_NODE_TRACE", "confidence": 0.8, "state": ranked[0][0],
+                        "superseded_plan_matched": any(only_old for _, only_old in shown), "nodes": [],
+                    }
                 else:
-                    result = {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
+                    ranked = self._rank(visible, tokens, words, now, require_match=True)[:top_k]
+                    if ranked:
+                        result = {"strategy": "DECISION_TEXT_MATCH", "confidence": 0.6, "state": ranked[0][0], "nodes": []}
+                    else:
+                        result = {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
 
-        withheld = self._withheld_ids(query, private, tokens, words, now)
+        withheld = sorted(set(self._withheld_ids(query, private, tokens, words, now)) | set(traced_private))
         if withheld:
             log.warning("recall scope=group: 私人卡命中但未注入 count=%d entity_ids=%s", len(withheld), withheld)
         result["scope"] = SCOPE_GROUP
@@ -174,39 +186,102 @@ class CognitiveRecallRouter:
             return self._finish(result, ranked, [])
 
         seeds = self._match_seed_nodes(query)
-        if not seeds:
-            ranked = self._rank(self.living.list_active_states(), tokens, words, now, require_match=True)[:top_k]
-            if ranked:
-                result = {"strategy": "DECISION_TEXT_MATCH", "confidence": 0.6, "state": ranked[0][0], "nodes": []}
-                fallback = self._explicit_fallback(query, top_k)
-                rows = fallback["facts"] if fallback else []
-                if rows:
-                    result["provisional_facts"] = rows
-                    result["source_log_ids"] = [r["id"] for r in rows]
-                return self._finish(result, ranked, rows)
-            provisional = self._explicit_fallback(query, top_k)
-            if provisional is not None:
-                return self._finish(provisional, [], provisional["facts"])
-            # Issue #44 PR4 红线1:candidate 候选降权召回(0.45),排在 explicit 之后、普通轮次之前
-            candidate = self._candidate_fallback(query, top_k)
-            if candidate is not None:
-                return self._finish(candidate, [], candidate["facts"])
-            recent = self._recent_turns_fallback(query, top_k, agent_id)
-            if recent is not None:
-                return self._finish(recent, [], recent["facts"])
-            result = {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
-            return self._finish(result, [], [])
+        if seeds:
+            energy = self.ppr.run_ppr(self.graph.get_active_subgraph(), seeds)
+            ranking = [{"node_id": node, "energy": score} for node, score in energy.items() if score > 0][:top_k]
+            resolved = self._resolve_first_active_state(ranking)
+            if resolved is not None:
+                result = {
+                    "strategy": "PPR_SPREADING",
+                    "seed_nodes": seeds,
+                    "ranking": ranking,
+                    "resolved_state": resolved,
+                }
+                return self._finish(result, [(resolved, None)], [])
+            # Issue #84:种子是方案节点(含已被取代的旧方案)时 PPR 解析不出现役卡,
+            # 顺着 decided_as 边找到所属的现役卡;仍然什么都没有就继续走后面的兜底层,不能在这里返回空
+            traced = self._plan_trace(seeds)
+            if traced:
+                return self._plan_trace_result(query, top_k, seeds, traced, tokens, words, now)
+        return self._fallback_chain(query, top_k, agent_id, tokens, words, now)
 
-        energy = self.ppr.run_ppr(self.graph.get_active_subgraph(), seeds)
-        ranking = [{"node_id": node, "energy": score} for node, score in energy.items() if score > 0][:top_k]
-        resolved = self._resolve_first_active_state(ranking)
+    def _fallback_chain(
+        self, query: str, top_k: int, agent_id: Optional[str], tokens: List[str], words: set, now: datetime
+    ) -> Dict[str, Any]:
+        ranked = self._rank(self.living.list_active_states(), tokens, words, now, require_match=True)[:top_k]
+        if ranked:
+            result = {"strategy": "DECISION_TEXT_MATCH", "confidence": 0.6, "state": ranked[0][0], "nodes": []}
+            fallback = self._explicit_fallback(query, top_k)
+            rows = fallback["facts"] if fallback else []
+            if rows:
+                result["provisional_facts"] = rows
+                result["source_log_ids"] = [r["id"] for r in rows]
+            return self._finish(result, ranked, rows)
+        provisional = self._explicit_fallback(query, top_k)
+        if provisional is not None:
+            return self._finish(provisional, [], provisional["facts"])
+        # Issue #44 PR4 红线1:candidate 候选降权召回(0.45),排在 explicit 之后、普通轮次之前
+        candidate = self._candidate_fallback(query, top_k)
+        if candidate is not None:
+            return self._finish(candidate, [], candidate["facts"])
+        recent = self._recent_turns_fallback(query, top_k, agent_id)
+        if recent is not None:
+            return self._finish(recent, [], recent["facts"])
+        result = {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
+        return self._finish(result, [], [])
+
+    def _plan_trace(self, seeds: Dict[str, float]) -> List[Tuple[Dict[str, Any], bool]]:
+        """Issue #84:从命中的方案节点顺着 decided_as 边(含已失效的)找所属的现役卡。
+
+        返回 [(卡片, 是否只命中了已被取代的旧方案)];只要有一条现役边指向命中的方案节点就不算旧方案。
+        只认 decided_as,且只返回 ACTIVE 的卡;作废节点自己的内容永远不当现行结论返回。
+        """
+        placeholders = ",".join("?" * len(seeds))
+        rows = self.conn.execute(
+            f"SELECT src_id, invalid_at FROM graph_edges WHERE rel_type = 'decided_as' "
+            f"AND dst_id IN ({placeholders}) ORDER BY edge_id",
+            list(seeds),
+        ).fetchall()
+        superseded: Dict[str, bool] = {}
+        for src_id, invalid_at in rows:
+            superseded[src_id] = superseded.get(src_id, True) and invalid_at is not None
+        traced: List[Tuple[Dict[str, Any], bool]] = []
+        for entity_id, only_old in superseded.items():
+            state = self.living.get_state(entity_id)
+            if state is not None and state["status"] == "ACTIVE":
+                traced.append((state, only_old))
+        return traced
+
+    def _plan_trace_result(
+        self,
+        query: str,
+        top_k: int,
+        seeds: Dict[str, float],
+        traced: List[Tuple[Dict[str, Any], bool]],
+        tokens: List[str],
+        words: set,
+        now: datetime,
+    ) -> Dict[str, Any]:
+        cards: List[Scored] = [(state, None) for state, _ in traced][:top_k]
+        have = {state["entity_id"] for state, _ in cards}
+        extra = [
+            item for item in self._rank(self.living.list_active_states(), tokens, words, now, require_match=True)
+            if item[0]["entity_id"] not in have
+        ][: max(0, top_k - len(cards))]
         result = {
-            "strategy": "PPR_SPREADING",
+            "strategy": "PLAN_NODE_TRACE",
+            "confidence": 0.8,
+            "state": cards[0][0],
             "seed_nodes": seeds,
-            "ranking": ranking,
-            "resolved_state": resolved,
+            "superseded_plan_matched": any(only_old for _, only_old in traced),
+            "nodes": [],
         }
-        return self._finish(result, [(resolved, None)] if resolved else [], [])
+        fallback = self._explicit_fallback(query, top_k)
+        rows = fallback["facts"] if fallback else []
+        if rows:
+            result["provisional_facts"] = rows
+            result["source_log_ids"] = [r["id"] for r in rows]
+        return self._finish(result, cards + extra, rows)
 
     def _finish(
         self, result: Dict[str, Any], scored: List[Scored], provisional_rows: List[Dict[str, Any]]
