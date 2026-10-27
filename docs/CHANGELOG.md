@@ -4,6 +4,42 @@
 
 ## 2026-10-27
 
+### 文档：同步 #85 #86 #88 的变更日志、README 与架构说明（Closes #89）
+- **背景**：#85、#86、#88 合并并上线后，变更日志、README 和架构说明还没有跟上，只能靠读代码才知道新增了哪些开关、字段和行为。
+- **做法**：只改文档。CHANGELOG 补下面三条，每条链上对应的 PR 与 issue；README 补路线图、目录骨架、整理的忙响应与 `skipped_changed`、测试文件数量；ARCHITECTURE 补 §2.4 整理三段式与互斥、§3.2 方案节点追溯、§6.2 环境变量表、§8.1 接口表、§8.2 MCP 说明与 §9 验证套件。
+- **核对**：每个开关名、字段名、默认值、取值都逐个对照了代码；测试文件数与鉴权覆盖项数以仓库当前内容为准（36 个测试文件、鉴权覆盖 17 项）。
+- **顺带**：§8.1 接口表里 `/v1/sleep/consolidate` 的说明仍写着 `dry_run` 只返回空报告，已改为实际行为；表里补上已存在的卡片历史查询与回滚两个接口。
+- **未覆盖**：#78（墓碑、卡片历史与回滚）本身在 CHANGELOG 与架构说明里还没有专门条目，本次没有补。
+
+### 修复：带已作废方案原话的问题顺着方案节点追溯现役卡，图检索无结果时继续走兜底层（PR #86，Closes #84）
+- **现象**：问题里带方案原话（旧方案或现行方案）时，召回返回空结果。夜间整理为每个定案建一个方案节点（标签就是定案文本）并给卡片连一条 `decided_as` 边，旧方案被取代后这条边失效；召回用节点标签选 PPR 种子，会命中方案节点，但方案节点不是活体卡，PPR 又只在现役子图上跑，`resolved_state` 为空；PPR 分支无论是否解析出卡片都直接返回，后面的显式事实、candidate、最近对话兜底全部被挡掉。
+- **做法**：PPR 解析出现役卡时行为不变。解析不出时，`_plan_trace` 顺着 `decided_as` 边（含已失效的）从方案节点找到所属的现役卡，返回 `strategy: PLAN_NODE_TRACE`、置信度 0.8、卡片的现行定案；`superseded_plan_matched` 为 `true` 表示有卡只能通过已失效的边追溯到，即问题里命中的是已被取代的旧方案。同时合并按文本命中的其它卡与未固化的显式事实。只认 `decided_as` 关系，只返回 `ACTIVE` 的卡，作废节点自己的内容从不当作现行结论返回。追溯不到任何卡时不再直接返回，继续走抽成 `_fallback_chain` 的原有兜底链：文本命中、显式事实、candidate、最近对话、`NO_MATCH`，顺序与内容不变。
+- **群聊视图**：沿用 #72 的闸。追溯到的卡只有 `group_ok` 才返回（白名单字段，不带显式事实与 `seed_nodes`）；追溯到私人卡只把 `entity_id` 记入 `withheld_entity_ids` 并写 WARNING 日志，不返回任何内容；一张可见卡都追溯不到时，按群聊视图原有的文本命中规则继续。
+- **开关**：无新开关。
+- **测试**：新增 `test_issue84_plan_node_trace`（6 例，假数据）：旧方案原话追溯到现行方案并带出未固化事实；现行方案原话同样追溯到所属卡；图检索解析不出时继续走兜底层（显式事实或 `NO_MATCH`）；直达与 PPR 命中不受影响；群聊请求不返回私人卡，标成群可见后可追溯但不带 facts 与草稿；只认 `decided_as` 与现役卡。生产库只读副本上用 24 条查询对比：完全空结果由 8 条降到 0 条，现行方案的 3 条查询由全空变为全部追溯到所属卡；群聊视图下返回的非群可见卡与草稿类条目修前修后都是 0。
+- **部署**：只改服务端，合并后重启服务端即可；不改 schema、不动数据。线上插件不需要改：`baize/client/recall.py` 只对 `CANDIDATE_UNVERIFIED` 按策略名分支，新策略名不受影响，新结果仍带 `state`、`living_states` 等字段。
+- **未覆盖**：没有所属卡的孤立方案节点不返回任何内容，直接走兜底链；追溯只看 `decided_as`，不沿其它关系类型扩散。
+
+### 修复：夜间整理调模型挪出全局锁，并加整理专用互斥（PR #88，Closes #87）
+- **现象**：`POST /v1/sleep/consolidate` 整段持有服务的全局锁，期间每次调用 System 2（批量判研每批、定案提取每组、candidate 核实每条）都挡住召回和写入；也没有整理专用的互斥，重复触发会重复整理。
+- **做法**：整理改成三段。阶段一在锁内取内存快照：待处理的草稿行、现役卡、最近 30 分钟更新的实体，以及每张卡的指纹 `(version, updated_at, current_decision)`。阶段二在锁外只读快照做分析并调模型，不再碰共享的数据库连接。阶段三在锁内开写事务（`BEGIN IMMEDIATE`）后先复查：来源草稿行必须仍在、未过期、`phase_hint` 未变，目标卡的指纹必须与快照一致；不满足就整组跳过、草稿行留到下次（没有选择“重新合并”，因为那要再调一次模型，结果仍基于旧判断，跳过不会覆盖刚被改过的内容，代价是最多晚一次固化）。通过复查的部分才写冷归档、更新卡片、删除草稿行。批量判研同样：每批先锁内读待判行，锁外调模型，锁内只对仍是 `judge_status='pending'`、`phase_hint` 仍为空且未过期的行写回。`/v1/sleep/consolidate` 端点不再 `with lock`，改为把全局锁传给 `run_consolidation(..., lock=lock)`；命令行与 MCP 使用各自独立的连接，不传锁。
+- **整理互斥**：真实整理走进程内的非阻塞互斥（`DreamConsolidator` 实例上的 `threading.Lock`），拿不到就立即返回 HTTP 200 的 JSON：`status: "busy"`、`message`、`archived_logs: 0`、`updated_states: []`、`archive_file: null`、`skipped_explicit: []`、`batch_judge: {"status": "busy"}`、`candidates: {"verified": 0, "rejected": [], "skipped": []}`，不排队、不重复整理。`dry_run` 不占用互斥（只读预览，不能挡住夜间任务）。
+- **返回值**：新增的字段只有两个，`skipped_changed`（`list[object]`，仅在非空时出现，真实整理与 `dry_run` 都可能有；每项是 `{"entity_id": string, "reason": "card_changed" 或 "source_rows_changed"}`，表示该实体这一组复查未通过被整组跳过）和 `message`（`string`，仅在 `status` 为 `busy` 时出现）；`status` 多了一个取值 `busy`。原有字段（`status`、`archived_logs`、`updated_states`、`archive_file`、`skipped_explicit`、`batch_judge`、`candidates`，以及 `dry_run` 下的 `dry_run`、`would_archive_logs`、`would_update_states`、`changes`）的名称、类型和含义不变。
+- **dry_run**：仍走三段式，阶段三在写事务里执行真实回写后整体回滚，不写库、不写冷归档、不跑批量判研；阶段二仍会调用 System 2 做分析，所以会产生模型调用。
+- **开关**：无新开关。
+- **测试**：新增 `test_issue87_consolidate_out_of_lock`（7 例，用假的慢 System 2）：整理进行中并发召回很快返回且不为空；并发写入不丢、不被这次整理误归档，迟到的行下次整理处理；整理期间卡片被改时不覆盖新内容、报告含 `skipped_changed`；两次整理同时触发只跑一次、第二次返回 `busy`；`dry_run` 前后全库逐表一致、冷归档目录无新增；模型报错、超时或回写阶段抛未捕获异常时锁与互斥都能释放，之后能再次整理；批量判研的模型调用不占锁，期间被软删除的行不被写回。生产库只读副本上用假的慢 System 2（每次调用 0.6 秒）、同样输入各跑一次真实整理：整理耗时、模型调用次数、归档条数、更新卡片数都一致；整理期间并发召回的最长等待由 4.81 秒降到 0.01 秒，并发写入的 10 条全部在库、没有被误归档，最长等待由 4.81 秒降到 0.01 秒。该实验没有开启批量判研，批量判研路径只靠测试覆盖。
+- **部署**：只重启服务端。线上夜间定时任务通过 HTTP 调用 `/v1/sleep/consolidate`（`curl`，`-m 600` 超时，无 `-f`），请求体和成功时的返回字段都不变；新增的返回形态只有 `busy`（HTTP 200，`curl` 不会判失败）和有跳过时多出的 `skipped_changed`。
+- **未覆盖**：互斥只在同一个服务进程、同一个 `DreamConsolidator` 实例内有效；MCP 每次调用新建 `DreamConsolidator`、命令行是独立进程，都不共用这把互斥，靠阶段三的复查保证不覆盖对方的改动，最坏情况是重复花一次模型调用。
+
+### 新增：seed 端点默认拒绝，命令行与 MCP 整理入口接入 System 2（PR #85，Closes #83）
+- **背景**：`POST /v1/admin/seed` 会把预置示例卡重置为初始内容，已被夜间整理或手动改过的内容会被覆盖（覆盖前内容有变化时会存一份历史快照）；它在未配置凭据时任何本机调用方都能调。另外，命令行整理入口和 MCP 整理工具没有接入 System 2，只做规则折叠，与 HTTP 路径的配置来源不一致。
+- **seed 开关**：`POST /v1/admin/seed` 默认返回 `403`。环境变量 `CORTEX_ALLOW_ADMIN_SEED` 为 `1`、`true` 或 `on`（忽略大小写与首尾空白）才放行，每次请求时读取进程环境，环境变量改动需要重启服务进程才会生效。仍先经过 `authenticate()`：已配置 `CORTEX_AGENT_TOKENS` 时无凭据 `401`、错凭据 `403`，凭据正确但开关关闭仍是 `403`。其它写入接口的鉴权这次没动。
+- **System 2 共用配置**：新增 `llm_client_from_env()`（`baize/intelligence/phase_detector.py`），复用 `llm_settings_from_env()`：`CORTEX_LLM_URL` 与 `CORTEX_LLM_KEY` 需同时设置，模型取 `CORTEX_REASONING_MODEL`（未设置时用代码内置默认值），任何一项缺失返回 `None`。HTTP 服务启动（lifespan）、命令行 `python -m baize.core.consolidator` 的 `main()`、MCP 的 `serve()` 都调用它；`BaizeTools` 新增可选参数 `llm_client`，不传时为 `None`。未配置 System 2 时三条入口的行为与此前一致：只做规则折叠，不报错；HTTP 路径行为不变。
+- **线上调用情况**：只读排查，没有发现任何程序在调用 seed——Hermes 插件目录、crontab、`/etc/cron.*`、Cortex 相关的 systemd 服务与定时器都是 0 处引用；`baize/` 下 `seed_initial_assets` 只出现在定义处和这个 HTTP 端点，命令行与 MCP 没有 seed 入口；服务日志因权限无法读取，历史请求次数无法统计。上线后确认该端点返回 `403`，卡片内容重启前后一致。
+- **测试**：新增 `test_issue83_seed_guard_and_system2_entries`（10 例）：开关取值的大小写与空白；默认 `403` 且不改库；开关打开后 `200`；配置 token 时 `401`、`403`、`200`；其它管理端点不受影响；三个入口在同样环境变量下拿到相同的地址、密钥、模型；未配置时三个入口都不报错并走规则折叠；MCP 注入的假模型确实被用于整理；`baize/` 下 seed 只出现在定义处与 HTTP 端点。`test_phase_a_auth_coverage` 与 `test_phase4_recall_router` 里调用 seed 的用例显式设置开关。
+- **部署**：更新并重启服务端即可；合并后 seed 默认关闭，线上没有调用方，不受影响。需要手动调用时，在服务环境里设置 `CORTEX_ALLOW_ADMIN_SEED=1` 并重启。线上夜间定时任务走 HTTP，不受命令行与 MCP 改动影响。
+- **未覆盖**：命令行没有 seed 入口；其它写入接口（`/v1/living-state/decision`、`/v1/graph/*` 等）在未配置 `CORTEX_AGENT_TOKENS` 时仍不校验凭据，服务只应监听回环地址。
+
 ### 新增：白天判定器默认只记日志（CORTEX_DAY_JUDGE）与测试数据软清理（PR #76，Closes #75）
 - **背景**：白天插件的 PhaseDetector 给用户的话打 `phase_hint`，经 `POST /v1/scratchpad/log` 直接写入草稿流，夜间整理会把 approval 折叠进活体卡定案。判定器准确率没有验证过，approval / rejection 又能直接改写定案，所以先让它默认不进正式记忆。
 - **开关**：服务端环境变量 `CORTEX_DAY_JUDGE`，只有等于 `apply`（忽略大小写与首尾空白）才保留白天的 approval / rejection，其他取值与未设置一律 `log_only`。开关在服务端生效，不依赖 Hermes 网关的环境变量。
