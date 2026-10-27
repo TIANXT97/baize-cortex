@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -20,7 +20,7 @@ from baize.core.normalization import normalize_content
 from baize.core.supersession import supersede
 from baize.core.scratchpad import (
     CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT, EXPLICIT_HINT, ScratchpadManager,
-    validate_timestamp,
+    day_judge_mode, screen_day_hint, validate_timestamp,
 )
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.core.seeds import seed_initial_assets
@@ -37,6 +37,8 @@ CANDIDATE_CATEGORIES = {CANDIDATE_FACT, CANDIDATE_DECISION}
 MAX_CONTENT = 2000
 MAX_REASON = 500
 DEFAULT_AGENT = "default"
+MAX_EXPIRE_IDS = 200
+MAX_EXPIRE_SESSIONS = 50
 
 
 def _load_agent_tokens() -> Dict[str, str]:
@@ -118,6 +120,12 @@ class RecallIn(BaseModel):
     scope: Optional[str] = None
 
 
+class ExpireIn(BaseModel):
+    ids: List[int] = []
+    session_ids: List[str] = []
+    dry_run: bool = True
+
+
 class VisibilityIn(BaseModel):
     entity_id: str
     visibility: str
@@ -176,6 +184,7 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         return {
             "status": "ok",
             "version": VERSION,
+            "day_judge": day_judge_mode(),
             "modules": {
                 "storage": "ready",
                 "scratchpad": "ready",
@@ -226,10 +235,13 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
                 existing = app.state.scratchpad.find_by_idempotency_key(body.idempotency_key)
                 if existing:
                     return deduplicated(existing, agent_id)
+            # Issue #75:白天判定器默认只记日志,approval/rejection 降为普通行,原判定写入 reason 列
+            phase_hint, reason = screen_day_hint(body.phase_hint)
             try:
                 log_id = app.state.scratchpad.append_log(
-                    body.session_id, body.role, body.raw_text, body.phase_hint, body.noul_score,
+                    body.session_id, body.role, body.raw_text, phase_hint, body.noul_score,
                     idempotency_key=body.idempotency_key, agent_id=agent_id, category=body.category,
+                    reason=reason,
                 )
             except sqlite3.IntegrityError:
                 app.state.conn.rollback()
@@ -424,6 +436,19 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         return {
             "entity_id": body.entity_id, "before": before, "after": body.visibility, "dry_run": body.dry_run,
         }
+
+    @app.post("/v1/admin/expire-scratchpad")
+    def admin_expire_scratchpad(body: ExpireIn, request: Request):
+        authenticate(request)
+        if not body.ids and not body.session_ids:
+            raise HTTPException(status_code=422, detail="必须提供 ids 或 session_ids")
+        if len(body.ids) > MAX_EXPIRE_IDS or len(body.session_ids) > MAX_EXPIRE_SESSIONS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"单次最多 {MAX_EXPIRE_IDS} 个 id、{MAX_EXPIRE_SESSIONS} 个会话",
+            )
+        with lock:
+            return app.state.scratchpad.expire_rows(body.ids, body.session_ids, body.dry_run)
 
     @app.post("/v1/admin/seed")
     def admin_seed(request: Request):

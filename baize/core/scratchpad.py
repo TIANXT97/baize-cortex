@@ -28,6 +28,26 @@ def batch_judge_enabled() -> bool:
     return os.environ.get("CORTEX_BATCH_JUDGE", "").strip().lower() in ("1", "true", "on")
 
 
+DAY_JUDGE_APPLY = "apply"
+DAY_JUDGE_LOG_ONLY = "log_only"
+# Issue #75:这两种标记能直接改写定案;candidate 是隔离通道(未核实标注、夜间 System 2 核实),不在此列
+_DAY_JUDGE_SUPPRESSED = ("approval", "rejection")
+_EXPIRE_CHUNK = 500
+
+
+def day_judge_mode() -> str:
+    """Issue #75:白天判定器结果能否写进正式记忆。只有 CORTEX_DAY_JUDGE=apply 才放行,其余一律只记日志。"""
+    value = os.environ.get("CORTEX_DAY_JUDGE", "").strip().lower()
+    return DAY_JUDGE_APPLY if value == DAY_JUDGE_APPLY else DAY_JUDGE_LOG_ONLY
+
+
+def screen_day_hint(phase_hint: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """只记日志模式下把 approval/rejection 降为普通行。返回 (实际写入的 phase_hint, 写入 reason 列的原判定)。"""
+    if phase_hint in _DAY_JUDGE_SUPPRESSED and day_judge_mode() == DAY_JUDGE_LOG_ONLY:
+        return None, f"day_judge:{phase_hint}"
+    return phase_hint, None
+
+
 def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
@@ -60,6 +80,7 @@ class ScratchpadManager:
         idempotency_key: Optional[str] = None,
         agent_id: Optional[str] = None,
         category: Optional[str] = None,
+        reason: Optional[str] = None,
     ) -> int:
         if phase_hint == EXPLICIT_HINT:
             raise ValueError("phase_hint=explicit_addition 仅限 cortex_add 内部路径使用")
@@ -74,11 +95,11 @@ class ScratchpadManager:
             """
             INSERT INTO scratchpad_log
                 (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id,
-                 ingested_at, valid_at, judge_status, category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ingested_at, valid_at, judge_status, category, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (session_id, role, raw_text, phase_hint, noul_score, idempotency_key, agent_id, now, now,
-             judge_status, category),
+             judge_status, category, reason),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -340,6 +361,58 @@ class ScratchpadManager:
             f"AND (phase_hint IS NOT NULL OR judge_status = 'pending')",
             params,
         ).fetchone()[0]
+
+    def expire_rows(self, ids: List[int], session_ids: List[str], dry_run: bool = True) -> Dict[str, Any]:
+        """Issue #75:软删除——只设 expired_at / invalid_at(与 supersede 同款),不物理删除、不动 phase_hint。"""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if ids:
+            clauses.append(f"id IN ({','.join('?' * len(ids))})")
+            params += ids
+        if session_ids:
+            clauses.append(f"session_id IN ({','.join('?' * len(session_ids))})")
+            params += session_ids
+        rows = self.conn.execute(
+            "SELECT id, session_id, role, phase_hint, created_at, expired_at, raw_text FROM scratchpad_log "
+            f"WHERE {' OR '.join(clauses)} ORDER BY id",
+            params,
+        ).fetchall() if clauses else []
+        targets = [r for r in rows if r[5] is None]
+        report: Dict[str, Any] = {
+            "dry_run": dry_run,
+            "matched": len(rows),
+            "already_expired": len(rows) - len(targets),
+            "to_expire": len(targets),
+            "ids": [r[0] for r in targets],
+            "missing_ids": sorted(set(ids) - {r[0] for r in rows}),
+            "unmatched_sessions": sorted(set(session_ids) - {r[1] for r in rows}),
+            "sample": [
+                {
+                    "id": r[0], "session_id": r[1], "role": r[2], "phase_hint": r[3], "created_at": r[4],
+                    "summary": " ".join((r[6] or "").split())[:40],
+                }
+                for r in targets[:20]
+            ],
+            "expired": 0,
+        }
+        if dry_run or not targets:
+            return report
+        now = _utc_now()
+        try:
+            for start in range(0, len(targets), _EXPIRE_CHUNK):
+                chunk = [r[0] for r in targets[start:start + _EXPIRE_CHUNK]]
+                self.conn.execute(
+                    "UPDATE scratchpad_log SET expired_at = COALESCE(expired_at, ?), "
+                    "invalid_at = COALESCE(invalid_at, ?) "
+                    f"WHERE expired_at IS NULL AND id IN ({','.join('?' * len(chunk))})",
+                    [now, now, *chunk],
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        report["expired"] = len(targets)
+        return report
 
     def export_pending_phase_logs(self, date_str: Optional[str] = None) -> List[Dict[str, Any]]:
         rows = self.conn.execute(

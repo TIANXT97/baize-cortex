@@ -80,6 +80,15 @@ def test_rule_fallback_without_llm_does_not_raise():
 
 
 def test_sleep_endpoint_and_mcp_tool():
+    # Issue #75:白天 approval 默认只记日志,这里显式放行以覆盖夜间折叠
+    os.environ["CORTEX_DAY_JUDGE"] = "apply"
+    try:
+        _run_sleep_endpoint_and_mcp_tool()
+    finally:
+        del os.environ["CORTEX_DAY_JUDGE"]
+
+
+def _run_sleep_endpoint_and_mcp_tool():
     with tempfile.TemporaryDirectory() as d:
         db = os.path.join(d, "e.db")
         archive = os.path.join(d, "arc")
