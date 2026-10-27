@@ -51,6 +51,7 @@
 - **特性**：一项目一文档，硬上限限制在 20~30 个核心工程实体；
 - **查询复杂度**：$O(1)$ 主键直连，直接旁路所有图检索与向量比对；
 - **展示名保护**：`display_name == entity_id` 视为“黑户”，慢波合成或 `POST /v1/admin/backfill-display-names` 可将其转正为自然语言名称；已有的良好名称不会被覆盖；
+- **可见性（Issue #72）**：`metadata.visibility == "group_ok"` 才表示该卡可以出现在群聊召回里，缺省即私人，无需迁移。`LivingStateManager.set_visibility` 只改该键，不动版本、定案与 `updated_at`；管理入口为 `POST /v1/admin/living-state/visibility`（见 §8.1）。夜间整理与 `update_decision` 合并 metadata 时保留该键，`seed_initial_assets` 重新写入时同样保留已有的值。群聊视图不返回卡片 `facts` 与墓碑（见 §3.2 末尾）；
 - **别名库**：`metadata.aliases` 增量取并集，永久保留；纯通用词（记忆/方案/项目/系统/服务/配置/记录/问题/时间/数据/工具）经黑名单**精确匹配**禁止入库，已入库的在该卡下次被慢波触碰时自动清洗，不误伤「时间机器」类长词（Issue #44 CTO 裁决，PR #47）。
 
 ### 2.3 Layer 2: 双时态实体拓扑图 (Bi-temporal Graph)
@@ -132,6 +133,16 @@
 | 7 | `NO_MATCH` | 全部未命中 | 返回空结果，置信度 0.0 |
 
 兜底的约束：Layer 1 活体卡始终是唯一权威，草稿事实只作为未固化窗口期的明确标注回退；草稿兜底纯只读，不进入 PPR 扩散、不修改 `scratchpad_log`；活体卡直达命中时绝不触发兜底；慢波固化之后，同一事实改由活体卡策略命中。
+
+**会话范围 `scope`（Issue #72）**：`recall(query, top_k, agent_id, scope=None)` 在上表流程之前先按范围分流。
+
+| `scope` | 行为 |
+|---|---|
+| 缺省（`None`） | 旧客户端，走上表全量流程，响应不带 `scope`，行为不变 |
+| `dm` | 走上表全量流程，响应回显 `scope: "dm"` |
+| 其他任何值（`group`、`forum`、空串、未知值） | 走群聊视图，响应回显 `scope: "group"` 与 `withheld_entity_ids` |
+
+群聊视图的规则：只在 `visibility == "group_ok"` 的活体卡上做名称、别名、PPR 与文本匹配，返回的卡片只保留白名单字段（`entity_id`、`display_name`、`version`、`status`、`current_decision`、`updated_at`，`metadata` 只留 `aliases` 与 `visibility`）。草稿流各层（`SCRATCHPAD_EXPLICIT_FALLBACK`、`CANDIDATE_UNVERIFIED`、`RECENT_TURNS_CONTEXT`、`provisional_facts`）、卡片 `facts` 与墓碑、PPR 的 `ranking` 与 `seed_nodes` 一律不返回：它们由夜间整理或草稿流从任意会话（含私聊）汇入，无法证明对群聊安全。命中了私人卡但被拦下时，把这些 `entity_id` 放进 `withheld_entity_ids`（只含 id，不含内容）并写 WARNING 日志（logger `baize.recall`）。`withheld_entity_ids` 只用于运维与客户端日志，不会注入对话。
 
 **为什么需要 RECENT_TURNS_CONTEXT 层（Issue #37）**：网关插件 `sync_turn` 每轮都写 Layer 0，但 `phase_hint` 只在 PhaseDetector 判 `decision_approved` 时才非空，而第 4 层与固化器都只认 `phase_hint IS NOT NULL`，于是普通对话永久「只写不读」：新会话开场拿不到上一轮的任务上下文，只能回翻原始会话库。第 5 层绕开 `phase_hint` 语义，按 `role` + 时间窗 + token 命中取行，只服务跨会话短期连续性，因此窗口短（72h）、条数少（≤3）、文本裁剪（400 字符）、置信度低（0.35），不会与权威记忆争夺排序。**否决的替代方案**：给普通轮次写 `phase_hint='turn'`——`phase_hint IS NOT NULL` 是固化器入队条件（`export_pending_phase_logs`），会把闲聊灌进 `living_states`。
 
@@ -279,7 +290,15 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 - **Hermes MemoryProvider 契约对齐**：Hermes 核心调度层 `agent/turn_context.py` 与 `MemoryManager` 要求 `prefetch(self, query: str, *, session_id: str = "") -> str`。若返回非字符串（如 `List`），消费端执行 `.strip()` 会抛出 `AttributeError` 并被调度层 `suppress(Exception)` 静默吞噬。因此插件端将结构化提取出的记忆格式化为换行分隔自然文本（`- [source] [display_name] content`），空召回返回 `""`；
 - **状态指示器透明化**：实现 `recall_status() -> Optional[RecallStatus]`，在上轮命中记忆条数 $>0$ 时返回 `RecallStatus(provider_label="baize-cortex", count=N, glyph="🧠")`，驱动前端渲染召回提示；
-- **群聊安全闸门（Fail-closed）**：对含 `:group:` 或以 `oc_` 开头的群聊会话，`prefetch` 恒返回 `""`，严格阻断私域记忆向群聊外溢。
+- **群聊安全闸门（Fail-closed，Issue #72 重写）**：旧闸靠 `session_id` 字符串判断（含 `:group:` 或以 `oc_` 开头），而网关实际传入的 session_id 形如 `YYYYMMDD_HHMMSS_xxxxxxxx`，闸从未触发，已删除。新规则：
+  - **只认显式 `chat_type`**：Hermes 在 `initialize(session_id, **kwargs)` 里传入 `chat_type`（飞书适配器规范成 `dm` / `group` / `forum`）。插件按 `session_id` 在 `SessionScopes` 里登记，同一个 provider 实例服务多个会话也不会串。只有 `dm` / `p2p` / `private` / `direct` 算私聊；`group`、`forum`、空值、缺失、未知值、session_id 查不到映射，一律按群聊。
+  - **会话切换**：`on_session_switch` 不带 `chat_type`。仅当切换原因是 `compression` 或 `new_session` 且新会话尚未登记时，才继承父会话的 chat_type；`resume` 等可能换到别的聊天，不继承，按群聊处理。显式传入的值优先于继承。
+  - **过滤在服务端**：`CortexClient.recall_scoped` 把 `scope`（`dm` 或 `group`）随 `/v1/recall` 请求发出，群聊只接受服务端回显 `scope=group` 的响应；没有回显（旧服务端）就什么都不注入，并写 `memory gate CLOSED` 日志。收到回显后客户端再按白名单过滤一遍：丢弃草稿类条目与非 `group_ok` 的卡，去掉 `facts`。
+  - **拦截日志**：每次群聊召回写一行，含 `chat_type` 原值、放行的群可见卡数量、被拦条目数与 `entity_id`，不写卡片内容。
+  - **默认状态**：所有卡缺省为私人，群聊默认什么都不注入，标记哪些卡群可见是运维决策（见 §8.1 可见性端点）。
+  - **线上插件**：`plugins/cortex/__init__.py` 不在本仓库，`prefetch` 里的判断与过滤已全部委托 `CortexClient.recall_scoped`，插件只负责在 `initialize` / `on_session_switch` 登记 `chat_type`。
+  - **部署顺序**：先部署仓库并重启服务端，再部署线上插件。新插件依赖 `SessionScopes`，反序会 import 失败；仓库先上而服务端未重启时群聊 fail-closed、私聊不变。
+  - **未覆盖**：MCP `baize_recall` 与 `GET /v1/living-states*` 没有 scope 控制；群聊 `sync_turn` 写入草稿流、再被批量判研或夜间整理固化的反向路径另行评估。
 
 ### 7.7 部署与归属
 
@@ -302,11 +321,12 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 | `/v1/graph/node` · `/v1/graph/edge` · `/v1/graph/invalidate` | POST | 图谱节点、边与失效 |
 | `/v1/graph/active-subgraph` | GET | 现役有效子图 |
 | `/v1/recall/ppr` | POST | PPR 能量扩散 |
-| `/v1/recall` | POST | 统一认知召回 |
+| `/v1/recall` | POST | 统一认知召回；可选入参 `scope`（Issue #72）：缺省为旧客户端行为，`dm` 全量并回显，其余走群聊视图并回显 `scope: "group"` 与 `withheld_entity_ids`，详见 §3.2 |
 | `/v1/sleep/consolidate` | POST | 触发慢波合成（`dry_run` 仅返回空报告） |
 | `/v1/admin/backfill-display-names` | POST | 黑户展示名转正，默认 `dry_run` |
 | `/v1/admin/purge-scratchpad` | POST | 草稿清洗，默认 `dry_run`，先归档再删除；过滤参数 `before_id`、`role`、`before_date`（`YYYY-MM-DD HH:MM:SS`）为 AND 关系；默认豁免 `phase_hint` 非空的待固化记录，`include_pending_phase=true` 才放行 |
 | `/v1/admin/backfill-judge` | POST | 一次性存量判研回填（Issue #44 PR4）：必须显式 `after_date` / `before_date` 时间窗 + 条数上限，默认 `dry_run` 出清单，防止全量存量回填风暴 |
+| `/v1/admin/living-state/visibility` | POST | 设置活体卡群聊可见性（Issue #72）：入参 `entity_id`、`visibility`（`group_ok` 或 `private`）、`dry_run`（默认 `true`）。`group_ok` 写入 `metadata.visibility`，`private` 移除该键；不改版本、定案与 `updated_at`。非法取值 `422`，卡不存在 `404`；响应含 `before`、`after`、`dry_run`。先用默认 `dry_run` 确认 `before` / `after`，再带 `"dry_run": false` 落库 |
 | `/v1/admin/seed` | POST | 预置核心工程资产 |
 
 全部 `/v1/*` 端点经 `authenticate()` 凭据校验（`/health` 除外）：未配置 `CORTEX_AGENT_TOKENS` 时放行并归属 `default`；配置后缺失凭据 `401`、凭据无效 `403`。PR #42 起覆盖全部端点，此前仅 `/v1/scratchpad/log`、`/v1/cortex/add`、`/v1/recall` 受保护。
@@ -319,4 +339,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 29 个套件（含 Issue #64 新增的 test_issue64_judge_contracts 与 test_issue64_judge_eval），其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 E 项新增 `test_phase_a_config_sediment`（沉淀五要素、脱敏零泄漏、None 标记、Outbox 重放、召回闭环），Issue #44 PR4 新增 `test_batch_judge_candidates`（状态机写入语义、confidence/noul 双门槛分流、切片与批次校验、重试 failed 终态、candidate 核实折叠与禁改写、开关三态、召回通道排序与未核实标注、purge 保护与回填窗口强制），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）；PR #49 在 `test_phase7_systemone_gates` 补鉴权熔断用例（401 熔断后跳过重试、TTL 到期恢复、5xx 不熔断）。PR #42 新增 `test_phase_a_auth_coverage`（12 个 `/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的八个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 31 个套件（含 Issue #64 新增的 test_issue64_judge_contracts 与 test_issue64_judge_eval），其中 Issue #72 新增 `test_issue72_group_memory_gate`（chat_type 判定矩阵、服务端群聊视图过滤、PPR 与最近对话层不外泄、网关真实 session_id 格式下的客户端矩阵、旧服务端无回显不注入、服务端异常时的客户端二次过滤、会话切换继承、可见性端点、夜间整理与 seed 后保留、事故形态重放），其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 E 项新增 `test_phase_a_config_sediment`（沉淀五要素、脱敏零泄漏、None 标记、Outbox 重放、召回闭环），Issue #44 PR4 新增 `test_batch_judge_candidates`（状态机写入语义、confidence/noul 双门槛分流、切片与批次校验、重试 failed 终态、candidate 核实折叠与禁改写、开关三态、召回通道排序与未核实标注、purge 保护与回填窗口强制），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）；PR #49 在 `test_phase7_systemone_gates` 补鉴权熔断用例（401 熔断后跳过重试、TTL 到期恢复、5xx 不熔断）。PR #42 新增 `test_phase_a_auth_coverage`（`/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行，当前覆盖 14 项请求，含 Issue #72 的可见性端点），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的八个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。

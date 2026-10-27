@@ -90,6 +90,7 @@ baize-cortex/
 │   │   ├── consolidator.py    # Layer 3: 夜间慢波睡眠合成引擎
 │   │   ├── normalization.py   # 内容规范化与幂等键 (客户端/服务端共用)
 │   │   ├── supersession.py    # supersedes_id 校验与旧记录失效
+│   │   ├── visibility.py      # Issue #72: 会话范围 (dm/group) 判定与活体卡群聊可见性
 │   │   └── seeds.py           # 核心工程资产预置
 │   ├── intelligence/          # 认知双系统与召回
 │   │   ├── phase_detector.py  # System 1: 毫秒级相变探测器 (Drex-Max)
@@ -102,7 +103,7 @@ baize-cortex/
 │   │   └── db.py              # 连接与 PRAGMA 初始化
 │   ├── client/                # cortex 插件参考实现 (纯标准库)
 │   │   ├── outbox.py          # 可靠 Outbox 投递层
-│   │   ├── plugin.py          # cortex_add 与 on_memory_write 镜像钩子
+│   │   ├── plugin.py          # cortex_add、on_memory_write 镜像钩子与按 chat_type 过滤的群聊记忆闸
 │   │   └── breaker.py         # 错误签名归一化与熔断
 │   └── server/                # 服务接入 (FastAPI + MCP)
 │       ├── app.py             # REST 端点
@@ -122,6 +123,7 @@ baize-cortex/
 │   ├── test_recall_scoring.py      # Issue #32: 2-gram 分词、打分排序与命中回写
 │   ├── test_recall_single_gram_gate.py # Issue #44 红线: 门槛回撤锁定与别名库通用词黑名单
 │   ├── test_batch_judge_candidates.py # Issue #44 PR4: candidate 候选流与批量判研状态机
+│   ├── test_issue72_group_memory_gate.py # Issue #72: 群聊记忆闸 (chat_type / 可见性 / scope 过滤)
 │   ├── test_purge_before_date.py   # Issue #32: 草稿流时间窗归档与一键脚本
 │   ├── test_purge_protect_phase_hints.py # Issue #34: 草稿归档默认豁免待固化记录
 │   ├── test_phase_a_*.py           # Phase A: 迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀
@@ -147,7 +149,8 @@ baize-cortex/
 - [x] **Phase A: 记忆外溢通道与可靠投递** —— Schema 增量迁移、`POST /v1/cortex/add` 幂等写入、Outbox 投递、memory 镜像钩子与错误签名熔断
 - [x] **Issue #44: 相态判研去关键词化** —— candidate 候选流（高 noul 事实/疑似计划经 System 2 核实后固化,严禁改写定案）、judge_status 批量判研状态机（会话切片/ID 校验/重试上限/failed 终态,`CORTEX_BATCH_JUDGE` 默认 off）、门神 401 鉴权熔断、配置改动事后沉淀通道与召回门槛红线纠偏
 - [x] **Issue #56: 批量判研二审排险** —— PR 1（切批空批防护、步骤异常隔离）、PR 2（candidate 事实/定案分流）、PR 3（插件 candidate 透传与标准词表绑定、薄壳委托）全量闭环
-- [ ] **Issue #64: System 2 批量判研准召定线与慢波 candidate 闭环** —— 已完成 PR #65（只读评测引擎 judge_eval、布尔校验/标签保留契约硬化）；待完成 NAS 侧人工黄金集复核、准召定线与受控启用
+- [x] **Issue #72: 群聊记忆闸** —— 只认 Hermes 传入的 `chat_type`（`dm` 之外一律按群聊）、活体卡 `metadata.visibility=group_ok` 才可在群里出现（缺省私人）、`/v1/recall` 新增 `scope` 与回显、群聊不出卡片 facts/草稿/最近对话、`POST /v1/admin/living-state/visibility` 管理入口；部署顺序为先服务端后插件
+- [ ] **Issue #64: System 2 批量判研准召定线与慢波 candidate 闭环** —— 已完成 PR #65（只读评测引擎 judge_eval、布尔校验/标签保留契约硬化）与 PR #68（提示词定案与事实边界对齐）；NAS 侧黄金集复核已完成，PR #70（提示词 v3，草稿）实测三轮准确率 73%~74%，未达 95% 准入线，事实候选留存仍不稳；`CORTEX_BATCH_JUDGE` 继续保持 off，待准召达标后再受控启用
 - [ ] **后续: 全量生产平滑割接** —— 现役存量数据提纯与全场景持续演化(原路线图中的 Phase 6 编号已被别名提纯占用,此项改为不编号待排期)
 
 ---
