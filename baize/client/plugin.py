@@ -2,6 +2,7 @@
 import json
 import logging
 import re
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from baize.client.outbox import Outbox
 from baize.client.recall import extract_memories
 from baize.core.normalization import idempotency_key, normalize_content
 from baize.core.scratchpad import CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT
+from baize.core.visibility import SCOPE_GROUP, group_view, is_group_visible, scope_from_chat_type
 from baize.intelligence.batch_judge import APPROVAL_CONFIDENCE_GATE, CANDIDATE_NOUL_GATE
 from baize.intelligence.phase_detector import (
     _APPROVAL_KEYWORDS, _REJECTION_KEYWORDS, PhaseDetector,
@@ -26,6 +28,10 @@ MIRROR_ORIGIN = "hermes_builtin_mirror"
 QUEUED_MESSAGE = "已保存到本地队列，将自动同步，无需重试"
 # Issue #56 P2-5(#44 B 项止血):白天快速门直接引用 PhaseDetector 本地规则词表,不再另写一份
 GATE_KEYWORDS = _APPROVAL_KEYWORDS + _REJECTION_KEYWORDS
+
+# 只有这些切换原因说明新会话与旧会话在同一个聊天里,才能继承旧会话的 chat_type;resume 等可能换到别的聊天,不继承
+_INHERIT_REASONS = frozenset({"compression", "new_session"})
+_MAX_TRACKED_SESSIONS = 1024
 
 Transport = Callable[[str, Dict[str, Any], Dict[str, str], float], Tuple[int, Dict[str, Any], Dict[str, str]]]
 
@@ -73,6 +79,54 @@ def _retry_after(headers: Dict[str, str]) -> Optional[float]:
     return None
 
 
+class SessionScopes:
+    """session_id -> Hermes chat_type。查不到、空值、认不出的值一律按群聊(fail-closed)。"""
+
+    def __init__(self) -> None:
+        self._chat_types: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+
+    def bind(self, session_id: str, chat_type: Any) -> None:
+        if not session_id or not chat_type:
+            return
+        with self._lock:
+            self._chat_types.pop(session_id, None)
+            self._chat_types[session_id] = chat_type
+            while len(self._chat_types) > _MAX_TRACKED_SESSIONS:
+                self._chat_types.pop(next(iter(self._chat_types)))
+
+    def inherit(self, session_id: str, parent_session_id: str, reason: str) -> None:
+        if reason not in _INHERIT_REASONS or not parent_session_id:
+            return
+        with self._lock:
+            known = session_id in self._chat_types
+            parent = self._chat_types.get(parent_session_id)
+        if not known and parent:
+            self.bind(session_id, parent)
+
+    def chat_type(self, session_id: str) -> Any:
+        with self._lock:
+            return self._chat_types.get(session_id)
+
+    def scope(self, session_id: str) -> str:
+        return scope_from_chat_type(self.chat_type(session_id))
+
+
+def _group_body(body: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """群聊响应的客户端二次过滤:只留非草稿且显式 group_ok 的卡,去掉 facts,其余字段一律丢弃。"""
+    kept: List[Dict[str, Any]] = []
+    dropped: List[str] = []
+    entries = body.get("living_states")
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("provisional") or not is_group_visible(entry):
+            dropped.append(str(entry.get("entity_id")))
+            continue
+        kept.append(group_view(entry))
+    return {"scope": SCOPE_GROUP, "strategy": body.get("strategy"), "living_states": kept}, dropped
+
+
 class CortexClient:
     def __init__(
         self,
@@ -84,6 +138,7 @@ class CortexClient:
         timeout: float = 3.0,
         path: str = "/v1/cortex/add",
         phase_detector: Optional[Any] = None,
+        scopes: Optional["SessionScopes"] = None,
     ):
         self._url = base_url.rstrip("/") + path
         self._recall_url = base_url.rstrip("/") + "/v1/recall"
@@ -95,6 +150,7 @@ class CortexClient:
         self._transport = transport or urllib_transport
         self._timeout = timeout
         self._outbox.sender = self._send_envelope
+        self._scopes = scopes if scopes is not None else SessionScopes()
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json; charset=utf-8"}
@@ -120,23 +176,58 @@ class CortexClient:
             return {"status": "error", "message": f"reason 超过 {MAX_REASON} 字符"}
         return self._deliver(normalized, category, reason or "", supersedes_id, None)
 
+    def bind_session(
+        self, session_id: str, chat_type: Any = None, *, parent_session_id: str = "", reason: str = ""
+    ) -> None:
+        """记下会话的 chat_type(Hermes initialize / on_session_switch 传入)。显式值优先,否则按原因继承父会话。"""
+        self._scopes.bind(session_id, chat_type)
+        self._scopes.inherit(session_id, parent_session_id, reason)
+
+    def scope_for(self, session_id: str = "") -> str:
+        return self._scopes.scope(session_id or self._session_id)
+
+    def recall_scoped(
+        self, query: str, top_k: int = 5, *, session_id: str = "", timeout: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """带会话范围的召回:群聊只拿服务端回显 scope=group 的响应并再过滤一遍;拿不到回显一律不注入。"""
+        sid = session_id or self._session_id
+        chat_type = self._scopes.chat_type(sid)
+        scope = scope_from_chat_type(chat_type)
+        status, body, _ = self._transport(
+            self._recall_url, {"query": query.strip(), "top_k": top_k, "scope": scope},
+            self._headers(), timeout if timeout is not None else self._timeout,
+        )
+        if not 200 <= status < 300 or not isinstance(body, dict):
+            return None
+        if scope != SCOPE_GROUP:
+            return body
+        if body.get("scope") != SCOPE_GROUP:
+            log.warning(
+                "memory gate CLOSED: session=%s chat_type=%r scope=group 但服务端未回显 scope(旧版本?),本轮不注入",
+                sid, chat_type,
+            )
+            return None
+        filtered, dropped = _group_body(body)
+        withheld = sorted(set(body.get("withheld_entity_ids") or []) | set(dropped))
+        level = logging.WARNING if withheld or chat_type not in ("group", "forum") else logging.INFO
+        log.log(
+            level,
+            "memory gate scope=group: session=%s chat_type=%r 放行 %d 张群可见卡,拦截 %d 个条目 entity_ids=%s",
+            sid, chat_type, len(filtered["living_states"]), len(withheld), withheld,
+        )
+        return filtered
+
     def prefetch(self, query: str, top_k: int = 5, *, session_id: str = "", as_text: bool = False) -> Any:
-        """Recall relevant memories via /v1/recall.
-        
+        """Recall relevant memories via /v1/recall,按会话范围(dm / group)过滤。
+
         When as_text=True, formats the memories into a newline-delimited prompt block
         matching Hermes MemoryProvider -> str contract. When False, returns the raw List[Dict].
         """
         if not query or len(query.strip()) < 2:
             return "" if as_text else []
-        if session_id and (":group:" in session_id or session_id.startswith("oc_")):
-            return "" if as_text else []
         try:
-            status, body, _ = self._transport(
-                self._recall_url, {"query": query.strip(), "top_k": top_k}, self._headers(), self._timeout
-            )
-            if not 200 <= status < 300:
-                return "" if as_text else []
-            memories = extract_memories(body)
+            body = self.recall_scoped(query, top_k, session_id=session_id)
+            memories = extract_memories(body) if body is not None else []
             if not as_text:
                 return memories
             if not memories:

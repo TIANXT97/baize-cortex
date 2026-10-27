@@ -2,7 +2,9 @@
 import json
 import sqlite3
 
+from baize.core.living_state import LivingStateManager
 from baize.core.temporal_graph import BiTemporalGraphManager
+from baize.core.visibility import VISIBILITY_KEY
 
 PROJ_ID = "proj:glass_mold_knowledge"
 _NODE_IDS = ["topic:aliyun", PROJ_ID, "plan:paddle_slice", "plan:manual_dict"]
@@ -19,6 +21,10 @@ def seed_initial_assets(conn: sqlite3.Connection) -> None:
         "plan": "人肉拆425张图做特征字典",
         "killed_reason": "资料增至1500张,人工标注成本爆炸且易错",
     }]
+    metadata = {"aliases": ["模具知识库", "玻璃模具"]}
+    existing = LivingStateManager(conn).get_state(PROJ_ID)
+    if existing and VISIBILITY_KEY in existing["metadata"]:
+        metadata[VISIBILITY_KEY] = existing["metadata"][VISIBILITY_KEY]
     conn.execute(
         """
         INSERT INTO living_states (entity_id, display_name, version, status, current_decision, metadata_json, tombstones_json, updated_at)
@@ -36,7 +42,7 @@ def seed_initial_assets(conn: sqlite3.Connection) -> None:
             PROJ_ID,
             "玻璃与模具工程知识库",
             "整页切片 + 飞桨描述强耦合 + 飞书折叠抽屉按需出图",
-            json.dumps({"aliases": ["模具知识库", "玻璃模具"]}, ensure_ascii=False),
+            json.dumps(metadata, ensure_ascii=False),
             json.dumps(tombstones, ensure_ascii=False),
         ),
     )

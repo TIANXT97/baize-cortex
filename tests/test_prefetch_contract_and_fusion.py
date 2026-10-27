@@ -184,6 +184,7 @@ def test_prefetch_injects_memories_end_to_end_and_fails_open():
 
             ob = Outbox(os.path.join(d, "o.jsonl"))
             client = CortexClient("http://testserver", None, "sess", ob, transport=transport)
+            client.bind_session("sess", "dm")
             items = client.prefetch(NATURAL_QUERY)
             assert items, "自动注入不应为空"
             assert items[0]["kind"] == "living_state" and items[0]["provisional"] is False
@@ -210,13 +211,14 @@ def test_prefetch_as_text_contract_and_group_fail_closed():
 
             ob = Outbox(os.path.join(d, "o.jsonl"))
             client = CortexClient("http://testserver", None, "sess", ob, transport=transport)
+            client.bind_session("sess", "dm")
             # 1. 验证 as_text=True 契约返回 str
             text_out = client.prefetch(NATURAL_QUERY, as_text=True)
             assert isinstance(text_out, str), "as_text=True 时必须返回 str"
             assert text_out.strip(), "命中记忆时不应为空串"
             assert "commit 0b8b352" in text_out
 
-            # 2. 验证群聊 fail-closed
+            # 2. 验证群聊 fail-closed(会话未登记 chat_type 同样视为群聊;完整矩阵见 test_issue72_group_memory_gate)
             group_out = client.prefetch(NATURAL_QUERY, session_id="oc_group_123", as_text=True)
             assert group_out == "", "群聊会话必须 fail-closed 返回空串"
             group_raw = client.prefetch(NATURAL_QUERY, session_id="agent:session:group:456", as_text=False)

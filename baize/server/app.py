@@ -24,6 +24,7 @@ from baize.core.scratchpad import (
 )
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.core.seeds import seed_initial_assets
+from baize.core.visibility import VISIBILITY_GROUP_OK, VISIBILITY_PRIVATE, visibility_of
 from baize.intelligence.phase_detector import OpenAICompatClient, llm_settings_from_env
 from baize.intelligence.ppr_engine import PPREngine
 from baize.intelligence.recall_router import CognitiveRecallRouter
@@ -114,6 +115,13 @@ class SleepIn(BaseModel):
 class RecallIn(BaseModel):
     query: str
     top_k: int = 5
+    scope: Optional[str] = None
+
+
+class VisibilityIn(BaseModel):
+    entity_id: str
+    visibility: str
+    dry_run: bool = True
 
 
 class PurgeIn(BaseModel):
@@ -362,7 +370,7 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         # Issue #39:读路径与写路径使用同一个 agent 身份,否则跨代理召回没有隔离依据。
         agent_id = authenticate(request)
         with lock:
-            return app.state.router.recall(body.query, body.top_k, agent_id=agent_id)
+            return app.state.router.recall(body.query, body.top_k, agent_id=agent_id, scope=body.scope)
 
     @app.post("/v1/admin/backfill-display-names")
     def admin_backfill(body: BackfillIn, request: Request):
@@ -398,6 +406,24 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc))
+
+    @app.post("/v1/admin/living-state/visibility")
+    def admin_set_visibility(body: VisibilityIn, request: Request):
+        authenticate(request)
+        if body.visibility not in (VISIBILITY_GROUP_OK, VISIBILITY_PRIVATE):
+            raise HTTPException(
+                status_code=422, detail=f"visibility 必须是 {VISIBILITY_GROUP_OK} 或 {VISIBILITY_PRIVATE}"
+            )
+        with lock:
+            state = app.state.living.get_state(body.entity_id)
+            if state is None:
+                raise HTTPException(status_code=404, detail="living state not found")
+            before = visibility_of(state)
+            if not body.dry_run:
+                app.state.living.set_visibility(body.entity_id, body.visibility)
+        return {
+            "entity_id": body.entity_id, "before": before, "after": body.visibility, "dry_run": body.dry_run,
+        }
 
     @app.post("/v1/admin/seed")
     def admin_seed(request: Request):

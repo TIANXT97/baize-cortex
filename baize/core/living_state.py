@@ -7,6 +7,8 @@ import json
 import sqlite3
 from typing import Any, Dict, List, Optional
 
+from baize.core.visibility import VISIBILITY_GROUP_OK, VISIBILITY_KEY
+
 
 class LivingStateManager:
     def __init__(self, db_conn: sqlite3.Connection):
@@ -47,6 +49,24 @@ class LivingStateManager:
             (display_name, entity_id),
         )
         self.conn.commit()
+
+    def set_visibility(self, entity_id: str, visibility: str, commit: bool = True) -> Optional[Dict[str, Any]]:
+        """只改 metadata.visibility,不动版本、定案与 updated_at;private 即移除该键(缺省即私人)。"""
+        current = self.get_state(entity_id)
+        if current is None:
+            return None
+        metadata = dict(current["metadata"])
+        if visibility == VISIBILITY_GROUP_OK:
+            metadata[VISIBILITY_KEY] = VISIBILITY_GROUP_OK
+        else:
+            metadata.pop(VISIBILITY_KEY, None)
+        self.conn.execute(
+            "UPDATE living_states SET metadata_json = ? WHERE entity_id = ?",
+            (json.dumps(metadata, ensure_ascii=False), entity_id),
+        )
+        if commit:
+            self.conn.commit()
+        return self.get_state(entity_id)
 
     def update_decision(
         self,
