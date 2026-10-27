@@ -139,8 +139,10 @@ class DreamConsolidator:
         phase_logs = self.scratchpad.export_pending_phase_logs(target_date)
         explicit_logs = [log for log in phase_logs if log["phase_hint"] == EXPLICIT_HINT]
         candidate_logs = [log for log in phase_logs if log["phase_hint"] == CANDIDATE_HINT]
+        # Issue #75:已软删除(expired_at)的定案/推翻行不再参与分析,否则软清理挡不住夜间折叠
         plans = self._analyze([
-            log for log in phase_logs if log["phase_hint"] not in (EXPLICIT_HINT, CANDIDATE_HINT)
+            log for log in phase_logs
+            if log["phase_hint"] not in (EXPLICIT_HINT, CANDIDATE_HINT) and not log.get("expired_at")
         ])
         skipped = self._merge_explicit(plans, explicit_logs)
         candidates = self._merge_candidates(plans, candidate_logs)

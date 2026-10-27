@@ -88,6 +88,15 @@ def test_scratchpad_log_endpoint_accepts_candidate_category():
 
 
 def test_sync_turn_tags_candidates_with_category():
+    # Issue #75:approval/rejection 默认只记日志,这里显式放行以覆盖完整打标矩阵;默认行为见 test_issue75
+    os.environ["CORTEX_DAY_JUDGE"] = "apply"
+    try:
+        _run_sync_turn_tags_candidates_with_category()
+    finally:
+        del os.environ["CORTEX_DAY_JUDGE"]
+
+
+def _run_sync_turn_tags_candidates_with_category():
     verdicts = {
         "就按这个记:服务器IP是101.200.45.220": ("exploration", 0.95, 0.7),
         "好,那就这样做": ("decision_approved", 0.2, 0.85),

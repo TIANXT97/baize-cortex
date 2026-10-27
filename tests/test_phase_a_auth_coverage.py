@@ -36,6 +36,7 @@ def _requests():
         ("post", "/v1/admin/living-state/visibility", {
             "entity_id": "proj:x", "visibility": "private", "dry_run": True,
         }),
+        ("post", "/v1/admin/expire-scratchpad", {"ids": [1], "dry_run": True}),
         ("post", "/v1/admin/seed", None),
     ]
 
