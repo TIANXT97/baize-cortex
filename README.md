@@ -103,6 +103,7 @@ pip install -r requirements.txt
 | `CORTEX_LLM_URL`、`CORTEX_LLM_KEY` | System 2（慢波合成、批量判研、candidate 核实）使用的 OpenAI 兼容网关地址与密钥，需同时设置 | 慢波合成降级为正则规则；批量判研与 candidate 核实不运行 |
 | `CORTEX_REASONING_MODEL` | System 2 使用的模型名 | 使用代码内置默认值（见 `baize/intelligence/phase_detector.py`） |
 | `CORTEX_AGENT_TOKENS` | 凭据表，格式 `token:agent_id,token2:agent_id2` | 不校验，所有写入归属 `default` |
+| `CORTEX_ALLOW_ADMIN_SEED` | 是否放行 `POST /v1/admin/seed`，`1` / `true` / `on` 放行 | 拒绝（403） |
 
 **插件进程**（Hermes 网关，加载 `baize/client/` 的那一侧）：
 
@@ -146,7 +147,7 @@ curl -s http://127.0.0.1:8768/health
 - 启动时自动建表并做增量迁移；有存量数据且需要加列时，会先备份为 `baize.db.bak-<时间戳>`
 - MCP stdio 入口：`python -m baize.server.mcp_server --db baize.db`（手写 JSON-RPC 2.0）
 - 服务只应监听本机回环地址。未设置 `CORTEX_AGENT_TOKENS` 时所有 `/v1/*` 端点都不校验凭据，不要把端口暴露到本机以外；设置后缺少凭据返回 `401`、凭据无效返回 `403`
-- `POST /v1/admin/seed` 会把预置示例卡重置为初始内容，已被夜间整理或手动改过的内容会被覆盖（覆盖前会存一份历史快照），生产环境不要随意调用
+- `POST /v1/admin/seed` 会把预置示例卡重置为初始内容，已被夜间整理或手动改过的内容会被覆盖（覆盖前会存一份历史快照）。它**默认返回 403**：确需调用时，在服务环境里设置 `CORTEX_ALLOW_ADMIN_SEED=1`（`true` / `on` 同义，忽略大小写与首尾空白）并重启；已配置 `CORTEX_AGENT_TOKENS` 时还必须带对凭据。服务启动、定时任务和命令行都不会调用它
 
 ### systemd 与定时任务
 
@@ -170,7 +171,7 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-夜间慢波（通过服务的 HTTP 接口触发，这样会用到服务已配置的 System 2；命令行入口 `python -m baize.core.consolidator` 不连接 System 2，只做规则折叠）：
+夜间慢波（推荐通过服务的 HTTP 接口触发。命令行入口 `python -m baize.core.consolidator` 和 MCP 的整理工具读取同一套 `CORTEX_LLM_URL` / `CORTEX_LLM_KEY` / `CORTEX_REASONING_MODEL` 配置，未配置时只做规则折叠）：
 
 ```ini
 # /etc/systemd/system/baize-cortex-slowwave.service

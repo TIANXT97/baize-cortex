@@ -66,6 +66,13 @@ def test_recall_no_match_returns_empty_strategy():
 
 
 def test_recall_endpoint_end_to_end():
+    os.environ["CORTEX_ALLOW_ADMIN_SEED"] = "1"  # Issue #83:seed 默认 403
+    try:
+        _run_recall_endpoint_end_to_end()
+    finally:
+        del os.environ["CORTEX_ALLOW_ADMIN_SEED"]
+
+def _run_recall_endpoint_end_to_end():
     with tempfile.TemporaryDirectory() as d:
         app = create_app(os.path.join(d, "e.db"), archive_dir=os.path.join(d, "arc"))
         with TestClient(app) as client:

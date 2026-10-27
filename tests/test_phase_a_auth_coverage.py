@@ -54,6 +54,7 @@ def test_all_v1_endpoints_require_token_when_configured():
     with tempfile.TemporaryDirectory() as d:
         app = create_app(os.path.join(d, "c.db"), os.path.join(d, "cold"))
         os.environ["CORTEX_AGENT_TOKENS"] = "tokA:agentA"
+        os.environ["CORTEX_ALLOW_ADMIN_SEED"] = "1"  # Issue #83:seed 默认 403,放行后才能验证凭据三态
         try:
             with TestClient(app) as tc:
                 for method, path, body in _requests():
@@ -65,6 +66,7 @@ def test_all_v1_endpoints_require_token_when_configured():
                     assert ok.status_code not in (401, 403), f"{path} 正确凭据被拒: {ok.status_code}"
         finally:
             del os.environ["CORTEX_AGENT_TOKENS"]
+            del os.environ["CORTEX_ALLOW_ADMIN_SEED"]
 
 
 def test_endpoints_still_open_when_tokens_unset():
