@@ -4,6 +4,20 @@
 
 ## 2026-10-27
 
+### 新增：白天判定器默认只记日志（CORTEX_DAY_JUDGE）与测试数据软清理（PR #76，Closes #75）
+- **背景**：白天插件的 PhaseDetector 给用户的话打 `phase_hint`，经 `POST /v1/scratchpad/log` 直接写入草稿流，夜间整理会把 approval 折叠进活体卡定案。判定器准确率没有验证过，approval / rejection 又能直接改写定案，所以先让它默认不进正式记忆。
+- **开关**：服务端环境变量 `CORTEX_DAY_JUDGE`，只有等于 `apply`（忽略大小写与首尾空白）才保留白天的 approval / rejection，其他取值与未设置一律 `log_only`。开关在服务端生效，不依赖 Hermes 网关的环境变量。
+- **`log_only` 的行为**：`/v1/scratchpad/log` 把 approval / rejection 降为普通行（`phase_hint` 置空），原判定写入 `reason` 列（`day_judge:approval` / `day_judge:rejection`），`noul_score` 照存，不改 schema。普通行白天兜底（最近对话层）查得到，夜间整理不处理，也能进评测样本。`apply` 下行为与此前一致。
+- **candidate 照常写入（方案 A）**：approval / rejection 能直接改写定案；candidate 是隔离通道（召回带「未核实」标注，夜间由 System 2 核实，不碰 `current_decision`，不写 `decided_as` 边）。代价：核实通过的 candidate 仍会进卡片 `facts`，所以这不算严格的「不影响任何正式记忆」。
+- **`/health`**：新增 `day_judge` 字段，回显当前模式，部署后可据此核对。
+- **夜间整理跳过已过期的定案 / 推翻行**：`run_consolidation` 分析前先剔除 `expired_at` 非空的行。此前只有 explicit 与 candidate 分支检查 `expired_at`，approval / rejection 分支不检查，光靠软删除挡不住已打标的行。
+- **软清理端点**：新增 `POST /v1/admin/expire-scratchpad`（鉴权、默认 `dry_run`）。入参 `ids`、`session_ids`、`dry_run`，至少提供一个，单次最多 200 个 id、50 个会话，超限 `422`。只设置 `expired_at` 与 `invalid_at`（与 `supersede` 同款），不改 `phase_hint`，不物理删除，重复执行幂等。响应含 `matched`、`to_expire`、`already_expired`、`ids`、`missing_ids`、`unmatched_sessions` 与 `sample`（id、会话、角色、标记、时间、前 40 字摘要）。
+- **已打标的旧记录**：开关只管新写入的行，旧行不自动改动；需要清掉的用上面的端点按 id 软删除。冷归档里的历史行不动。
+- **不动的路径**：`cortex_add` 与 MEMORY.md 镜像不经过判定器；MCP `baize_scratchpad_log` 的 `phase_hint` 由调用方 agent 显式传入，不属于白天判定器（有测试锁定）；夜间批量判研仍由 `CORTEX_BATCH_JUDGE` 单独控制。
+- **测试**：新增 `test_issue75_day_judge_log_only`（13 例：开关取值、`/health` 回显、默认降级与 candidate 不受影响、`apply` 行为不变、降级行被最近对话召回且不被折叠、MCP 路径不受影响、插件端到端、夜间整理跳过已过期行、清理端点 dry_run / 软删除 / 幂等 / 不物理删除、过期行不再召回、入参校验与上限、鉴权）；`test_phase3_consolidation`、`test_plugin_candidate_category` 两个依赖白天打标落库的用例显式设为 `apply`；`test_phase_a_auth_coverage` 补新端点。Linux、Python 3.12 下全量 32 个测试文件通过。
+- **生产执行**：先 `dry_run` 核对，再真实执行，共软删除 8 行（测试会话与定时任务文本的行），复查已无遗留。
+- **部署**：只需更新并重启 baize-cortex，不用动 Hermes 网关与线上插件。合并后默认即 `log_only`；要恢复旧行为，给服务设置 `CORTEX_DAY_JUDGE=apply`。
+
 ### 修复：群聊记忆闸改为显式 chat_type + 卡片可见性（PR #73，Closes #72）
 - **现象**：旧闸靠 `session_id` 含 `:group:` 或以 `oc_` 开头判断，而网关实际传入的 session_id 形如 `YYYYMMDD_HHMMSS_xxxxxxxx`，闸从未触发（网关日志里一次拦截记录都没有）。10-25 的一次群聊请求把私人活体卡、`general_decisions` 事实与未固化草稿一并注入了群对话。`/v1/recall` 各层也没有可见性概念，服务端无法区分私人卡与群可见卡。
 - **规则（用户拍板：私人信息不泄露即可，其余不设限）**：

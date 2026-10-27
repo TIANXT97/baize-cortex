@@ -80,7 +80,7 @@
 - **显式沉淀固化（Issue #25）**：`phase_hint="explicit_addition"` 的记录（由 `cortex_add` 写入）不走授权批准门，`_is_authoritative` 语义保持不变，另由 `_is_explicit_addition` 判定准入：
   - **归属**：只认文本里的 `proj:` 锚点（含别名解析）命中已有合法实体；命中不了一律落入 `proj:general_decisions`。不使用 `_recent_entity()` 回退，不新建陌生实体、图谱节点或共现边；
   - **无损合并**：同实体多条按 `(created_at, id)` 升序全部并入 `metadata.facts`（含来源 log id、`category`、`reason`），不做“后者胜出”；与 approval 同组时 approval 保持主结论，显式事实并列补充；只有显式事实时 `current_decision` 保持原值，新建的 `proj:general_decisions` 为空字符串（该列 NOT NULL）；
-  - **不固化的情形**：含探索或疑问措辞（`_EXPLORATION_RE`）、或已被 `supersedes_id` 推翻（`expired_at` 非空）的记录留在热表，并出现在慢波报告的 `skipped_explicit`（带 `id` 与原因），不静默丢弃；
+  - **不固化的情形**：含探索或疑问措辞（`_EXPLORATION_RE`）、或已被 `supersedes_id` 推翻（`expired_at` 非空）的记录留在热表，并出现在慢波报告的 `skipped_explicit`（带 `id` 与原因），不静默丢弃；定案 / 推翻行（approval、rejection 等非 explicit、非 candidate 的标记行）在分析前同样先剔除 `expired_at` 非空的行（Issue #75），这样软删除能真正挡住夜间折叠；
   - **模型边界**：LLM 路径只看到用户 approval 等日志，看不到显式事实；事实无论 LLM 是否可用都写入卡片；
   - **幂等与原子性**：卡片写入与日志清退仍在同一个 `BEGIN IMMEDIATE` 事务内，失败整体回滚，重复运行不产生重复条目；冷归档 jsonl 额外保存 `category`、`reason`。
 
@@ -173,6 +173,7 @@ $$\text{Score} = 3\,[\text{display\_name 命中}] + 2\,[\text{alias 命中}] + 1
 - **仲裁**：先问 Drex-Max；其 `noul` 得分落在模糊区间 (0.4, 0.6) 时，再交 OpenJev 复判；
 - **鉴权熔断（Issue #44 PR1，PR #49）**：门神返回 401/403（永久性凭据失效）时进程内熔断该门神（`_GateBreaker`，TTL 600s），熔断期内直接跳过不再白等，到期自动恢复；熔断打 `WARNING`（logger `baize.phase_detector`），失败不再静默。5xx/超时属临时故障，不熔断；
 - **Fail-open**：两道门都不可用时，降级为本地关键词规则（`_detect_local`），不阻塞写入；
+- **白天判定结果默认只记日志（Issue #75）**：服务端 `CORTEX_DAY_JUDGE`（见 §6.2）决定白天 approval / rejection 能否写进正式记忆。默认 `log_only`：`/v1/scratchpad/log` 把这两种标记降为普通行（`phase_hint` 置空），原判定记入 `reason` 列（`day_judge:approval` / `day_judge:rejection`），`noul_score` 照存；普通行被最近对话层兜底召回，夜间整理不处理。只有等于 `apply` 才保留标记。candidate 不受影响（隔离通道：召回带「未核实」标注、夜间由 System 2 核实、不碰 `current_decision`），代价是核实通过的 candidate 仍会进卡片 `facts`。`cortex_add`、MEMORY.md 镜像与 MCP `baize_scratchpad_log` 不经过这个开关；
 - **返回**：`detect_phase(text) -> (phase, confidence, category)`。
 
 ### 4.2 System 2：深度推理模型
@@ -218,6 +219,7 @@ Hermes 网关核心的 `sync_turn` 采用 `(user_content, assistant_content, *, 
 | `CORTEX_SYSTEMONE_OPENJEV_URL` / `_KEY` | OpenJev 门神 | 跳过该门 |
 | `CORTEX_SYSTEMONE_PROXY` | 门神请求使用的代理 | 直连 |
 | `CORTEX_AGENT_TOKENS` | 凭据表，格式 `token:agent_id,token2:agent_id2` | 不校验，所有写入归属 `default` |
+| `CORTEX_DAY_JUDGE` | 白天判定器结果能否写进正式记忆（Issue #75）；只有 `apply`（忽略大小写与首尾空白）放行白天 approval / rejection | 一律 `log_only`：approval / rejection 降为普通行，原判定记入 `reason` 列；`GET /health` 的 `day_judge` 字段回显当前模式 |
 | `CORTEX_BATCH_JUDGE` | 夜间批量判研总开关（Issue #44 PR4）；`1`/`true`/`on` 开启 | 不跑批量判，普通行 `judge_status` 保持 NULL（与历史存量同语义）；**System 2 判相态准召经 50~100 条标注样本验证通过后才允许开启** |
 
 > 历史变量 `CORTEX_DECISION_MODEL` 自 Phase 7 起已不再使用，被 SystemOne 双门神变量取代。
@@ -312,7 +314,7 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 | 路径 | 方法 | 说明 |
 |---|---|---|
-| `/health` | GET | 健康检查 |
+| `/health` | GET | 健康检查；含 `day_judge` 字段，回显白天判定器当前模式（`log_only` / `apply`，Issue #75） |
 | `/v1/scratchpad/log` | POST | 草稿流追加（支持幂等） |
 | `/v1/cortex/add` | POST | 显式沉淀（幂等、可推翻旧记录） |
 | `/v1/living-states` | GET | 列出现役活体卡 |
@@ -325,6 +327,7 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 | `/v1/sleep/consolidate` | POST | 触发慢波合成（`dry_run` 仅返回空报告） |
 | `/v1/admin/backfill-display-names` | POST | 黑户展示名转正，默认 `dry_run` |
 | `/v1/admin/purge-scratchpad` | POST | 草稿清洗，默认 `dry_run`，先归档再删除；过滤参数 `before_id`、`role`、`before_date`（`YYYY-MM-DD HH:MM:SS`）为 AND 关系；默认豁免 `phase_hint` 非空的待固化记录，`include_pending_phase=true` 才放行 |
+| `/v1/admin/expire-scratchpad` | POST | 草稿行软删除（Issue #75）：入参 `ids`、`session_ids`、`dry_run`（默认 `true`），至少提供一个，单次最多 200 个 id、50 个会话，超限 `422`。只设置 `expired_at` 与 `invalid_at`，不改 `phase_hint`、不物理删除，重复执行幂等；响应含 `matched`、`to_expire`、`already_expired`、`ids`、`missing_ids`、`unmatched_sessions`、`sample`。先用默认 `dry_run` 核对再带 `"dry_run": false` 落库 |
 | `/v1/admin/backfill-judge` | POST | 一次性存量判研回填（Issue #44 PR4）：必须显式 `after_date` / `before_date` 时间窗 + 条数上限，默认 `dry_run` 出清单，防止全量存量回填风暴 |
 | `/v1/admin/living-state/visibility` | POST | 设置活体卡群聊可见性（Issue #72）：入参 `entity_id`、`visibility`（`group_ok` 或 `private`）、`dry_run`（默认 `true`）。`group_ok` 写入 `metadata.visibility`，`private` 移除该键；不改版本、定案与 `updated_at`。非法取值 `422`，卡不存在 `404`；响应含 `before`、`after`、`dry_run`。先用默认 `dry_run` 确认 `before` / `after`，再带 `"dry_run": false` 落库 |
 | `/v1/admin/seed` | POST | 预置核心工程资产 |
@@ -339,4 +342,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 31 个套件（含 Issue #64 新增的 test_issue64_judge_contracts 与 test_issue64_judge_eval），其中 Issue #72 新增 `test_issue72_group_memory_gate`（chat_type 判定矩阵、服务端群聊视图过滤、PPR 与最近对话层不外泄、网关真实 session_id 格式下的客户端矩阵、旧服务端无回显不注入、服务端异常时的客户端二次过滤、会话切换继承、可见性端点、夜间整理与 seed 后保留、事故形态重放），其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 E 项新增 `test_phase_a_config_sediment`（沉淀五要素、脱敏零泄漏、None 标记、Outbox 重放、召回闭环），Issue #44 PR4 新增 `test_batch_judge_candidates`（状态机写入语义、confidence/noul 双门槛分流、切片与批次校验、重试 failed 终态、candidate 核实折叠与禁改写、开关三态、召回通道排序与未核实标注、purge 保护与回填窗口强制），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）；PR #49 在 `test_phase7_systemone_gates` 补鉴权熔断用例（401 熔断后跳过重试、TTL 到期恢复、5xx 不熔断）。PR #42 新增 `test_phase_a_auth_coverage`（`/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行，当前覆盖 14 项请求，含 Issue #72 的可见性端点），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的八个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 32 个套件（含 Issue #64 新增的 test_issue64_judge_contracts 与 test_issue64_judge_eval），其中 Issue #75 新增 `test_issue75_day_judge_log_only`（开关取值、`/health` 回显、默认降级与 candidate 不受影响、`apply` 行为不变、降级行被最近对话召回且不被折叠、MCP 路径不受影响、夜间整理跳过已过期行、清理端点 dry_run / 软删除 / 幂等 / 上限 / 鉴权），Issue #72 新增 `test_issue72_group_memory_gate`（chat_type 判定矩阵、服务端群聊视图过滤、PPR 与最近对话层不外泄、网关真实 session_id 格式下的客户端矩阵、旧服务端无回显不注入、服务端异常时的客户端二次过滤、会话切换继承、可见性端点、夜间整理与 seed 后保留、事故形态重放），其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 E 项新增 `test_phase_a_config_sediment`（沉淀五要素、脱敏零泄漏、None 标记、Outbox 重放、召回闭环），Issue #44 PR4 新增 `test_batch_judge_candidates`（状态机写入语义、confidence/noul 双门槛分流、切片与批次校验、重试 failed 终态、candidate 核实折叠与禁改写、开关三态、召回通道排序与未核实标注、purge 保护与回填窗口强制），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）；PR #49 在 `test_phase7_systemone_gates` 补鉴权熔断用例（401 熔断后跳过重试、TTL 到期恢复、5xx 不熔断）。PR #42 新增 `test_phase_a_auth_coverage`（`/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行，当前覆盖 15 项请求，含 Issue #72 的可见性端点与 Issue #75 的清理端点），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的八个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
