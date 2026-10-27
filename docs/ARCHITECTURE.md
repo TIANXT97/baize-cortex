@@ -2,8 +2,8 @@
 
 **工程标识**：`baize-cortex`  
 **文档版本**：v2.1  
-**审定人**：田总监 (TIAN)  
-**架构执笔**：夭夭 (CTO & Chief Architect)  
+**审定人**：项目负责人  
+**架构执笔**：架构负责人 (CTO & Chief Architect)  
 **初版日期**：2026-10-20  
 **最近同步**：2026-10-25（同步至 PR #59 / Issue #56 PR 2：candidate 核实按事实类/定案类分流；含 PR #57 / Issue #56 PR 1：批量判研切批空批防护与整步异常隔离；此前 2026-10-24 同步至 PR #54 / Issue #44 PR4：candidate 候选流与夜间批量判研状态机，含 PR #51 E 项沉淀通道、PR #49 门神熔断、PR #47/#48 红线 3 纠偏与 C 项验收勘误）  
 
@@ -304,7 +304,7 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ### 7.7 部署与归属
 
-插件代码在本仓库 `baize/client/` 完成自闭环测试后，由 NAS / 云机部署通道同步至 Hermes 的 `plugins/cortex/`。构建、容器重启与数据库迁移的实际执行由 NAS 侧（夭夭）负责。
+插件代码在本仓库 `baize/client/` 完成自闭环测试后，由 NAS / 云机部署通道同步至 Hermes 的 `plugins/cortex/`。构建、容器重启与数据库迁移的实际执行由 NAS 侧维护者负责。
 
 ---
 

@@ -12,7 +12,7 @@ from baize.core.living_state import LivingStateManager
 from baize.intelligence.recall_router import CognitiveRecallRouter
 from baize.storage.db import init_db
 
-REPRO_QUERY = "你现在用得卡片是洋哥仓库最新的吗"
+REPRO_QUERY = "当前使用的卡片是示例仓库的最新版吗"
 
 
 def _put(conn, entity_id, name, decision, aliases=None):
@@ -71,7 +71,7 @@ def test_full_alias_word_in_long_query_hits_direct():
     with tempfile.TemporaryDirectory() as d:
         conn, router = _env(d)
         try:
-            _put(conn, "proj:feishu_card", "流式卡片", "飞书消息用卡片展示更新", aliases=["洋哥仓库"])
+            _put(conn, "proj:feishu_card", "流式卡片", "飞书消息用卡片展示更新", aliases=["示例仓库"])
             out = router.recall(REPRO_QUERY)
             assert out["strategy"] == "LIVING_STATE_DIRECT", out
             assert out["state"]["entity_id"] == "proj:feishu_card", out

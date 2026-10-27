@@ -35,7 +35,7 @@ def _add(sp, text):
 def test_fact_is_visible_before_consolidation_as_provisional():
     with tempfile.TemporaryDirectory() as d:
         with TestClient(_app(d)) as tc:
-            lid = _add_http(tc, "夭夭验收口令是北斗七号")
+            lid = _add_http(tc, "小明验收口令是北斗七号")
             out = _recall(tc, "北斗七号")
             assert out["strategy"] == FALLBACK, out
             assert out["provisional"] is True and out["authoritative"] is False
@@ -46,7 +46,7 @@ def test_fact_is_visible_before_consolidation_as_provisional():
 def test_after_consolidation_the_living_card_answers_instead_of_fallback():
     with tempfile.TemporaryDirectory() as d:
         with TestClient(_app(d)) as tc:
-            _add_http(tc, "夭夭验收口令是北斗七号")
+            _add_http(tc, "小明验收口令是北斗七号")
             report = tc.post("/v1/sleep/consolidate", json={}).json()
             assert report["archived_logs"] == 1, report
             out = _recall(tc, "北斗七号")
@@ -94,12 +94,12 @@ def test_reproduces_field_queries_and_removes_no_match():
             sp = ScratchpadManager(conn)
             router = CognitiveRecallRouter(conn)
             living.update_decision("proj:e2e_probe", "探针项目", "对照组 定案")
-            ids = [_add(sp, f"白泽验收 夭夭-美西01 E2E 事实{i}") for i in range(6)]
+            ids = [_add(sp, f"白泽验收 小明-美西01 E2E 事实{i}") for i in range(6)]
 
             control = router.recall("e2e_probe 对照组 定案")
             assert control["strategy"] == "DECISION_TEXT_MATCH"
 
-            for query in ("白泽验收 夭夭-美西01 验证", "E2E"):
+            for query in ("白泽验收 小明-美西01 验证", "E2E"):
                 out = router.recall(query)
                 assert out["strategy"] == FALLBACK, (query, out)
                 assert out["source_log_ids"] == ids[::-1][:5], (query, out)
