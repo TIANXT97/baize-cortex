@@ -47,6 +47,7 @@ class BaizeTools:
             args["new_decision"],
             args.get("superseded_plan"),
             args.get("killed_reason"),
+            source="mcp:update_decision",
         )
 
     def scratchpad_log(self, args: Dict[str, Any]):

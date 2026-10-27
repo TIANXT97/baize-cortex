@@ -36,6 +36,25 @@ CREATE TABLE IF NOT EXISTS living_states (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Issue #78: 活体卡历史 —— 每次卡片内容变化前存一份旧快照(只增不删),支撑回滚。
+-- 纯新增表:旧库启动时由 CREATE TABLE IF NOT EXISTS 自动补上,不改任何已有表;旧版本代码不认识它也照常运行。
+CREATE TABLE IF NOT EXISTS living_state_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id TEXT NOT NULL,
+    version INTEGER NOT NULL,            -- 被替换前的卡片版本号
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    current_decision TEXT NOT NULL,
+    metadata_json TEXT DEFAULT '{}',
+    tombstones_json TEXT DEFAULT '[]',
+    entity_updated_at TIMESTAMP,         -- 该版本在卡片上的原 updated_at
+    recorded_at TIMESTAMP NOT NULL,      -- 写入历史的 UTC 时间
+    source TEXT NOT NULL,                -- 改动来源: consolidation / api:decision / mcp:update_decision / admin:visibility / seed / rollback ...
+    note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_living_state_history_entity ON living_state_history(entity_id, id);
+
 -- ============================================================================
 -- Layer 2: 双时态实体拓扑图 (Bi-temporal Graph)
 -- 实体节点与带有现实有效时态、系统认知时态的有向加权关系网

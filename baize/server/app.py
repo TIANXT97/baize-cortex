@@ -120,6 +120,13 @@ class RecallIn(BaseModel):
     scope: Optional[str] = None
 
 
+class RollbackIn(BaseModel):
+    entity_id: str
+    to_version: Optional[int] = None
+    history_id: Optional[int] = None
+    dry_run: bool = True
+
+
 class ExpireIn(BaseModel):
     ids: List[int] = []
     session_ids: List[str] = []
@@ -325,7 +332,16 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
                 body.superseded_plan,
                 body.killed_reason,
                 body.metadata,
+                source="api:decision",
             )
+
+    @app.get("/v1/living-state/{entity_id}/history")
+    def living_state_history(entity_id: str, request: Request, limit: int = 50):
+        authenticate(request)
+        with lock:
+            if app.state.living.get_state(entity_id) is None:
+                raise HTTPException(status_code=404, detail="living state not found")
+            return {"entity_id": entity_id, "history": app.state.living.history(entity_id, min(max(limit, 1), 200))}
 
     @app.post("/v1/graph/node")
     def graph_node(body: GraphNodeIn, request: Request):
@@ -371,11 +387,8 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
     @app.post("/v1/sleep/consolidate")
     def sleep_consolidate(body: SleepIn, request: Request):
         authenticate(request)
-        if body.dry_run:
-            return {"status": "dry_run", "archived_logs": 0, "updated_states": [], "archive_file": None}
         with lock:
-            report = app.state.consolidator.run_consolidation(body.target_date)
-        return report
+            return app.state.consolidator.run_consolidation(body.target_date, dry_run=body.dry_run)
 
     @app.post("/v1/recall")
     def recall(body: RecallIn, request: Request):
@@ -436,6 +449,19 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         return {
             "entity_id": body.entity_id, "before": before, "after": body.visibility, "dry_run": body.dry_run,
         }
+
+    @app.post("/v1/admin/living-state/rollback")
+    def admin_rollback_living_state(body: RollbackIn, request: Request):
+        authenticate(request)
+        with lock:
+            try:
+                return app.state.living.rollback(
+                    body.entity_id, body.to_version, body.history_id, body.dry_run, source="rollback"
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
 
     @app.post("/v1/admin/expire-scratchpad")
     def admin_expire_scratchpad(body: ExpireIn, request: Request):
