@@ -13,6 +13,7 @@ from baize.core.consolidator import DreamConsolidator
 from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import ScratchpadManager
 from baize.core.temporal_graph import BiTemporalGraphManager
+from baize.intelligence.phase_detector import llm_client_from_env
 from baize.intelligence.ppr_engine import PPREngine
 from baize.intelligence.recall_router import CognitiveRecallRouter
 from baize.storage.db import init_db
@@ -23,8 +24,9 @@ SERVER_VERSION = "2.0.0-alpha"
 
 
 class BaizeTools:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, llm_client: Optional[Any] = None):
         self.conn = conn
+        self.llm_client = llm_client
         self.living = LivingStateManager(conn)
         self.scratchpad = ScratchpadManager(conn)
         self.graph = BiTemporalGraphManager(conn)
@@ -61,9 +63,10 @@ class BaizeTools:
         return [{"node_id": node, "energy": score} for node, score in energy.items()]
 
     def consolidate_sleep(self, args: Dict[str, Any]):
-        return DreamConsolidator(self.conn, archive_dir=args.get("archive_dir", "cold_archive")).run_consolidation(
-            args.get("target_date")
+        consolidator = DreamConsolidator(
+            self.conn, archive_dir=args.get("archive_dir", "cold_archive"), llm_client=self.llm_client
         )
+        return consolidator.run_consolidation(args.get("target_date"))
 
 
 def _schema(properties: Dict[str, Any], required: list) -> Dict[str, Any]:
@@ -185,7 +188,7 @@ def handle_message(msg: Any, tools: BaizeTools) -> Optional[Dict[str, Any]]:
 
 def serve(db_path: str, stdin: TextIO, stdout: TextIO) -> None:
     conn = init_db(db_path)
-    tools = BaizeTools(conn)
+    tools = BaizeTools(conn, llm_client=llm_client_from_env())
     try:
         for line in stdin:
             line = line.strip()

@@ -117,6 +117,14 @@ def llm_settings_from_env() -> Optional[Tuple[str, str, str]]:
         return None
     return url, key, os.environ.get("CORTEX_REASONING_MODEL", "cbcn/deepseek-v4.1-flash")
 
+def llm_client_from_env() -> Optional["OpenAICompatClient"]:
+    """Issue #83:HTTP、命令行、MCP 三个整理入口共用的 System 2 配置来源;未配置返回 None(走规则折叠)。"""
+    settings = llm_settings_from_env()
+    if settings is None:
+        return None
+    url, key, model = settings
+    return OpenAICompatClient(url, key, model)
+
 
 class PhaseDetector:
     def __init__(

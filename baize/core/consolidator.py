@@ -22,6 +22,7 @@ from baize.core.scratchpad import (
 )
 from baize.core.temporal_graph import BiTemporalGraphManager, plan_node_id
 from baize.intelligence.batch_judge import BatchJudgeRunner
+from baize.intelligence.phase_detector import llm_client_from_env
 from baize.storage.db import init_db
 
 logger = logging.getLogger("baize.consolidator")
@@ -590,7 +591,8 @@ def main() -> None:
     args = parser.parse_args()
     conn = init_db(args.db)
     try:
-        report = DreamConsolidator(conn, archive_dir=args.archive_dir).run_consolidation(args.date)
+        consolidator = DreamConsolidator(conn, archive_dir=args.archive_dir, llm_client=llm_client_from_env())
+        report = consolidator.run_consolidation(args.date)
         print(json.dumps(report, ensure_ascii=False))
     finally:
         conn.close()

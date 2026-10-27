@@ -25,7 +25,7 @@ from baize.core.scratchpad import (
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.core.seeds import seed_initial_assets
 from baize.core.visibility import VISIBILITY_GROUP_OK, VISIBILITY_PRIVATE, visibility_of
-from baize.intelligence.phase_detector import OpenAICompatClient, llm_settings_from_env
+from baize.intelligence.phase_detector import llm_client_from_env
 from baize.intelligence.ppr_engine import PPREngine
 from baize.intelligence.recall_router import CognitiveRecallRouter
 from baize.storage.db import init_db
@@ -48,6 +48,11 @@ def _load_agent_tokens() -> Dict[str, str]:
         if sep and token and agent:
             tokens[token] = agent
     return tokens
+
+
+def admin_seed_allowed() -> bool:
+    """Issue #83:seed 会覆盖预置卡的现有内容,默认拒绝;只有显式开关为 1/true/on(忽略大小写与空白)才放行。"""
+    return os.environ.get("CORTEX_ALLOW_ADMIN_SEED", "").strip().lower() in ("1", "true", "on")
 
 
 def _graph_time() -> str:
@@ -170,12 +175,7 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         app.state.scratchpad = ScratchpadManager(conn)
         app.state.living = LivingStateManager(conn)
         app.state.graph = BiTemporalGraphManager(conn)
-        settings = llm_settings_from_env()
-        llm_client = None
-        if settings is not None:
-            url, key, reasoning_model = settings
-            llm_client = OpenAICompatClient(url, key, reasoning_model)
-        app.state.consolidator = DreamConsolidator(conn, archive_dir=archive_dir, llm_client=llm_client)
+        app.state.consolidator = DreamConsolidator(conn, archive_dir=archive_dir, llm_client=llm_client_from_env())
         app.state.router = CognitiveRecallRouter(conn, ppr)
         try:
             yield
@@ -479,6 +479,11 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
     @app.post("/v1/admin/seed")
     def admin_seed(request: Request):
         authenticate(request)
+        if not admin_seed_allowed():
+            raise HTTPException(
+                status_code=403,
+                detail="admin/seed 默认关闭:它会把预置示例卡重置为初始内容。确需调用时设置 CORTEX_ALLOW_ADMIN_SEED=1 后重启服务",
+            )
         with lock:
             seed_initial_assets(app.state.conn)
         return {"status": "seeded"}
