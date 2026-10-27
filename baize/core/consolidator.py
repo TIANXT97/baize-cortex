@@ -6,7 +6,6 @@ candidate 候选经 System 2 二次核实后并入 facts,严禁参与定案改�
 """
 import argparse
 import gzip
-import hashlib
 import json
 import logging
 import os
@@ -21,7 +20,7 @@ from baize.core.scratchpad import (
     CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT, EXPLICIT_HINT, ScratchpadManager,
     batch_judge_enabled,
 )
-from baize.core.temporal_graph import BiTemporalGraphManager
+from baize.core.temporal_graph import BiTemporalGraphManager, plan_node_id
 from baize.intelligence.batch_judge import BatchJudgeRunner
 from baize.storage.db import init_db
 
@@ -106,9 +105,34 @@ def _union(*groups: List[str]) -> List[str]:
     return list(seen)
 
 
-def _plan_node_id(entity_id: str, decision: str) -> str:
-    digest = hashlib.sha1(f"{entity_id}|{decision}".encode("utf-8")).hexdigest()[:12]
-    return f"plan:{digest}"
+def _squash(text: Optional[str]) -> str:
+    return " ".join((text or "").split())
+
+def _describe_change(plan: Dict[str, Any], before: Optional[Dict[str, Any]], after: Dict[str, Any]) -> Dict[str, Any]:
+    """Issue #78:一次卡片回写的变更说明(dry_run 预览与真实执行同口径)。"""
+    if before is None:
+        kind = "new_card"
+    elif plan["decision"] is None:
+        kind = "facts_or_aliases_only"
+    elif _squash(plan["decision"]) != _squash(before["current_decision"]):
+        kind = "decision_replaced"
+    else:
+        kind = "decision_unchanged"
+    def count(state: Optional[Dict[str, Any]], key: str) -> int:
+        value = state["metadata"].get(key) if state else None
+        return len(value) if isinstance(value, list) else 0
+    return {
+        "entity_id": after["entity_id"],
+        "change": kind,
+        "version_from": before["version"] if before else None,
+        "version_to": after["version"],
+        "decision_from": before["current_decision"] if before else None,
+        "decision_to": after["current_decision"],
+        "tombstones_added": after["tombstones"][len(before["tombstones"]) if before else 0:],
+        "facts_added": count(after, "facts") - count(before, "facts"),
+        "aliases_added": count(after, "aliases") - count(before, "aliases"),
+        "folded_log_ids": [log["id"] for log in plan["logs"]],
+    }
 
 
 def _open_unique_archive(archive_dir: str, prefix: str) -> Tuple[str, Any]:
@@ -134,8 +158,9 @@ class DreamConsolidator:
         self.living = LivingStateManager(conn)
         self.graph = BiTemporalGraphManager(conn)
 
-    def run_consolidation(self, target_date: Optional[str] = None) -> Dict[str, Any]:
-        judge_report = self._batch_judge_step()
+    def run_consolidation(self, target_date: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
+        # Issue #78:dry_run 真跑分析与回写,读出结果后整体回滚;不跑批量判研(会写库)、不写冷归档
+        judge_report = {"status": "skipped_dry_run"} if dry_run else self._batch_judge_step()
         phase_logs = self.scratchpad.export_pending_phase_logs(target_date)
         explicit_logs = [log for log in phase_logs if log["phase_hint"] == EXPLICIT_HINT]
         candidate_logs = [log for log in phase_logs if log["phase_hint"] == CANDIDATE_HINT]
@@ -148,10 +173,25 @@ class DreamConsolidator:
         candidates = self._merge_candidates(plans, candidate_logs)
         folded = [log for plan in plans for log in plan["logs"]]
         if not folded and not candidates["rejected"]:
-            return {
+            report = {
                 "status": "ok", "archived_logs": 0, "updated_states": [],
                 "archive_file": None, "skipped_explicit": skipped,
                 "batch_judge": judge_report, "candidates": candidates,
+            }
+            if dry_run:
+                report.update(
+                    status="dry_run", dry_run=True, would_archive_logs=0, would_update_states=[], changes=[]
+                )
+            return report
+        if dry_run:
+            changes: List[Dict[str, Any]] = []
+            would_update = self._apply(plans, candidates["rejected"], changes=changes, dry_run=True)
+            return {
+                "status": "dry_run", "dry_run": True,
+                "archived_logs": 0, "updated_states": [], "archive_file": None,
+                "would_archive_logs": len(folded) + len(candidates["rejected"]),
+                "would_update_states": would_update, "changes": changes,
+                "skipped_explicit": skipped, "batch_judge": judge_report, "candidates": candidates,
             }
         archive_file = self._write_archive(
             folded + candidates["rejected"], f"scratchpad_{target_date or 'all'}"
@@ -439,7 +479,13 @@ class DreamConsolidator:
             os.fsync(raw.fileno())
         return path
 
-    def _apply(self, plans: List[Dict[str, Any]], rejected_logs: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    def _apply(
+        self,
+        plans: List[Dict[str, Any]],
+        rejected_logs: Optional[List[Dict[str, Any]]] = None,
+        changes: Optional[List[Dict[str, Any]]] = None,
+        dry_run: bool = False,
+    ) -> List[str]:
         updated: List[str] = []
         now = self._now()
         self.conn.execute("BEGIN IMMEDIATE")
@@ -458,23 +504,28 @@ class DreamConsolidator:
                 if facts:
                     metadata["facts"] = facts
 
+                source_ids = [log["id"] for log in plan["logs"]]
                 if decision is None:
-                    self.living.update_decision(
+                    after = self.living.update_decision(
                         entity_id,
                         display,
                         current["current_decision"] if current else "",
                         metadata=metadata or None,
                         commit=False,
+                        source="consolidation",
+                        source_log_ids=source_ids,
                     )
+                    if changes is not None:
+                        changes.append(_describe_change(plan, current, after))
                     updated.append(entity_id)
                     continue
 
-                plan_id = _plan_node_id(entity_id, decision)
+                plan_id = plan_node_id(entity_id, decision)
 
                 self.graph.upsert_node(entity_id, display, "project", commit=False)
                 self.graph.upsert_node(plan_id, decision, "rule", commit=False)
                 self._retire_plan_edges(entity_id, plan_id, now)
-                self.living.update_decision(
+                after = self.living.update_decision(
                     entity_id,
                     display,
                     decision,
@@ -482,7 +533,11 @@ class DreamConsolidator:
                     killed_reason="睡眠合成:被新定案取代" if plan["superseded"] else None,
                     metadata=metadata or None,
                     commit=False,
+                    source="consolidation",
+                    source_log_ids=source_ids,
                 )
+                if changes is not None:
+                    changes.append(_describe_change(plan, current, after))
                 if not self._has_active_decision_edge(entity_id, plan_id):
                     self.graph.add_edge(entity_id, plan_id, "decided_as", valid_at=now, commit=False)
                 updated.append(entity_id)
@@ -493,7 +548,10 @@ class DreamConsolidator:
                 chunk = folded_ids[start:start + _DELETE_CHUNK]
                 placeholders = ",".join("?" * len(chunk))
                 self.conn.execute(f"DELETE FROM scratchpad_log WHERE id IN ({placeholders})", chunk)
-            self.conn.commit()
+            if dry_run:
+                self.conn.rollback()
+            else:
+                self.conn.commit()
         except Exception:
             self.conn.rollback()
             raise

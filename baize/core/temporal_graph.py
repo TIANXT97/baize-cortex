@@ -3,9 +3,16 @@
 负责实体节点写入、带时间戳关系的建立、失效标记与有效子图导出。
 """
 from __future__ import annotations
+import hashlib
 import json
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def plan_node_id(entity_id: str, decision: str) -> str:
+    """定案方案节点 ID:sha1(实体|定案文本) 前 12 位。哈希口径不可改,否则已有的 decided_as 边会失联。"""
+    digest = hashlib.sha1(f"{entity_id}|{decision}".encode("utf-8")).hexdigest()[:12]
+    return f"plan:{digest}"
 
 
 class BiTemporalGraphManager:

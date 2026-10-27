@@ -22,9 +22,16 @@ def seed_initial_assets(conn: sqlite3.Connection) -> None:
         "killed_reason": "资料增至1500张,人工标注成本爆炸且易错",
     }]
     metadata = {"aliases": ["模具知识库", "玻璃模具"]}
-    existing = LivingStateManager(conn).get_state(PROJ_ID)
+    living = LivingStateManager(conn)
+    existing = living.get_state(PROJ_ID)
     if existing and VISIBILITY_KEY in existing["metadata"]:
         metadata[VISIBILITY_KEY] = existing["metadata"][VISIBILITY_KEY]
+    seeded_decision = "整页切片 + 飞桨描述强耦合 + 飞书折叠抽屉按需出图"
+    seeded = ("玻璃与模具工程知识库", seeded_decision, metadata, tombstones)
+    if existing and (
+        existing["display_name"], existing["current_decision"], existing["metadata"], existing["tombstones"]
+    ) != seeded:
+        living.snapshot(PROJ_ID, "seed")
     conn.execute(
         """
         INSERT INTO living_states (entity_id, display_name, version, status, current_decision, metadata_json, tombstones_json, updated_at)
@@ -41,7 +48,7 @@ def seed_initial_assets(conn: sqlite3.Connection) -> None:
         (
             PROJ_ID,
             "玻璃与模具工程知识库",
-            "整页切片 + 飞桨描述强耦合 + 飞书折叠抽屉按需出图",
+            seeded_decision,
             json.dumps(metadata, ensure_ascii=False),
             json.dumps(tombstones, ensure_ascii=False),
         ),
