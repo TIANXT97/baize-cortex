@@ -387,8 +387,8 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
     @app.post("/v1/sleep/consolidate")
     def sleep_consolidate(body: SleepIn, request: Request):
         authenticate(request)
-        with lock:
-            return app.state.consolidator.run_consolidation(body.target_date, dry_run=body.dry_run)
+        # Issue #87:不再整段持有全局锁;整理自己只在读写数据库时短暂拿锁,调模型时不拿
+        return app.state.consolidator.run_consolidation(body.target_date, dry_run=body.dry_run, lock=lock)
 
     @app.post("/v1/recall")
     def recall(body: RecallIn, request: Request):

@@ -6,7 +6,8 @@
 """
 import json
 import math
-from typing import Any, Dict, List
+from contextlib import nullcontext
+from typing import Any, Dict, List, Optional
 
 from baize.core.scratchpad import CANDIDATE_DECISION, CANDIDATE_FACT, ScratchpadManager
 from baize.intelligence.phase_detector import PHASE_CATEGORY
@@ -66,15 +67,23 @@ class BatchJudgeRunner:
         llm_client: Any,
         batch_size: int = BATCH_SIZE,
         max_retry: int = MAX_RETRY,
+        lock: Optional[Any] = None,
     ):
         self.conn = conn
+        # Issue #87:共享连接的全局锁;只在读写数据库时持有,调模型时不持有
+        self.lock = lock
         self.llm_client = llm_client
         self.batch_size = batch_size
         self.max_retry = max_retry
         self.scratchpad = ScratchpadManager(conn)
 
+    def _guard(self) -> Any:
+        return self.lock if self.lock is not None else nullcontext()
+
     def run(self) -> Dict[str, Any]:
-        rows = self.scratchpad.fetch_pending_judgement(max_retry=self.max_retry)
+        """每批:锁内无,锁外调模型,锁内只对「仍是待判状态」的行写回(整理期间被软删除或已打标的行跳过)。"""
+        with self._guard():
+            rows = self.scratchpad.fetch_pending_judgement(max_retry=self.max_retry)
         report: Dict[str, Any] = {
             "batches": 0, "judged": 0, "approved": 0, "rejected": 0,
             "candidates": 0, "plain": 0, "failed_batches": 0,
@@ -85,12 +94,27 @@ class BatchJudgeRunner:
                 verdicts = self._judge_batch(batch)
             except Exception:
                 report["failed_batches"] += 1
-                self.scratchpad.mark_judge_retry([r["id"] for r in batch], self.max_retry)
-                self.conn.commit()
+                with self._guard():
+                    self.scratchpad.mark_judge_retry(self._still_pending([r["id"] for r in batch]), self.max_retry)
+                    self.conn.commit()
                 continue
-            self._apply(batch, verdicts, report)
-            self.conn.commit()
+            with self._guard():
+                pending = set(self._still_pending([row["id"] for row in batch]))
+                pairs = [(row, verdict) for row, verdict in zip(batch, verdicts) if row["id"] in pending]
+                self._apply([p[0] for p in pairs], [p[1] for p in pairs], report)
+                self.conn.commit()
         return report
+
+    def _still_pending(self, ids: List[int]) -> List[int]:
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT id FROM scratchpad_log WHERE id IN ({placeholders}) "
+            "AND judge_status = 'pending' AND phase_hint IS NULL AND expired_at IS NULL",
+            ids,
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def _slice(self, rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         # 按会话分组、组内时间正序,批次不跨会话(缓解批次锚定效应)
