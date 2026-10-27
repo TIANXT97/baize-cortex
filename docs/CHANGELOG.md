@@ -2,6 +2,25 @@
 
 按合并时间倒序记录。每个功能 PR 合并后，补一个 `docs/*` 分支同步本文件、`README.md` 与 `docs/ARCHITECTURE.md`，同样走 PR 合并。
 
+## 2026-10-27
+
+### 修复：群聊记忆闸改为显式 chat_type + 卡片可见性（PR #73，Closes #72）
+- **现象**：旧闸靠 `session_id` 含 `:group:` 或以 `oc_` 开头判断，而网关实际传入的 session_id 形如 `YYYYMMDD_HHMMSS_xxxxxxxx`，闸从未触发（网关日志里一次拦截记录都没有）。10-25 的一次群聊请求把私人活体卡、`general_decisions` 事实与未固化草稿一并注入了群对话。`/v1/recall` 各层也没有可见性概念，服务端无法区分私人卡与群可见卡。
+- **规则（用户拍板：私人信息不泄露即可，其余不设限）**：
+  - 只认 Hermes 传入的显式 `chat_type`，插件按 `session_id` 登记。只有 `dm` / `p2p` / `private` / `direct` 算私聊；`group`、`forum`、空值、缺失、未知值、session_id 查不到映射，一律按群聊（fail-closed），不再从 session_id 字符串猜。
+  - 卡片可见性写在 `living_states.metadata_json` 的 `visibility` 键，只有显式 `group_ok` 才算群可见，缺省即私人，无需迁移。
+  - 群聊下不注入：卡片 `facts` 与墓碑、草稿流（provisional / candidate / explicit 兜底）、最近对话层、PPR 排名与种子节点。`facts` 由夜间整理从任意会话折叠而来，即使卡标了群可见也无法证明每条都安全。
+- **服务端**：`/v1/recall` 新增可选入参 `scope`。缺省（旧客户端）行为不变；`dm` 走全量并回显 `scope: "dm"`；其他任何值走群聊视图并回显 `scope: "group"` 与 `withheld_entity_ids`（命中但被拦截的私人卡 id，不含内容），同时写 WARNING 日志（logger `baize.recall`）。
+- **客户端**：`baize/client/plugin.py` 新增 `SessionScopes`、`CortexClient.bind_session` / `recall_scoped`，`prefetch` 改走 `recall_scoped`，删除旧的 `:group:` 判断。群聊下若服务端未回显 `scope=group`（旧服务端），本轮什么都不注入；收到回显后客户端再按白名单过滤一遍（丢弃草稿与非 `group_ok` 的卡）。会话切换时仅 `compression` / `new_session` 继承父会话的 chat_type，`resume` 不继承（可能换到别的聊天）。每次拦截写日志：`chat_type` 原值、放行与拦截的数量、被拦 `entity_id`，不写卡片内容。
+- **管理端点**：新增 `POST /v1/admin/living-state/visibility`（鉴权、默认 `dry_run`），只改 `metadata.visibility`，不动版本、定案与 `updated_at`。夜间整理与后续 decision 写入合并 metadata 时保留该键；`seed_initial_assets` 重新写入时同样保留已有的 `visibility`。
+- **默认状态**：合并后所有现有卡缺省为私人，群聊什么都不注入。哪些卡标为群可见由用户另行决定。
+- **测试**：新增 `test_issue72_group_memory_gate`（12 例：chat_type 判定矩阵、服务端群聊视图过滤、PPR 与最近对话层不外泄、网关真实 session_id 格式下的客户端矩阵、旧服务端无回显、服务端异常时的客户端二次过滤、会话切换继承、可见性端点、夜间整理与 seed 后保留、事故形态重放）；`test_prefetch_contract_and_fusion` 给 dm 用例显式登记 chat_type；`test_phase_a_auth_coverage` 补新端点。Linux、Python 3.12 下全量 31 个测试文件通过。
+- **重放**：用生产库只读副本与 staged 插件重放 10-25 事故请求，群聊注入 0 行并有拦截日志，同样的问题按 dm 仍可召回。
+- **部署顺序硬约束**：先部署仓库并重启 `baize-cortex.service`，后部署线上插件。新插件依赖仓库新增的 `SessionScopes`，反序会 import 失败，私聊也没有记忆；仓库先上而服务端未重启时，群聊 fail-closed 不注入，私聊不变。线上插件文件不在本仓库，随部署通道单独同步。
+- **未覆盖**：MCP `baize_recall` 与 `GET /v1/living-states*` 未做 scope 控制；群聊 `sync_turn` 写入草稿流、再被批量判研或夜间整理固化的反向路径另行评估。群聊会话在生产热表里留有历史草稿行，其中处于 `judge_status='pending'` 的行在打开 `CORTEX_BATCH_JUDGE` 前需要决定如何处理。
+
+## 2026-10-26
+
 ### Issue #64 PR 2：System 2 判研提示词定案与事实边界对齐（PR #68，Refs #64）
 - 微创优化 `baize/intelligence/batch_judge.py` 中的 `_SYSTEM_PROMPT`。
 - 吸收 NAS 黄金标注口径，清晰界定全局正式裁决与一次性运维指令、简单确认、状态播报、技术排查的 phase 语义边界。
