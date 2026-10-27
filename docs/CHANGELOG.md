@@ -4,6 +4,20 @@
 
 ## 2026-10-27
 
+### 新增：白天判定器默认只记日志（CORTEX_DAY_JUDGE）与测试数据软清理（PR #76，Closes #75）
+- **背景**：白天插件的 PhaseDetector 给用户的话打 `phase_hint`，经 `POST /v1/scratchpad/log` 直接写入草稿流，夜间整理会把 approval 折叠进活体卡定案。判定器准确率没有验证过，approval / rejection 又能直接改写定案，所以先让它默认不进正式记忆。
+- **开关**：服务端环境变量 `CORTEX_DAY_JUDGE`，只有等于 `apply`（忽略大小写与首尾空白）才保留白天的 approval / rejection，其他取值与未设置一律 `log_only`。开关在服务端生效，不依赖 Hermes 网关的环境变量。
+- **`log_only` 的行为**：`/v1/scratchpad/log` 把 approval / rejection 降为普通行（`phase_hint` 置空），原判定写入 `reason` 列（`day_judge:approval` / `day_judge:rejection`），`noul_score` 照存，不改 schema。普通行白天兜底（最近对话层）查得到，夜间整理不处理，也能进评测样本。`apply` 下行为与此前一致。
+- **candidate 照常写入（方案 A）**：approval / rejection 能直接改写定案；candidate 是隔离通道（召回带「未核实」标注，夜间由 System 2 核实，不碰 `current_decision`，不写 `decided_as` 边）。代价：核实通过的 candidate 仍会进卡片 `facts`，所以这不算严格的「不影响任何正式记忆」。
+- **`/health`**：新增 `day_judge` 字段，回显当前模式，部署后可据此核对。
+- **夜间整理跳过已过期的定案 / 推翻行**：`run_consolidation` 分析前先剔除 `expired_at` 非空的行。此前只有 explicit 与 candidate 分支检查 `expired_at`，approval / rejection 分支不检查，光靠软删除挡不住已打标的行。
+- **软清理端点**：新增 `POST /v1/admin/expire-scratchpad`（鉴权、默认 `dry_run`）。入参 `ids`、`session_ids`、`dry_run`，至少提供一个，单次最多 200 个 id、50 个会话，超限 `422`。只设置 `expired_at` 与 `invalid_at`（与 `supersede` 同款），不改 `phase_hint`，不物理删除，重复执行幂等。响应含 `matched`、`to_expire`、`already_expired`、`ids`、`missing_ids`、`unmatched_sessions` 与 `sample`（id、会话、角色、标记、时间、前 40 字摘要）。
+- **已打标的旧记录**：开关只管新写入的行，旧行不自动改动；需要清掉的用上面的端点按 id 软删除。冷归档里的历史行不动。
+- **不动的路径**：`cortex_add` 与 MEMORY.md 镜像不经过判定器；MCP `baize_scratchpad_log` 的 `phase_hint` 由调用方 agent 显式传入，不属于白天判定器（有测试锁定）；夜间批量判研仍由 `CORTEX_BATCH_JUDGE` 单独控制。
+- **测试**：新增 `test_issue75_day_judge_log_only`（13 例：开关取值、`/health` 回显、默认降级与 candidate 不受影响、`apply` 行为不变、降级行被最近对话召回且不被折叠、MCP 路径不受影响、插件端到端、夜间整理跳过已过期行、清理端点 dry_run / 软删除 / 幂等 / 不物理删除、过期行不再召回、入参校验与上限、鉴权）；`test_phase3_consolidation`、`test_plugin_candidate_category` 两个依赖白天打标落库的用例显式设为 `apply`；`test_phase_a_auth_coverage` 补新端点。Linux、Python 3.12 下全量 32 个测试文件通过。
+- **生产执行**：先 `dry_run` 核对，再真实执行，共软删除 8 行（测试会话与定时任务文本的行），复查已无遗留。
+- **部署**：只需更新并重启 baize-cortex，不用动 Hermes 网关与线上插件。合并后默认即 `log_only`；要恢复旧行为，给服务设置 `CORTEX_DAY_JUDGE=apply`。
+
 ### 修复：群聊记忆闸改为显式 chat_type + 卡片可见性（PR #73，Closes #72）
 - **现象**：旧闸靠 `session_id` 含 `:group:` 或以 `oc_` 开头判断，而网关实际传入的 session_id 形如 `YYYYMMDD_HHMMSS_xxxxxxxx`，闸从未触发（网关日志里一次拦截记录都没有）。10-25 的一次群聊请求把私人活体卡、`general_decisions` 事实与未固化草稿一并注入了群对话。`/v1/recall` 各层也没有可见性概念，服务端无法区分私人卡与群可见卡。
 - **规则（用户拍板：私人信息不泄露即可，其余不设限）**：
@@ -58,7 +72,7 @@
 ## 2026-10-24
 
 ### 新增：candidate 候选流与夜间批量判研状态机（PR #54，Issue #44 PR4 / CTO 会诊红线 1+2，含美西五点反馈修订）
-- **红线 1（candidate 候选流）**：高 noul 事实（`noul>=0.8` 且 exploration/chitchat）与「疑似计划」（`decision_approved` 但 `confidence<0.9`——美西反例「下周打算把机房迁到新加坡」差点变定案）统一进 `candidate`；召回以 `CANDIDATE_UNVERIFIED` 通道降权透出（置信度 0.45，排在 explicit 之后、recent_turns 之前，注入文本带「candidate·未核实」标注）；慢波由 System 2 二次核实——通过并入 `metadata.facts`（携带 noul 溯源），否决归档清退计入报告；**严禁参与定案改写**：不写 `decided_as` 边、不进墓碑、不改写 `current_decision`。
+- **红线 1（candidate 候选流）**：高 noul 事实（`noul>=0.8` 且 exploration/chitchat）与「疑似计划」（`decision_approved` 但 `confidence<0.9`——美西反例「下月打算把测试环境迁到新机房」差点变定案）统一进 `candidate`；召回以 `CANDIDATE_UNVERIFIED` 通道降权透出（置信度 0.45，排在 explicit 之后、recent_turns 之前，注入文本带「candidate·未核实」标注）；慢波由 System 2 二次核实——通过并入 `metadata.facts`（携带 noul 溯源），否决归档清退计入报告；**严禁参与定案改写**：不写 `decided_as` 边、不进墓碑、不改写 `current_decision`。
 - **红线 2（批量判研状态机）**：`scratchpad_log` 增量迁移 `judge_status`/`retry_count`/`judge_source` 三列；历史双 NULL 行永不自动回填（防存量风暴）；`BatchJudgeRunner` 按会话切片 10 条/批（批不跨会话防锚定）、每条裁 300 字符、批次 ID/条数严格校验、失败重试上限 3 次入 `failed` 终态（不进任何召回层，可随 purge 清退）；approval/rejection 走 **`confidence>=0.9` 双门槛**（美西否决 noul 门槛：noul 与「是否定案」反相关，真定案 0.004~0.128，0/6 误杀）。
 - **总开关 `CORTEX_BATCH_JUDGE` 默认 off**：System 2 判相态准召未经标注样本验证前不自动跑；关闭时普通行 `judge_status` 保持 NULL（与历史同语义、可被默认 purge，防关闭期 pending 无限积压）。
 - **配套**：`phase_detector` 透出 `category.confidence`（缺失按 1.0 fail-open），`detect_phase_rich()` 四元组富返回、`detect_phase` 三元组签名不变（部署副本兼容）；purge 默认豁免扩展至 `pending` 行；`POST /v1/admin/backfill-judge` 一次性存量回填（必须显式时间窗，dry-run 默认，补 4 条历史漏判定案）。
@@ -84,11 +98,11 @@
 - **认账**：PR #45 按原单提议放宽的「单 2-gram 命中卡名/别名即放行」违反 CTO 会诊红线 3——卡名「白泽记忆」内嵌高频词「记忆」，任意一句闲聊都能把该卡以 score≈6 拽进召回。PR #45 的测试缺高频词负样本，属测试盲区。
 - **门槛回撤**：`qualifies` 撤销第三析取，回到两规则（原词命中 / ≥2 个不同 2-gram）；全词命中由 `LIVING_STATE_DIRECT` 的 name/alias 子串匹配承担，长句召回靠注册**具体别名**解决。
 - **别名库黑名单**：`_GENERIC_ALIAS_BLACKLIST`（记忆/方案/项目/系统/服务/配置/记录/问题/时间/数据/工具）精确匹配，过滤点在慢波 `_apply` 的别名并集处——新别名禁止入库，已入库的在该卡下次被慢波触碰时自动清洗，不误伤「时间机器」类长词。「卡片」未列入（Phase 6 既有夹具作合法别名、本域核心词），是否列入待 CTO 定夺。
-- **测试**：`test_recall_single_gram_gate` 重写为红线锁定（白泽记忆反例 `NO_MATCH`、正文单 gram 仍拦、双 gram 不变、具体别名「洋哥仓库」整词命中 #44 复现句走直达层、全名命中回归保护）；`test_phase6` 补黑名单用例。全量 25 套件通过。
-- **验收状态（美西实弹复核后修正，2026-10-24）**：**未验收通过——代码层面收益归零**。回撤后门槛与 `302d7cc` 基线一致，「全词命中走直达层」为既有能力而非新增；#44 复现句的通过依赖别名「洋哥仓库」，而生产库该卡实测 aliases 为 `['流式卡片', '飞书流式推送']`，**不含该别名**，复现句仍落 `RECENT_TURNS_CONTEXT`。本 PR 的实际交付是：撤销噪声放大器 + 别名黑名单防污染。复现句的修复待**别名数据回填**（运维动作：为存量卡补充具体别名，如给「流式卡片」补「洋哥仓库」）。
+- **测试**：`test_recall_single_gram_gate` 重写为红线锁定（白泽记忆反例 `NO_MATCH`、正文单 gram 仍拦、双 gram 不变、具体别名「示例仓库」整词命中 #44 复现句走直达层、全名命中回归保护）；`test_phase6` 补黑名单用例。全量 25 套件通过。
+- **验收状态（美西实弹复核后修正，2026-10-24）**：**未验收通过——代码层面收益归零**。回撤后门槛与 `302d7cc` 基线一致，「全词命中走直达层」为既有能力而非新增；#44 复现句的通过依赖别名「示例仓库」，而生产库该卡实测 aliases 为 `['流式卡片', '飞书流式推送']`，**不含该别名**，复现句仍落 `RECENT_TURNS_CONTEXT`。本 PR 的实际交付是：撤销噪声放大器 + 别名黑名单防污染。复现句的修复待**别名数据回填**（运维动作：为存量卡补充具体别名，如给「流式卡片」补「示例仓库」）。
 
 ### 修复：召回单 2-gram 命中卡名/别名即放行（PR #45，Issue #44 C 项）
-- **现象**：卡片就在库里，长句查不到——`recall('你现在用得卡片是洋哥仓库最新的吗')` 落到 `RECENT_TURNS_CONTEXT`，权威记忆被末级兜底抢占。根因：无标点中文整句只切出一个原词 token，句中唯一的卡名 2-gram（「卡片」→「流式卡片」）满足不了「≥2 个 2-gram」门槛，整卡被 `DECISION_TEXT_MATCH` 刷掉。
+- **现象**：卡片就在库里，长句查不到——`recall('当前使用的卡片是示例仓库的最新版吗')` 落到 `RECENT_TURNS_CONTEXT`，权威记忆被末级兜底抢占。根因：无标点中文整句只切出一个原词 token，句中唯一的卡名 2-gram（「卡片」→「流式卡片」）满足不了「≥2 个 2-gram」门槛，整卡被 `DECISION_TEXT_MATCH` 刷掉。
 - **修复**：`qualifies` 增加第三析取——单个 2-gram 命中 `display_name` 或 `alias` 即放行（卡名短且独特，单 gram 命中名字是强信号）；仅命中正文（decision/facts）的单 gram 仍拦，通用词噪声不放大。`LIVING_STATE_DIRECT` / PPR / 兜底路径零改动。
 - **测试**：新增 `test_recall_single_gram_gate.py`（4 例：复现句命中卡名、命中别名、正文单 gram 仍 `NO_MATCH`、双 gram 正文命中不变）。全量 25 套件通过，无策略漂移。
 - **未验证**：60 条真实提问重跑（权威命中率 ≥57% 且误召回不增加）待美西机 `cortex_rt_regression` 复验。
@@ -123,10 +137,10 @@
 - 豁免范围是所有 `phase_hint` 非空的记录，比工单列出的 `approval`、`explicit_addition` 多了 `rejection`：慢波合成读取的正是这些记录，`rejection` 是推翻旧方案的依据，删掉同样丢信息。
 - 报告新增 `include_pending_phase` 与 `protected_pending`，dry-run 即可看到被保护的条数。
 - 新增测试 `test_purge_protect_phase_hints.py`（6 条），其中一条验证默认归档之后 approval 仍能被下一次慢波合成固化；`test_purge_before_date.py` 中归档显式沉淀记录的用例改为显式打开开关。
-- 夭夭已在生产环境实测并完成部署。
+- NAS 侧维护者已在生产环境实测并完成部署。
 
 ### 新增：普通对话轮次末级召回层 RECENT_TURNS_CONTEXT（Issue #37）
-- **现象**：美西生产实测，老板 `/new` 开新会话后要求验收上一轮改动，分身手里没有任何上一轮上下文，只能回翻会话库。`scratchpad_log` 里当轮 user/assistant 行（id=197/198）都在，但 `/v1/recall` 对「重启开新会话了，你测吧」返回 `NO_MATCH`——**写入正常，召回结构性不通**。
+- **现象**：美西生产实测，老板 `/new` 开新会话后要求验收上一轮改动，分身手里没有任何上一轮上下文，只能回翻会话库。`scratchpad_log` 里当轮 user/assistant 行（id=197/198）都在，但 `/v1/recall` 对「新会话已开启，请继续测试」返回 `NO_MATCH`——**写入正常，召回结构性不通**。
 - **根因**：插件 `sync_turn` 只在文本含「定案/决定/确认/批准/同意」且 PhaseDetector 判 `decision_approved` 时才写 `phase_hint`，普通轮次恒为 `NULL`；而第 4 层兜底 `SCRATCHPAD_EXPLICIT_FALLBACK` 与固化器都只查 `phase_hint` 非空（`scratchpad.py:69`/`:161`），于是普通对话只写不读。
 - **修复**：`ScratchpadManager.search_recent_turns()` 绕过 `phase_hint` 语义，按 `role='user'` + `expired_at IS NULL` + 72 小时窗口 + token 命中取行，文本裁剪到 400 字符；`CognitiveRecallRouter` 在其后新增末级策略 `RECENT_TURNS_CONTEXT`（置信度 0.35，`provisional=True`，`authoritative=False`，最多 3 条），只在活体卡、PPR、决策文本、显式事实全部落空后触发。
 - **否决方案**：给普通轮次写 `phase_hint='turn'`。`phase_hint IS NOT NULL` 是固化器入队条件（`export_pending_phase_logs`），会把闲聊灌进 `living_states`。

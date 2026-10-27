@@ -94,11 +94,11 @@ def test_pure_filler_queries_do_not_trigger_recent_turns():
 
 
 def test_filler_phrase_does_not_drag_in_unrelated_history():
-    """老板口头禅「按你说的办」不得把只共享「你说」的无关旧对话拉进来（实测缺陷形态）。"""
+    """用户口头禅「按你说的办」不得把只共享「你说」的无关旧对话拉进来（实测缺陷形态）。"""
     with tempfile.TemporaryDirectory() as d:
         with TestClient(_app(d)) as tc:
-            _turn(tc, "我还没把你放群里呢，你说得铁律可以先给你自己打上")
-            _turn(tc, "本尊哪里已经有个现成的方案，就是懒加载")
+            _turn(tc, "这条规则还没有生效，你说得对，可以先在别处试用")
+            _turn(tc, "这边已经有个现成的方案，就是延迟加载")
             out = _recall(tc, "好，按你说的办")
             assert out["strategy"] != RECENT, out
 
@@ -107,7 +107,7 @@ def test_substantive_short_query_still_recalls():
     """收口不能把核心用例打死：一句口语化的实质 query 仍要接上上一轮。"""
     with tempfile.TemporaryDirectory() as d:
         with TestClient(_app(d)) as tc:
-            lid = _turn(tc, "继续吧，把工具懒加载做完。")
+            lid = _turn(tc, "继续吧，把日志整理做完。")
             out = _recall(tc, "继续测")
             assert out["strategy"] == RECENT, out
             assert out["source_log_ids"] == [lid], out

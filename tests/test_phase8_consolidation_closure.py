@@ -40,9 +40,9 @@ def test_upsert_promotes_blackbox_name_and_keeps_good_name():
         try:
             living = LivingStateManager(conn)
             living.update_decision("proj:g", "proj:g", "旧")
-            assert living.resolve_display_name("proj:g", "玻璃模具") == "玻璃模具"
-            living.update_decision("proj:g", "玻璃模具", "新")
-            assert living.resolve_display_name("proj:g", "别的名字") == "玻璃模具"
+            assert living.resolve_display_name("proj:g", "示例展示名") == "示例展示名"
+            living.update_decision("proj:g", "示例展示名", "新")
+            assert living.resolve_display_name("proj:g", "别的名字") == "示例展示名"
         finally:
             conn.close()
 

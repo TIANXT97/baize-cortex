@@ -53,7 +53,7 @@ python -m py_compile <改动的文件>
 1. 开工前:`git checkout main && git pull origin main`,再从 `main` 切出 `feature/*` 或 `docs/*` 分支。
 2. 自测全绿后推送分支(只走 SSH:`git@github.com:TIANXT97/baize-cortex.git`)并创建 PR。
 3. PR 描述必须贴出测试输出,并写 `Closes #<issue>`。
-4. 合并由审核方(夭夭)以 squash 方式完成,合并后同步本地 `main` 并删除本地功能分支。
+4. 合并由审核方以 squash 方式完成,合并后同步本地 `main` 并删除本地功能分支。
 5. 进度与问题在对应 issue 上回复,不在 PR 之外单独提问架构问题。
 
 ## 红线
@@ -61,7 +61,7 @@ python -m py_compile <改动的文件>
 - 不 `--force` 推送,不 `reset --hard` `main`。
 - 不把 token 写进 git remote URL。
 - 不恢复 ghproxy.net URL 重写。
-- 构建、容器重启、数据库迁移、NAS 部署由 NAS 侧(夭夭)负责,本仓库会话不执行。
+- 构建、容器重启、数据库迁移、NAS 部署由 NAS 侧维护者负责,本仓库会话不执行。
 
 ## 文档约定
 

@@ -82,7 +82,7 @@ def test_anchorless_fact_goes_to_general_and_never_pollutes_recent_entity():
         conn, sp, living, arc = _env(d)
         try:
             living.update_decision("proj:recent", "最近项目", "最近定案")
-            lid = _add(sp, "夭夭负责美西验收")
+            lid = _add(sp, "小明负责美西验收")
             report = DreamConsolidator(conn, archive_dir=arc).run_consolidation()
             assert report["updated_states"] == ["proj:general_decisions"], report
             recent = living.get_state("proj:recent")

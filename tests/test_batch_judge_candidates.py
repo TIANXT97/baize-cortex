@@ -73,11 +73,11 @@ def test_batch_judge_confidence_gates_and_candidate_channels():
             try:
                 sp = ScratchpadManager(conn)
                 ids = [
-                    sp.append_log("s1", "user", "确认同意,按方案A执行"),       # 高置信定案 → approval
-                    sp.append_log("s1", "user", "下周打算把机房迁到新加坡"),     # 弱信号计划 → candidate
-                    sp.append_log("s1", "user", "我的服务器IP是101.200.45.220"),  # 高 noul 事实 → candidate
+                    sp.append_log("s1", "user", "同意该方案,按计划执行"),       # 高置信定案 → approval
+                    sp.append_log("s1", "user", "下月打算把测试环境迁到新机房"),     # 弱信号计划 → candidate
+                    sp.append_log("s1", "user", "我的服务器IP是192.0.2.10"),  # 高 noul 事实 → candidate
                     sp.append_log("s1", "user", "今天天气不错"),                 # 闲聊 → 不打标
-                    sp.append_log("s2", "user", "不对,昨天那个结论记错了,作废"),  # 高置信推翻 → rejection
+                    sp.append_log("s2", "user", "不对,上次那个结论有误,作废"),  # 高置信推翻 → rejection
                 ]
             finally:
                 del os.environ["CORTEX_BATCH_JUDGE"]
@@ -103,9 +103,9 @@ def test_batch_judge_confidence_gates_and_candidate_channels():
             assert state[ids[3]][0] is None and state[ids[3]][1] == "done"
             # 批次不跨会话:两次调用分别是 s1 的 4 条与 s2 的 1 条
             assert json.loads(llm.calls[0][1]) == [
-                {"id": ids[0], "text": "确认同意,按方案A执行"},
-                {"id": ids[1], "text": "下周打算把机房迁到新加坡"},
-                {"id": ids[2], "text": "我的服务器IP是101.200.45.220"},
+                {"id": ids[0], "text": "同意该方案,按计划执行"},
+                {"id": ids[1], "text": "下月打算把测试环境迁到新机房"},
+                {"id": ids[2], "text": "我的服务器IP是192.0.2.10"},
                 {"id": ids[3], "text": "今天天气不错"},
             ]
         finally:
@@ -145,9 +145,9 @@ def test_consolidation_verifies_and_folds_candidates_without_supersede():
         try:
             LivingStateManager(conn).update_decision("proj:x", "X卡", "现役定案")
             sp = ScratchpadManager(conn)
-            good = sp.append_log("s", "user", "我的服务器IP是101.200.45.220")
+            good = sp.append_log("s", "user", "我的服务器IP是192.0.2.10")
             sp.mark_judged(good, "candidate", 0.98, "batch_judge")
-            bad = sp.append_log("s", "user", "下周打算把机房迁到新加坡")
+            bad = sp.append_log("s", "user", "下月打算把测试环境迁到新机房")
             sp.mark_judged(bad, "candidate", 0.36, "batch_judge")
             conn.commit()
 
@@ -160,7 +160,7 @@ def test_consolidation_verifies_and_folds_candidates_without_supersede():
             assert state["current_decision"] == "现役定案"
             assert state["version"] == 2  # facts-only 折叠算一次卡片更新,但不改写定案
             facts = state["metadata"]["facts"]
-            assert len(facts) == 1 and facts[0]["text"] == "我的服务器IP是101.200.45.220"
+            assert len(facts) == 1 and facts[0]["text"] == "我的服务器IP是192.0.2.10"
             assert abs(facts[0]["noul"] - 0.98) < 1e-9
             # 红线1:严禁参与定案改写——无 decided_as 新边、无墓碑
             assert conn.execute(
@@ -177,7 +177,7 @@ def test_consolidation_without_llm_leaves_candidates_skipped():
         conn, consolidator = _env(d, llm_client=None)
         try:
             sp = ScratchpadManager(conn)
-            row_id = sp.append_log("s", "user", "我的服务器IP是101.200.45.220")
+            row_id = sp.append_log("s", "user", "我的服务器IP是192.0.2.10")
             sp.mark_judged(row_id, "candidate", 0.98, "batch_judge")
             conn.commit()
             report = consolidator.run_consolidation()
@@ -263,7 +263,7 @@ def test_batch_judge_tags_candidate_kind():
             try:
                 sp = ScratchpadManager(conn)
                 weak_decision = sp.append_log("s", "user", "好,那就这样")
-                fact = sp.append_log("s", "user", "我的服务器IP是101.200.45.220")
+                fact = sp.append_log("s", "user", "我的服务器IP是192.0.2.10")
             finally:
                 del os.environ["CORTEX_BATCH_JUDGE"]
             llm = _QueueLLM(["[" + ",".join([
@@ -322,7 +322,7 @@ def test_candidate_reject_reasons_distinguish_kind():
             sp = ScratchpadManager(conn)
             fact = sp.append_log("s", "user", "我觉得服务器可能是两台")
             sp.mark_judged(fact, "candidate", 0.9, "batch_judge", category="fact")
-            plan = sp.append_log("s", "user", "下周打算把机房迁到新加坡")
+            plan = sp.append_log("s", "user", "下月打算把测试环境迁到新机房")
             sp.mark_judged(plan, "candidate", 0.36, "batch_judge", category="decision")
             conn.commit()
 
@@ -339,7 +339,7 @@ def test_candidate_recall_channel_is_lowest_authority_fallback():
         conn, _ = _env(d)
         try:
             sp = ScratchpadManager(conn)
-            cand = sp.append_log("s", "user", "我的服务器IP是101.200.45.220,5台4C8G")
+            cand = sp.append_log("s", "user", "我的服务器IP是192.0.2.10,5台4C8G")
             sp.mark_judged(cand, "candidate", 0.98, "batch_judge")
             router = CognitiveRecallRouter(conn)
             out = router.recall("服务器IP")
