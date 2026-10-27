@@ -208,7 +208,8 @@ def test_rename_display_and_seed_snapshot_only_on_real_change():
             assert living.history(PROJ_ID) == [], "首次 seed 是新建"
             seed_initial_assets(conn)
             assert living.history(PROJ_ID) == [], "内容没变的重复 seed 不写历史"
-            living.update_decision(PROJ_ID, "玻璃与模具工程知识库", "人为改过的定案", metadata={"aliases": ["模具知识库"]})
+            seeded_name = living.get_state(PROJ_ID)["display_name"]
+            living.update_decision(PROJ_ID, seeded_name, "人为改过的定案", metadata={"aliases": ["示例别名"]})
             seed_initial_assets(conn)
             assert [h["source"] for h in living.history(PROJ_ID)] == ["seed", "api"], "seed 覆盖前先存旧版本"
         finally:
