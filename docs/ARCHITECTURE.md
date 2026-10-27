@@ -52,6 +52,10 @@
 - **查询复杂度**：$O(1)$ 主键直连，直接旁路所有图检索与向量比对；
 - **展示名保护**：`display_name == entity_id` 视为“黑户”，慢波合成或 `POST /v1/admin/backfill-display-names` 可将其转正为自然语言名称；已有的良好名称不会被覆盖；
 - **可见性（Issue #72）**：`metadata.visibility == "group_ok"` 才表示该卡可以出现在群聊召回里，缺省即私人，无需迁移。`LivingStateManager.set_visibility` 只改该键，不动版本、定案与 `updated_at`；管理入口为 `POST /v1/admin/living-state/visibility`（见 §8.1）。夜间整理与 `update_decision` 合并 metadata 时保留该键，`seed_initial_assets` 重新写入时同样保留已有的值。群聊视图不返回卡片 `facts` 与墓碑（见 §3.2 末尾）；
+- **自动墓碑（Issue #78）**：`LivingStateManager.update_decision` 在新定案替换旧定案时给旧定案留一条墓碑，记在 `tombstones_json`。字段：`plan`（被取代的方案文本）、`killed_reason`、`version`（被替换的版本号）、`superseded_by`（新定案的前 200 字）、`at`（UTC，`YYYY-MM-DD HH:MM:SS`）、`source`（改动来源）、`source_log_ids`（仅夜间整理会带，折叠的草稿行 id，最多 20 个）。显式传入 `superseded_plan` 时按它留一条（`killed_reason` 缺省为「推翻更新」）；自动留的那一条 `killed_reason` 固定为「被新定案取代」，只在旧定案与新定案不同（规范化空白后）、且没有被显式墓碑覆盖时才留。「覆盖」指显式墓碑的文本与旧定案相等，或一方包含另一方且较短的至少 2 个字（`tombstone_covers`）。新建卡、旧定案为空、仅空白差异、定案没变（只改 facts / 别名 / 展示名）都不留；旧格式的墓碑（没有 `superseded_by` / `at` / `source` / `source_log_ids`）照常加载；
+- **墓碑与 `decided_as` 的关系**：两者各自独立。墓碑在卡片里记录文本和原因；`decided_as` 边在图谱里记录哪个方案节点是现行方案及其时态。夜间整理（以及回滚）为现行定案建方案节点（`plan_node_id`，即 `sha1(实体|定案文本)` 的前 12 位，该哈希口径不可改，否则已有的边会失联）并连 `decided_as` 边，同时把指向旧方案的现役边置为失效。通过 `POST /v1/living-state/decision` 或 MCP 直接改定案时只写卡片（留墓碑、存历史），不写图谱；
+- **卡片历史（Issue #78）**：每次卡片内容变化前，先把旧版本存进 `living_state_history`（§2.6），再改卡；
+- **回滚（Issue #78）**：`POST /v1/admin/living-state/rollback`（鉴权，`dry_run` 默认 `true`）把卡片恢复为某条历史快照。目标：缺省为最近一条内容与当前不同的快照（比较展示名、定案、metadata（忽略 `visibility`）、墓碑）；`to_version` 取该版本号最新的一条；`history_id` 精确指定；二者同时给返回 `422`，目标不存在 `404`。恢复展示名、定案、metadata、墓碑；版本号继续递增（当前版本 + 1），不复用；在 `BEGIN IMMEDIATE` 事务里先把回滚前的状态存一份历史（来源 `rollback`），所以回滚本身也能再回滚。内容与当前相同（响应 `changed: false`）时不落库、不涨版本。**可见性保留当前值**：`visibility` 是用户手动设定的访问控制而不是定案内容，按历史恢复会让一次回滚悄悄改变群聊可见范围，所以写回时用当前值（响应 `visibility_kept`）。图谱：只对已经有 `decided_as` 边的实体，把现役边同步到恢复后的定案（响应 `graph` 为 `would_sync` / `no_decided_as_edges` / `unchanged` / `synced`）。不碰草稿流和冷归档，不恢复 `status`；
 - **别名库**：`metadata.aliases` 增量取并集，永久保留；纯通用词（记忆/方案/项目/系统/服务/配置/记录/问题/时间/数据/工具）经黑名单**精确匹配**禁止入库，已入库的在该卡下次被慢波触碰时自动清洗，不误伤「时间机器」类长词（Issue #44 CTO 裁决，PR #47）。
 
 ### 2.3 Layer 2: 双时态实体拓扑图 (Bi-temporal Graph)
@@ -77,6 +81,7 @@
 - **整理专用互斥**：真实整理走进程内的非阻塞互斥（`DreamConsolidator` 实例上的 `threading.Lock`），拿不到就立即返回 HTTP 200 的 JSON：`status: "busy"`、`message`、`archived_logs: 0`、`updated_states: []`、`archive_file: null`、`skipped_explicit: []`、`batch_judge: {"status": "busy"}`、`candidates: {"verified": 0, "rejected": [], "skipped": []}`，不排队、不重复整理。互斥只在同一个服务进程内有效：MCP 每次调用新建 `DreamConsolidator`、命令行是独立进程，都不共用这把互斥，靠阶段三的复查保证不覆盖对方的改动，最坏情况是重复花一次模型调用。
 - **dry_run**：`dry_run=true` 不占用整理互斥（只读预览，不能挡住夜间任务），同样走三段式；阶段三在写事务里执行真实回写后整体回滚，不写库、不写冷归档、不跑批量判研（`batch_judge: {"status": "skipped_dry_run"}`）。阶段二仍会调用 System 2 做分析与核实，所以会产生模型调用。返回 `status: "dry_run"`、`dry_run: true`、`would_archive_logs`、`would_update_states`、`changes`。
 - **返回值字段（Issue #87 新增）**：`skipped_changed`——`list[object]`，仅在非空时出现（真实整理与 `dry_run` 都可能有），每项为 `{"entity_id": string, "reason": "card_changed" 或 "source_rows_changed"}`，表示该实体这一组复查未通过被整组跳过；`message`——`string`，仅在 `status` 为 `busy` 时出现；`status` 多一个取值 `busy`。原有字段（`status`、`archived_logs`、`updated_states`、`archive_file`、`skipped_explicit`、`batch_judge`、`candidates`，以及 `dry_run` 下的字段）的名称、类型和含义不变。
+- **dry_run 预览怎么做到不写库（Issue #78）**：预览与真实整理走同一段回写代码（`_apply`），所以墓碑和版本号与随后的真实执行一致；区别只在阶段三：预览在写事务里回写、收集变更后 `ROLLBACK`，不提交、不写冷归档、不跑批量判研。`changes` 每项：`entity_id`、`change`（`new_card` / `facts_or_aliases_only` / `decision_replaced` / `decision_unchanged`）、`version_from`、`version_to`、`decision_from`、`decision_to`、`tombstones_added`（本次会新增的墓碑列表）、`facts_added`、`aliases_added`、`folded_log_ids`（会被折叠的草稿行 id）。
 - **无锚点定案兜底（Phase 8）**：授权批准且不带 `proj:` 锚点的记录，依次归入同会话最近出现的实体、30 分钟内最近更新的 ACTIVE 实体，兜底为 `proj:general_decisions`，不再滞留热表。
 - **决策清洗**：定案文本去除半角 `:`、全角 `：` 与首尾空白。
 - **candidate 候选核实（Issue #44 PR4，红线 1）**：`phase_hint='candidate'` 的行（白天快速规则或夜间批量判产出——`noul>=0.8` 的事实类、或 `decision_approved` 但 `confidence<0.9` 的疑似计划）由 System 2 二次核实：通过则并入对应卡 `metadata.facts`（携带 noul 溯源），否决则归档清退并计入报告 `candidates.rejected`；全程不写 `decided_as` 边、不进墓碑、不改写 `current_decision`（**严禁参与定案冲突覆盖**）。召回侧以 `CANDIDATE_UNVERIFIED` 通道降权透出（见 §3.2）。无 System 2 时候选保留待下次并计入报告，不静默丢弃。
@@ -107,6 +112,26 @@
 **时间格式约定**：所有时间戳统一为 `YYYY-MM-DD HH:MM:SS`（UTC），与 SQLite `CURRENT_TIMESTAMP` 兼容。带 `T` 的 ISO 格式会破坏视图中 `valid_at <= datetime('now')` 的字符串比较，禁止使用。
 
 **回填来源**：`scratchpad_log` 与 `graph_edges` 用 `created_at`，`living_states` 没有该列，用 `updated_at`。
+
+### 2.6 卡片历史表 `living_state_history`（Issue #78）
+
+每次卡片内容变化前存一份旧快照，只增不删，支撑回滚。纯新增表：写在 `schema.sql` 里，`init_db` 每次启动执行 `CREATE TABLE IF NOT EXISTS`，旧库自动补建；不改任何已有表，旧版本代码不认识它也照常运行。
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `id` | INTEGER 主键自增 | 历史条目编号，回滚时可用 `history_id` 精确指定 |
+| `entity_id` | TEXT NOT NULL | 卡片实体 ID |
+| `version` | INTEGER NOT NULL | 被替换前的卡片版本号 |
+| `display_name` / `status` / `current_decision` | TEXT NOT NULL | 被替换前的展示名、状态、定案 |
+| `metadata_json` / `tombstones_json` | TEXT | 被替换前的 metadata 与墓碑 |
+| `entity_updated_at` | TIMESTAMP | 该版本在卡片上的原 `updated_at` |
+| `recorded_at` | TIMESTAMP NOT NULL | 写入历史的时间（UTC） |
+| `source` | TEXT NOT NULL | 取代该版本的那次改动的来源 |
+| `note` | TEXT | 备注，回滚时记录回滚到的快照编号 |
+
+索引 `idx_living_state_history_entity` 建在 `(entity_id, id)` 上。`source` 的取值：`consolidation`（夜间整理）、`api:decision`（`POST /v1/living-state/decision`）、`mcp:update_decision`（MCP）、`backfill_display_names`（黑户展示名转正）、`admin:visibility`（可见性修改，可见性没变不写）、`seed`（`seed_initial_assets`，仅当展示名 / 定案 / metadata / 墓碑任一项与预置值不同才存）、`rollback`（回滚）。召回命中计数（`hit_count`、`last_recalled_at`）不算内容变化，不写历史。新建卡没有旧版本，不写历史。
+
+注意：种子卡写入时版本号固定为 1，覆盖后历史里可能出现同一版本号的多条快照；按 `to_version` 回滚取的是该版本号最新的一条，需要精确指定时用 `history_id`。历史表没有保留与清理策略。读取接口 `GET /v1/living-state/{entity_id}/history`（见 §8.1）。
 
 ---
 
@@ -327,7 +352,7 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 | `/v1/cortex/add` | POST | 显式沉淀（幂等、可推翻旧记录） |
 | `/v1/living-states` | GET | 列出现役活体卡 |
 | `/v1/living-state/{entity_id}` | GET | 读取单张活体卡 |
-| `/v1/living-state/decision` | POST | 就地更新定案并写墓碑 |
+| `/v1/living-state/decision` | POST | 就地更新定案并写墓碑；定案被新定案替换时自动给旧定案留墓碑，写卡前先存历史快照（来源 `api:decision`，Issue #78）；不写图谱 |
 | `/v1/living-state/{entity_id}/history` | GET | 卡片历史快照，新的在前；`limit` 默认 50、上限 200；卡不存在 `404`（Issue #78） |
 | `/v1/graph/node` · `/v1/graph/edge` · `/v1/graph/invalidate` | POST | 图谱节点、边与失效 |
 | `/v1/graph/active-subgraph` | GET | 现役有效子图 |
@@ -339,7 +364,7 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 | `/v1/admin/expire-scratchpad` | POST | 草稿行软删除（Issue #75）：入参 `ids`、`session_ids`、`dry_run`（默认 `true`），至少提供一个，单次最多 200 个 id、50 个会话，超限 `422`。只设置 `expired_at` 与 `invalid_at`，不改 `phase_hint`、不物理删除，重复执行幂等；响应含 `matched`、`to_expire`、`already_expired`、`ids`、`missing_ids`、`unmatched_sessions`、`sample`。先用默认 `dry_run` 核对再带 `"dry_run": false` 落库 |
 | `/v1/admin/backfill-judge` | POST | 一次性存量判研回填（Issue #44 PR4）：必须显式 `after_date` / `before_date` 时间窗 + 条数上限，默认 `dry_run` 出清单，防止全量存量回填风暴 |
 | `/v1/admin/living-state/visibility` | POST | 设置活体卡群聊可见性（Issue #72）：入参 `entity_id`、`visibility`（`group_ok` 或 `private`）、`dry_run`（默认 `true`）。`group_ok` 写入 `metadata.visibility`，`private` 移除该键；不改版本、定案与 `updated_at`。非法取值 `422`，卡不存在 `404`；响应含 `before`、`after`、`dry_run`。先用默认 `dry_run` 确认 `before` / `after`，再带 `"dry_run": false` 落库 |
-| `/v1/admin/living-state/rollback` | POST | 把卡片回滚到历史快照：入参 `entity_id`，可选 `to_version` 或 `history_id`（二者不能同时给），`dry_run`（默认 `true`）；保留当前可见性，版本号继续递增，回滚前的状态先存一份历史；目标不存在 `404`，参数冲突 `422`（Issue #78） |
+| `/v1/admin/living-state/rollback` | POST | 把卡片回滚到历史快照：入参 `entity_id`，可选 `to_version` 或 `history_id`（二者不能同时给），`dry_run`（默认 `true`）；保留当前可见性，版本号继续递增，回滚前的状态先存一份历史；目标不存在 `404`，参数冲突 `422`（Issue #78）。响应：`entity_id`、`dry_run`、`changed`、`target`（`history_id`、`version`、`recorded_at`、`source`）、`from` / `to`（`version`、`display_name`、`current_decision`、`tombstones` 条数）、`visibility_kept`、`graph` |
 | `/v1/admin/seed` | POST | 把预置示例卡重置为初始内容（覆盖前内容有变化时存一份历史快照）。**默认返回 `403`**，环境变量 `CORTEX_ALLOW_ADMIN_SEED` 为 `1` / `true` / `on`（忽略大小写与首尾空白）才放行；先过 `authenticate()`，已配置 `CORTEX_AGENT_TOKENS` 时无凭据 `401`、错凭据 `403`（Issue #83） |
 
 全部 `/v1/*` 端点经 `authenticate()` 凭据校验（`/health` 除外）：未配置 `CORTEX_AGENT_TOKENS` 时放行并归属 `default`；配置后缺失凭据 `401`、凭据无效 `403`。PR #42 起覆盖全部端点，此前仅 `/v1/scratchpad/log`、`/v1/cortex/add`、`/v1/recall` 受保护。
@@ -354,4 +379,4 @@ Hermes 内置 `memory` 工具写入 `MEMORY.md` 有 2200 字符上限，超限�
 
 ## 9. 验证套件
 
-在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 36 个套件（含 Issue #64 新增的 test_issue64_judge_contracts 与 test_issue64_judge_eval），其中 Issue #83 新增 `test_issue83_seed_guard_and_system2_entries`（开关取值大小写与空白、默认 403 且不改库、开关打开后 200、配置 token 时 401 / 403 / 200、三个整理入口在同样环境变量下拿到相同的 System 2 配置、未配置时不报错并走规则折叠），Issue #84 新增 `test_issue84_plan_node_trace`（旧方案与现行方案原话追溯到现役卡、图检索解析不出时继续走兜底层、直达与 PPR 命中不受影响、群聊视图不返回私人卡、只认 `decided_as` 与现役卡），Issue #87 新增 `test_issue87_consolidate_out_of_lock`（整理中并发召回与写入、卡片被改时不覆盖、重复触发返回 `busy`、`dry_run` 不落库、异常时锁与互斥释放、批量判研不占锁），Issue #75 新增 `test_issue75_day_judge_log_only`（开关取值、`/health` 回显、默认降级与 candidate 不受影响、`apply` 行为不变、降级行被最近对话召回且不被折叠、MCP 路径不受影响、夜间整理跳过已过期行、清理端点 dry_run / 软删除 / 幂等 / 上限 / 鉴权），Issue #72 新增 `test_issue72_group_memory_gate`（chat_type 判定矩阵、服务端群聊视图过滤、PPR 与最近对话层不外泄、网关真实 session_id 格式下的客户端矩阵、旧服务端无回显不注入、服务端异常时的客户端二次过滤、会话切换继承、可见性端点、夜间整理与 seed 后保留、事故形态重放），其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 E 项新增 `test_phase_a_config_sediment`（沉淀五要素、脱敏零泄漏、None 标记、Outbox 重放、召回闭环），Issue #44 PR4 新增 `test_batch_judge_candidates`（状态机写入语义、confidence/noul 双门槛分流、切片与批次校验、重试 failed 终态、candidate 核实折叠与禁改写、开关三态、召回通道排序与未核实标注、purge 保护与回填窗口强制），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）；PR #49 在 `test_phase7_systemone_gates` 补鉴权熔断用例（401 熔断后跳过重试、TTL 到期恢复、5xx 不熔断）。PR #42 新增 `test_phase_a_auth_coverage`（`/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行，当前覆盖 17 项请求，含 Issue #72 的可见性端点、Issue #75 的清理端点与 Issue #78 的历史、回滚端点），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的八个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。
+在仓库根目录以 Python 3.12 运行，需设置 `PYTHONPATH=.`，每个文件均可 `python tests/xxx.py` 直接执行。当前共 36 个套件（含 Issue #64 新增的 test_issue64_judge_contracts 与 test_issue64_judge_eval），其中 Issue #78 新增 `test_issue78_tombstone_history_rollback`（14 例：缓存例子的墓碑、历史、`decided_as` 边与回滚往返，显式推翻不重复留，各写卡路径写历史并标来源，回滚保留当前可见性且不碰草稿流，回滚的错误码与鉴权，`dry_run` 逐表一致且不写冷归档，旧库自动补建历史表，旧格式墓碑照常加载），Issue #83 新增 `test_issue83_seed_guard_and_system2_entries`（开关取值大小写与空白、默认 403 且不改库、开关打开后 200、配置 token 时 401 / 403 / 200、三个整理入口在同样环境变量下拿到相同的 System 2 配置、未配置时不报错并走规则折叠），Issue #84 新增 `test_issue84_plan_node_trace`（旧方案与现行方案原话追溯到现役卡、图检索解析不出时继续走兜底层、直达与 PPR 命中不受影响、群聊视图不返回私人卡、只认 `decided_as` 与现役卡），Issue #87 新增 `test_issue87_consolidate_out_of_lock`（整理中并发召回与写入、卡片被改时不覆盖、重复触发返回 `busy`、`dry_run` 不落库、异常时锁与互斥释放、批量判研不占锁），Issue #75 新增 `test_issue75_day_judge_log_only`（开关取值、`/health` 回显、默认降级与 candidate 不受影响、`apply` 行为不变、降级行被最近对话召回且不被折叠、MCP 路径不受影响、夜间整理跳过已过期行、清理端点 dry_run / 软删除 / 幂等 / 上限 / 鉴权），Issue #72 新增 `test_issue72_group_memory_gate`（chat_type 判定矩阵、服务端群聊视图过滤、PPR 与最近对话层不外泄、网关真实 session_id 格式下的客户端矩阵、旧服务端无回显不注入、服务端异常时的客户端二次过滤、会话切换继承、可见性端点、夜间整理与 seed 后保留、事故形态重放），其中 Issue #34 新增 `test_purge_protect_phase_hints`（草稿归档默认豁免待固化记录），Issue #37 新增 `test_recent_turns_recall`（普通对话轮召回、assistant 行排除、时间窗、显式事实优先、只读、文本裁剪、未命中仍 `NO_MATCH`），Issue #39 新增 `test_recent_turns_hardening`（代理隔离、NULL 历史行、零信息量行、停用词过滤、命中数排序），Issue #32 新增 `test_recall_scoring`（分词、打分、Top-K、时效排序与命中回写）与 `test_purge_before_date`（时间窗归档与一键脚本），Issue #44 E 项新增 `test_phase_a_config_sediment`（沉淀五要素、脱敏零泄漏、None 标记、Outbox 重放、召回闭环），Issue #44 PR4 新增 `test_batch_judge_candidates`（状态机写入语义、confidence/noul 双门槛分流、切片与批次校验、重试 failed 终态、candidate 核实折叠与禁改写、开关三态、召回通道排序与未核实标注、purge 保护与回填窗口强制），Issue #44 红线 3 落地为 `test_recall_single_gram_gate`（高频词嵌卡名不放行、正文单 gram 仍拦、双 gram 不变、全词别名/全名命中走直达层）；PR #49 在 `test_phase7_systemone_gates` 补鉴权熔断用例（401 熔断后跳过重试、TTL 到期恢复、5xx 不熔断）。PR #42 新增 `test_phase_a_auth_coverage`（`/v1/*` 端点的 401/403/正确凭据三态与未配置时全放行，当前覆盖 17 项请求，含 Issue #72 的可见性端点、Issue #75 的清理端点与 Issue #78 的历史、回滚端点），并在 `test_phase7_systemone_gates` 补全角问号本地规则用例、`test_bitemporal` 补 PPR 平行边能量等价用例。其余为：`test_bitemporal`、`test_phase1_mvp` 至 `test_phase8_consolidation_closure`，Phase A 的八个 `test_phase_a_*`（迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀），Issue #25 的 `test_explicit_addition_consolidation`（慢波固化）与 `test_explicit_addition_recall`（召回可见性），以及 Issue #27 的 `test_prefetch_contract_and_fusion`（`living_states` 契约与未固化事实融合）。

@@ -4,6 +4,13 @@
 
 ## 2026-10-27
 
+### 文档：补记 #79、#80、#82 与漏记的变更日志，补 #78 架构说明（Closes #91）
+- **背景**：上一轮文档同步（#89）写明 #78 / #79 在变更日志与架构说明里还没有专门条目。借这次补档，把全部已合并 PR 的编号和变更日志对了一遍，又发现几处没有条目或没写 PR 号的改动。目的是让每个合并过的改动为什么做、怎么做的都能查到。
+- **做法**：只改文档。CHANGELOG 新增 #79（Closes #78）、#80、#82（Closes #81）三条；补上漏记的 #28（Closes #27）、#61（Closes #56）、#71、#24 四条；给已有条目补 PR 号：#38、#40、#53。ARCHITECTURE 新增 #78 的机制说明：§2.2 补自动墓碑、与 `decided_as` 的关系、回滚；新增 §2.6 卡片历史表；§2.4 补 `dry_run` 预览的 `changes` 字段；§8.1 更新定案接口与回滚接口的说明；§9 补测试说明。
+- **核对**：表名、接口路径、参数名、字段名、来源取值都对照代码与 PR 的实际 diff 核对过。
+- **对照结果**：下列纯文档同步 PR 没有单独补条目，因为它们只是为已有条目补文档，内容已经体现在对应的功能条目里：#29（#26）、#36（#35）、#43（#42）、#46（#45）、#48（#47）、#50（#49）、#52（#51）、#55（#54）、#58（#57）、#60（#59）、#66（#65）、#69（#68）、#74（#73）、#77（#76）、#90（#85 #86 #88）。其中 #24 不只是同步（新建了变更日志、升级了白皮书、写入了项目约定），单独记了一条；#53 更正了 #47 的验收状态，这条更正已经写在 #47 的条目里，这次只补上 PR 号。
+- **未覆盖**：条目按当时的 PR 正文与代码整理，没有重新做线上验证；#80 之前的提交与提交信息不改写，见 #80 条目。
+
 ### 文档：同步 #85 #86 #88 的变更日志、README 与架构说明（Closes #89）
 - **背景**：#85、#86、#88 合并并上线后，变更日志、README 和架构说明还没有跟上，只能靠读代码才知道新增了哪些开关、字段和行为。
 - **做法**：只改文档。CHANGELOG 补下面三条，每条链上对应的 PR 与 issue；README 补路线图、目录骨架、整理的忙响应与 `skipped_changed`、测试文件数量；ARCHITECTURE 补 §2.4 整理三段式与互斥、§3.2 方案节点追溯、§6.2 环境变量表、§8.1 接口表、§8.2 MCP 说明与 §9 验证套件。
@@ -40,6 +47,35 @@
 - **部署**：更新并重启服务端即可；合并后 seed 默认关闭，线上没有调用方，不受影响。需要手动调用时，在服务环境里设置 `CORTEX_ALLOW_ADMIN_SEED=1` 并重启。线上夜间定时任务走 HTTP，不受命令行与 MCP 改动影响。
 - **未覆盖**：命令行没有 seed 入口；其它写入接口（`/v1/living-state/decision`、`/v1/graph/*` 等）在未配置 `CORTEX_AGENT_TOKENS` 时仍不校验凭据，服务只应监听回环地址。
 
+### 文档：README 补安装、配置、启动与升级说明（PR #82，Closes #81）
+- **背景**：README 只有架构介绍，新环境要靠读代码和白皮书才能把服务跑起来：服务读取哪些环境变量、数据库与冷归档放在哪、定时任务怎么配、插件怎么部署，都没有集中的说明。
+- **做法**：README 新增「快速开始」：环境要求（Python 3.12，依赖只有 `requirements.txt` 里的四项）、建 venv 与装依赖；环境变量表（服务进程与插件进程分开列，写明默认值与作用）；启动命令、默认端口、数据库与冷归档位置（建在进程当前工作目录）、`/health` 自检、MCP stdio 入口；systemd 服务与夜间慢波、草稿清理两个定时任务示例（路径与用户都是占位）；Hermes 插件部署与升级顺序；升级步骤（拉代码、在线备份数据库、重启，新表启动时自动创建）；运行测试的命令。路线图补 #78。地址、模型名、密钥一律用占位符。
+- **开关**：无。
+- **测试**：合并前在全新目录里完全照 README 走了一遍：新 venv 装依赖、临时数据库、非默认端口启动、`/health`、慢波 `dry_run` 与空请求体、`cortex_purge`（默认与 `--execute`）、MCP `initialize`、备份单行命令、`git pull --ff-only`、README 里的测试循环（33 个测试文件全部通过），然后停进程、删目录。
+- **部署**：无。
+- **未覆盖**：示例里的 systemd 单元和路径是占位，走查时没有在真实的 systemd 下运行；#85、#90 之后 README 的环境变量与整理说明又有更新，以那两条为准。
+
+### 新增：改主意自动留墓碑、卡片历史与回滚、真正的 consolidate dry_run（PR #79，Closes #78）
+- **现象**：（1）只说「改为 Y」并打 approval，夜间整理后卡片升到下一版、内容变成 Y，`tombstones` 却是空的，旧方案没有留下任何记录，只有显式说「推翻 / 作废」才会留；（2）卡片就地覆盖，没有历史，夜里整理错了没法撤回；（3）`POST /v1/sleep/consolidate` 的 `dry_run` 直接返回空报告，看不出今晚会改什么。
+- **自动墓碑**：`update_decision` 在新定案替换旧定案时给旧定案留一条墓碑，字段 `plan`、`killed_reason`（自动留的固定为「被新定案取代」）、`version`（被替换的版本号）、`superseded_by`（新定案前 200 字）、`at`（UTC，`YYYY-MM-DD HH:MM:SS`）、`source`（改动来源）、`source_log_ids`（仅夜间整理带，折叠的草稿行 id，最多 20 个）。显式给了 `superseded_plan` 时按它留一条（`killed_reason` 缺省为「推翻更新」），只有它没覆盖旧定案时才另留一条；「覆盖」指文本相等，或一方包含另一方且较短的至少 2 个字（`tombstone_covers`）。新建卡、旧定案为空、仅空白差异、定案没变（只改 facts / 别名 / 展示名）都不留。
+- **卡片历史**：新表 `living_state_history`（`CREATE TABLE IF NOT EXISTS` 写进 `schema.sql`，启动时自动创建，不改任何已有表）。卡片内容每次变化前先存一份旧快照：`update_decision`（来源 `consolidation` / `api:decision` / `mcp:update_decision`）、`rename_display`（`backfill_display_names`）、`set_visibility`（`admin:visibility`，可见性没变不写）、`seed_initial_assets`（`seed`，仅当展示名 / 定案 / metadata / 墓碑任一项与预置值不同才存）、回滚（`rollback`）。召回命中计数不算内容变化。`source` 记的是取代该版本的那次改动，不是该版本当初的来源。新增只读接口 `GET /v1/living-state/{entity_id}/history`。
+- **回滚**：新增 `POST /v1/admin/living-state/rollback`（鉴权，`dry_run` 默认 `true`），入参 `entity_id`，可选 `to_version`（该版本号最新的一条快照）或 `history_id`（精确指定），二者同时给返回 `422`，目标不存在 `404`；缺省目标是最近一条内容与当前不同的快照。恢复展示名、定案、metadata 与墓碑；版本号继续递增、不复用；回滚前的状态先存一份历史，所以能再滚回去；内容与当前相同（响应 `changed: false`）时不落库、不涨版本；同步现役 `decided_as` 边（只对已有该类边的实体）；不碰草稿流和冷归档，不恢复 `status`。
+- **回滚保留当前可见性**：`visibility` 是用户手动设定的访问控制，不是定案内容。按历史恢复会让一次回滚定案悄悄把已收紧的私人卡放回群聊，或把刚放开的卡重新关上。实现上比较内容时忽略 `visibility`，写回时用当前值（响应的 `visibility_kept`）。
+- **真正的 dry_run**：`run_consolidation(dry_run=True)` 真跑分析与候选核实，在 `BEGIN IMMEDIATE` 事务里执行与真实整理同一段回写代码，收集变更后整体回滚；不写库、不写冷归档、不跑批量判研。返回 `status: "dry_run"`、`dry_run: true`、`would_archive_logs`、`would_update_states`、`changes`（每张卡一项：`entity_id`、`change`、`version_from`、`version_to`、`decision_from`、`decision_to`、`tombstones_added`、`facts_added`、`aliases_added`、`folded_log_ids`）。#88 之后改为三段式，行为不变，见该条。
+- **服务启动不跑种子初始化**：`lifespan` 不调用 `seed_initial_assets`，只有手动调用 `POST /v1/admin/seed` 才会覆盖种子卡；该端点现在默认 `403`，见 #85。种子写入时版本号固定为 1，覆盖后历史里可能出现同一版本号的多条快照，按 `to_version` 回滚取的是该版本号最新的一条，需要精确指定时用 `history_id`。
+- **开关**：无新开关。
+- **测试**：新增 `test_issue78_tombstone_history_rollback`（14 例）：缓存例子（旧方案留墓碑、历史与 `decided_as` 边都对，回滚回旧方案再滚回新方案）；显式推翻不重复留、定案没变与新建卡不留；各写卡路径写历史并标明来源；`rename_display` 与 seed 只在内容真有变化时写；召回命中计数不写历史；回滚保留当前可见性且不改草稿流；回滚的空操作、错误码、鉴权；`dry_run` 前后全库逐表一致、冷归档目录无新增、无待处理行时可重复、分析失败后无遗留事务；旧库自动补建历史表；旧格式墓碑（没有新字段）仍可加载并回滚。`test_phase_a_auth_coverage` 补历史、回滚两个端点。合并时全量 33 个测试文件通过。
+- **部署**：更新并重启服务端即可，历史表在启动时自动创建；线上插件不需要改。历史从部署后才开始记，部署前被覆盖的旧版本找不回来。
+- **未覆盖**：历史表只增不删，没有保留与清理策略；回滚只同步 `decided_as` 边，不恢复种子写入时被删掉重建的其它图谱边，也不恢复 `status`；草稿流与冷归档不随回滚变化。
+
+### 维护：测试与文档里的真实标识替换为占位数据（PR #80，无对应 issue）
+- **背景**：仓库是公开的，测试和文档里留有真实会话编号、服务器公网地址、人名昵称、真实对话语句，以及随手取用的业务示例名。
+- **做法**：只改测试与文档（`CLAUDE.md`、`docs/ARCHITECTURE.md`、`docs/CHANGELOG.md` 和 10 个测试文件），不改 `baize/` 业务源码。会话编号换成明显的假值（如 `20000101_000000_0a0b0c0d`）；服务器地址换成文档保留地址（如 `192.0.2.10`）；真实对话语句改写成意思相近的假句子；人名昵称在测试里换成假名、在文档里换成角色说法（审核方、NAS 侧维护者、项目负责人、架构负责人）；测试里随手取用的业务示例名换成示例名；断言种子数据的用例改为读取种子模块实际写入的值，不再写字面量。改写前用服务器本地的评测标注文件做过整句比对，比对只在本地进行。
+- **开关**：无。
+- **测试**：改完后全量 32 个测试文件通过；`git grep` 扫描 `baize/` 以外的文件，群名、群 id、真实格式的会话编号、私人卡名、人名昵称均为 0 命中，IP 只剩回环地址。
+- **部署**：无需部署。
+- **未覆盖**：没有改写 git 历史，旧提交与已合并提交的提交信息里仍保留原值，这是已知的未覆盖项；预置示例数据属于业务代码，保持不变；issue 与 PR 正文的历史编辑记录无法通过接口删除，需要仓库维护者在网页上处理。
+
 ### 新增：白天判定器默认只记日志（CORTEX_DAY_JUDGE）与测试数据软清理（PR #76，Closes #75）
 - **背景**：白天插件的 PhaseDetector 给用户的话打 `phase_hint`，经 `POST /v1/scratchpad/log` 直接写入草稿流，夜间整理会把 approval 折叠进活体卡定案。判定器准确率没有验证过，approval / rejection 又能直接改写定案，所以先让它默认不进正式记忆。
 - **开关**：服务端环境变量 `CORTEX_DAY_JUDGE`，只有等于 `apply`（忽略大小写与首尾空白）才保留白天的 approval / rejection，其他取值与未设置一律 `log_only`。开关在服务端生效，不依赖 Hermes 网关的环境变量。
@@ -71,6 +107,13 @@
 
 ## 2026-10-26
 
+### 维护：忽略本地评测数据目录（PR #71，Refs #64）
+- **背景**：本地评测用的真实对话、人工标注和结果放在 `data/eval/`，此前只靠服务器本机的 `.git/info/exclude` 忽略，换一个 checkout 就可能被误提交。
+- **做法**：主干的 `.gitignore` 新增 `data/eval/` 一行，所有 checkout 默认忽略该目录。只改这一行。
+- **开关 / 部署**：无。
+- **测试**：`git check-ignore -v data/eval/<任一文件>` 命中 `.gitignore`；`git ls-files data/eval` 无输出。
+- **未覆盖**：只防止新文件被误提交，已被跟踪的文件不受影响。
+
 ### Issue #64 PR 2：System 2 判研提示词定案与事实边界对齐（PR #68，Refs #64）
 - 微创优化 `baize/intelligence/batch_judge.py` 中的 `_SYSTEM_PROMPT`。
 - 吸收 NAS 黄金标注口径，清晰界定全局正式裁决与一次性运维指令、简单确认、状态播报、技术排查的 phase 语义边界。
@@ -86,6 +129,16 @@
 - 生产环境开关保持 `CORTEX_BATCH_JUDGE=off`，待 NAS 侧人工黄金集复核完成后定线。
 
 ## 2026-10-25
+
+### 新增：插件白天快速规则产 candidate 并透传 category（PR #61，Issue #56 P2-5，Closes #56）
+- **背景**：Issue #56 的最后一项。白天的快速门写死了 5 个关键词，打标规则与夜间批量判研、candidate 候选流不一致，服务端也无法接收 candidate 的类别（事实或定案）。
+- **服务端**：`ScratchpadLogIn` 新增可选字段 `category`，`POST /v1/scratchpad/log` 透传给 `append_log(..., category=...)`。校验：只有 `phase_hint=candidate` 且取值为 `fact` / `decision` 时才接收，其它组合返回 `422`；原因是 `scratchpad_log.category` 这一列 `cortex_add` 也在用（`fact` / `preference` / `rule` / `lesson`），不加限制会串味。`ScratchpadManager.append_log` 新增 `category` 参数。不改 schema。
+- **客户端**：`CortexClient.sync_turn(user_content, assistant_content, *, session_id, ...)`，签名对齐 Hermes `MemoryProvider` 契约。快速门不再用写死的词，改为引用 `phase_detector` 的 `_APPROVAL_KEYWORDS + _REJECTION_KEYWORDS`（`GATE_KEYWORDS`）。门命中后调用 `detect_phase_rich()`，打标规则：`decision_approved` 且置信度 ≥ 0.9 → `approval`；`decision_approved` 且置信度 < 0.9 → `candidate`（`category=decision`）；`rejection` → `rejection`；其它且 `noul` ≥ 0.8 → `candidate`（`category=fact`）；其它不打标。两个阈值直接引用 `batch_judge.APPROVAL_CONFIDENCE_GATE`（0.9）与 `CANDIDATE_NOUL_GATE`（0.8），与夜间批量判用同一组数。assistant 行永远不打标；判定失败或写入失败只记日志，不阻塞主会话。
+- **之后的变化**：#76 起，服务端默认把白天的 `approval` / `rejection` 降为普通行（见 `CORTEX_DAY_JUDGE`），`candidate` 不受影响。
+- **开关**：无新开关；`CORTEX_BATCH_JUDGE` 仍保持关闭。
+- **测试**：新增 `test_plugin_candidate_category`（5 例）：`append_log` 落库 `category`；端点接收 candidate 的 `category` 并拒收其它组合；`sync_turn` 的完整打标矩阵（含门未命中时不调用模型）；快速门引用标准词表；判定失败时 fail-open。
+- **部署**：沿用 #54 的顺序约束：服务端先上，插件后上，反序会让插件写入的 candidate 行静默堆积。仓库里是参考实现，部署副本由部署侧同步。
+- **未覆盖**：旧写死词表里的「决定」「确认」「批准」「同意」不在标准词表中，移除后不再触发白天的门；白天的事实类 candidate 只在门命中时产出，不含关键词的句子仍靠夜间批量判。
 
 ### 修复：candidate 核实按事实类/定案类分流（PR #59，Issue #56 PR 2 / P1-3）
 - **现象**：`decision_approved` 但 `confidence<0.9` 的弱信号定案进 candidate 后，夜间核实问的是「这是可固化的客观事实吗」。定案不是事实，真定案（如「好,那就这样」conf 0.85）大概率被否决并归档清退。
@@ -135,7 +188,7 @@
 - **门槛回撤**：`qualifies` 撤销第三析取，回到两规则（原词命中 / ≥2 个不同 2-gram）；全词命中由 `LIVING_STATE_DIRECT` 的 name/alias 子串匹配承担，长句召回靠注册**具体别名**解决。
 - **别名库黑名单**：`_GENERIC_ALIAS_BLACKLIST`（记忆/方案/项目/系统/服务/配置/记录/问题/时间/数据/工具）精确匹配，过滤点在慢波 `_apply` 的别名并集处——新别名禁止入库，已入库的在该卡下次被慢波触碰时自动清洗，不误伤「时间机器」类长词。「卡片」未列入（Phase 6 既有夹具作合法别名、本域核心词），是否列入待 CTO 定夺。
 - **测试**：`test_recall_single_gram_gate` 重写为红线锁定（白泽记忆反例 `NO_MATCH`、正文单 gram 仍拦、双 gram 不变、具体别名「示例仓库」整词命中 #44 复现句走直达层、全名命中回归保护）；`test_phase6` 补黑名单用例。全量 25 套件通过。
-- **验收状态（美西实弹复核后修正，2026-10-24）**：**未验收通过——代码层面收益归零**。回撤后门槛与 `302d7cc` 基线一致，「全词命中走直达层」为既有能力而非新增；#44 复现句的通过依赖别名「示例仓库」，而生产库该卡实测 aliases 为 `['流式卡片', '飞书流式推送']`，**不含该别名**，复现句仍落 `RECENT_TURNS_CONTEXT`。本 PR 的实际交付是：撤销噪声放大器 + 别名黑名单防污染。复现句的修复待**别名数据回填**（运维动作：为存量卡补充具体别名，如给「流式卡片」补「示例仓库」）。
+- **验收状态（美西实弹复核后修正，2026-10-24，PR #53）**：**未验收通过——代码层面收益归零**。回撤后门槛与 `302d7cc` 基线一致，「全词命中走直达层」为既有能力而非新增；#44 复现句的通过依赖别名「示例仓库」，而生产库该卡实测 aliases 为 `['流式卡片', '飞书流式推送']`，**不含该别名**，复现句仍落 `RECENT_TURNS_CONTEXT`。本 PR 的实际交付是：撤销噪声放大器 + 别名黑名单防污染。复现句的修复待**别名数据回填**（运维动作：为存量卡补充具体别名，如给「流式卡片」补「示例仓库」）。
 
 ### 修复：召回单 2-gram 命中卡名/别名即放行（PR #45，Issue #44 C 项）
 - **现象**：卡片就在库里，长句查不到——`recall('当前使用的卡片是示例仓库的最新版吗')` 落到 `RECENT_TURNS_CONTEXT`，权威记忆被末级兜底抢占。根因：无标点中文整句只切出一个原词 token，句中唯一的卡名 2-gram（「卡片」→「流式卡片」）满足不了「≥2 个 2-gram」门槛，整卡被 `DECISION_TEXT_MATCH` 刷掉。
@@ -156,7 +209,7 @@
 
 ## 2026-10-23
 
-### 修复：RECENT_TURNS_CONTEXT 三层收口（Issue #39）
+### 修复：RECENT_TURNS_CONTEXT 三层收口（PR #40，Issue #39）
 - **现象**：美西分身对 PR #38 做验收，七条标准全过、自动注入首次打通（`messages.id=2614` 带出跨 34 小时的两条历史对话），但新层自身带出三个缺陷。老板只发一句「好，按你说的办」，注入块就被拖进三条无关历史对话——`你说的` → 2-gram `你说`/`说的` → 命中三条闲聊，其中一条是群聊旧话。
 - **代理隔离**：`search_recent_turns` 原先没有 `agent_id` 条件，多代理配置 token 后 beta 代理的对话会进 default 代理的注入块。现在查询新增 `(? IS NULL OR agent_id IS NULL OR agent_id = ?)`，`agent_id IS NULL` 属于未启用 token 时期的历史行，放行以免记忆断层；`/v1/recall` 与写路径共用同一个 `authenticate(request)` 身份。
 - **噪声收口**：新增 `RECENT_TURN_STOPWORDS`（纯语气/指示/连接词：可以、这个、然后、好的、你说……），过滤后若没有至少一个 ≥3 字的实义词，整层不触发——单 token 或纯 2-gram 碎片不足以「接上上一轮」。
@@ -175,7 +228,7 @@
 - 新增测试 `test_purge_protect_phase_hints.py`（6 条），其中一条验证默认归档之后 approval 仍能被下一次慢波合成固化；`test_purge_before_date.py` 中归档显式沉淀记录的用例改为显式打开开关。
 - NAS 侧维护者已在生产环境实测并完成部署。
 
-### 新增：普通对话轮次末级召回层 RECENT_TURNS_CONTEXT（Issue #37）
+### 新增：普通对话轮次末级召回层 RECENT_TURNS_CONTEXT（PR #38，Issue #37）
 - **现象**：美西生产实测，老板 `/new` 开新会话后要求验收上一轮改动，分身手里没有任何上一轮上下文，只能回翻会话库。`scratchpad_log` 里当轮 user/assistant 行（id=197/198）都在，但 `/v1/recall` 对「新会话已开启，请继续测试」返回 `NO_MATCH`——**写入正常，召回结构性不通**。
 - **根因**：插件 `sync_turn` 只在文本含「定案/决定/确认/批准/同意」且 PhaseDetector 判 `decision_approved` 时才写 `phase_hint`，普通轮次恒为 `NULL`；而第 4 层兜底 `SCRATCHPAD_EXPLICIT_FALLBACK` 与固化器都只查 `phase_hint` 非空（`scratchpad.py:69`/`:161`），于是普通对话只写不读。
 - **修复**：`ScratchpadManager.search_recent_turns()` 绕过 `phase_hint` 语义，按 `role='user'` + `expired_at IS NULL` + 72 小时窗口 + token 命中取行，文本裁剪到 400 字符；`CognitiveRecallRouter` 在其后新增末级策略 `RECENT_TURNS_CONTEXT`（置信度 0.35，`provisional=True`，`authoritative=False`，最多 3 条），只在活体卡、PPR、决策文本、显式事实全部落空后触发。
@@ -202,6 +255,14 @@
 - 群聊隔离：加固 `fail-closed` 闸门，识别 `:group:` 与飞书群聊 `oc_` 前缀，恒定阻断记忆外溢。
 - 客户端库：`CortexClient.prefetch` 支持 `as_text=True` 模式，并原生支持 `session_id` 群聊安全过滤。
 
+### 修复：prefetch 字段契约失配与召回宽匹配抢占兜底（PR #28，Issue #27）
+- **现象**：（1）插件每轮自动注入记忆靠读取 `/v1/recall` 响应里的 `living_states`，而服务端当时返回的字典里没有这个字段，解析结果恒为 0 条，自动注入恒为空；（2）`DECISION_TEXT_MATCH` 命中后直接返回，整句自然提问下，未固化的显式记录被掩盖。
+- **做法**：`/v1/recall` 所有策略的响应都带 `living_states` 列表（`LIVING_STATE_DIRECT`、`DECISION_TEXT_MATCH`、`PPR_SPREADING`、`SCRATCHPAD_EXPLICIT_FALLBACK`、`NO_MATCH`），由 `state` / `resolved_state` 与未固化记录派生；固化条目 `provisional: false, authoritative: true`，未固化条目 `provisional: true, authoritative: false`。`DECISION_TEXT_MATCH` 命中后不再直接返回，同时探测未固化的显式记录，有则附加 `provisional_facts` 与 `source_log_ids`，策略名与 `state` 不变；没有未固化记录时响应不含这两个字段。选择了「合并返回」，没有走「提高命中阈值」。新增 `baize/client/recall.py` 的 `extract_memories(response)`，解析 `state`、`resolved_state`、`state.metadata.facts`、`living_states`、`provisional_facts`、`facts`，按 id 去重，对 `None`、列表、错误类型等畸形输入一律返回空列表；`CortexClient.prefetch(query, top_k)` 在任何异常或非 2xx 时返回 `[]`（fail-open）。该方法后来在 #73 中改为按会话范围召回。
+- **开关**：无。
+- **测试**：新增 `test_prefetch_contract_and_fusion`：每种策略都带 `living_states`、宽匹配命中后与显式记录融合、固化后不再作为未固化条目返回、插件侧解析新旧两种响应形态、畸形输入返回空、读取路径只读（断言事务计数不变、无遗留事务）。
+- **部署**：改动在仓库的参考实现 `baize/client/` 与服务端 `recall_router.py`；部署副本的插件不在本仓库，服务端补上 `living_states` 后，现有插件读取该字段即可拿到数据，不改插件也行。构建与部署由 NAS 侧维护者负责。
+- **未覆盖**：没有在生产副本上复现现场，用同形态的数据在本地复现。
+
 ### 修复：explicit_addition 慢波合成静默丢弃与召回端断链（PR #26，Issue #25）
 - 现象：美西生产副本实测，`cortex_add` 写入的事实召回 100% 返回 `NO_MATCH`，6 条 `explicit_addition` 滞留热表，被每次慢波静默丢弃。
 - 慢波合成：`explicit_addition` 单独分流，`_is_authoritative` 语义不变。归属只认 `proj:` 锚点（含别名），命中不了落入 `proj:general_decisions`，不使用最近活跃实体回退，不新建陌生实体、图谱节点或边。多条事实按 `(created_at, id)` 全部并入 `metadata.facts` 并记录来源 log id；与 approval 同组时 approval 保持主结论。
@@ -213,6 +274,12 @@
 - 未验证：没有在生产副本复现美西现场，三条现场查询用同形态数据在本地复现。
 
 ## 2026-10-22
+
+### 文档：白皮书升级为 v2.1，建立变更日志与项目约定（PR #24）
+- **背景**：Phase 5 至 Phase A 陆续合并后，白皮书、README 和项目约定落后于代码。
+- **做法**：`docs/ARCHITECTURE.md` 升级为 v2.1，补 Phase 6 / 7 / 8 / A 的架构说明、Phase A 增量列、时间格式约定、召回路由顺序、环境变量总表、REST 与 MCP 接口总览，并标注 `CORTEX_DECISION_MODEL` 自 Phase 7 起不再使用；新建 `docs/CHANGELOG.md`，按 PR 倒序记录 #2 至 #23；README 路线图补录 Phase 6 / 7 / 8 / A，原路线图里「Phase 6：全量生产平滑割接」的编号已被别名提纯占用，改为不编号的「后续」项；`CLAUDE.md` 补全测试清单与目录约定，写入「每个功能 PR 合并后同步文档并走 PR 合并」和时间戳格式约定（`YYYY-MM-DD HH:MM:SS`，UTC，不用带 `T` 的 ISO 格式）。
+- **核对**：环境变量、REST 路径、MCP 工具名、召回路由顺序都对照代码核实。核实时发现服务端没有 429 或 `Retry-After` 逻辑，文档改为「服务端当前不返回 429，仅客户端 Outbox 实现了遵守逻辑」。
+- **开关 / 测试 / 部署**：无；纯文档改动，没有重跑测试。
 
 ### Phase A：记忆外溢通道与可靠投递（PR #23，Issue #22）
 - 三表（`scratchpad_log` / `living_states` / `graph_edges`）增量加列：`idempotency_key`、`valid_at`、`invalid_at`、`ingested_at`、`expired_at`、`supersedes_id`、`pinned`、`hit_count`、`last_recalled_at`、`agent_id`；`scratchpad_log` 另增 `category`、`reason`。迁移可重复执行，迁移前备份，存量分批回填。
