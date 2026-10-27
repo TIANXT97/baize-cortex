@@ -16,11 +16,11 @@ from baize.server.app import create_app
 from baize.storage.db import init_db
 
 # 网关真实的 session_id 格式与 Hermes initialize 传入的身份字段
-GATEWAY_SESSION = "20261023_161320_57e1481c"
+GATEWAY_SESSION = "20000101_000000_0a0b0c0d"
 GATEWAY_KWARGS = {"platform": "feishu", "chat_id": "oc_test_chat", "gateway_session_key": "agent:main:feishu:group:oc_test_chat:on_x"}
 
-PRIVATE_ID, PRIVATE_NAME, PRIVATE_TEXT = "proj:private_cinema", "私人影院", "私房标签排最后且严禁落盘"
-OPEN_ID, OPEN_NAME, OPEN_TEXT = "proj:open_router", "公开路由", "路由分流走旁路由"
+PRIVATE_ID, PRIVATE_NAME, PRIVATE_TEXT = "proj:private_cinema", "私人影院", "私有备注排最后且严禁外传"
+OPEN_ID, OPEN_NAME, OPEN_TEXT = "proj:open_router", "公开路由", "路由分流走备用链路"
 QUERY_BOTH = "私人影院 公开路由"
 
 
@@ -84,7 +84,7 @@ def test_server_group_scope_filters_private_cards_and_drafts():
     with tempfile.TemporaryDirectory() as d:
         with TestClient(_app(d)) as tc:
             _populate(tc)
-            sid = "20261023_161320_57e1481c"
+            sid = "20000101_000000_0a0b0c0d"
             tc.post("/v1/scratchpad/log", json={"session_id": sid, "role": "user", "raw_text": "私人影院的草稿想法 暗号青檀"})
             tc.post("/v1/cortex/add", json={"session_id": sid, "content": "私人影院显式事实 暗号青檀", "category": "fact", "reason": "r"})
 
@@ -157,7 +157,7 @@ def test_client_matrix_with_gateway_session_ids():
                 assert (OPEN_NAME in text) is True, (chat_type, text)
                 assert ("混入的会话事实乙" in text) is sees_private, (chat_type, text)
 
-            assert PRIVATE_NAME not in client.prefetch(QUERY_BOTH, session_id="never_bound_20261023_161320_57e1481c", as_text=True)
+            assert PRIVATE_NAME not in client.prefetch(QUERY_BOTH, session_id="never_bound_20000101_000000_0a0b0c0d", as_text=True)
             assert PRIVATE_NAME not in client.prefetch(QUERY_BOTH, as_text=True), "session_id 为空且未登记也按群聊"
             assert PRIVATE_NAME not in client.prefetch(QUERY_BOTH, session_id="oc_or_dm_looking_id", as_text=True)
 
@@ -274,11 +274,13 @@ def test_visibility_survives_nightly_consolidation_and_reseed():
             assert state["current_decision"] != "旧方案" and state["metadata"]["visibility"] == "group_ok"
 
             seed_initial_assets(conn)
+            seed_aliases = living.get_state(PROJ_ID)["metadata"]["aliases"]
+            assert seed_aliases, "种子卡应带别名"
             assert "visibility" not in living.get_state(PROJ_ID)["metadata"], "seed 不替用户标可见"
             living.set_visibility(PROJ_ID, "group_ok")
             seed_initial_assets(conn)
             seeded = living.get_state(PROJ_ID)["metadata"]
-            assert seeded["visibility"] == "group_ok" and seeded["aliases"] == ["模具知识库", "玻璃模具"]
+            assert seeded["visibility"] == "group_ok" and seeded["aliases"] == seed_aliases
         finally:
             conn.close()
 
@@ -287,11 +289,11 @@ def test_replay_group_request_does_not_surface_private_cards():
     """重放 10-25 事故形态:群聊 + 网关 session_id,私人卡(默认无标记)与 general_decisions facts 都不能出来。"""
     with tempfile.TemporaryDirectory() as d:
         with TestClient(_app(d)) as tc:
-            _card(tc, "proj:general_decisions", "通用决策", "", {"facts": [{"id": 1, "text": "本机磁盘清理基线"}]})
+            _card(tc, "proj:general_decisions", "通用决策", "", {"facts": [{"id": 1, "text": "本机清单基线"}]})
             _card(tc, PRIVATE_ID, PRIVATE_NAME, PRIVATE_TEXT)
             client = _client(tc, d)
             client.bind_session(GATEWAY_SESSION, "group")
-            query = "你也来回答下这个问题 私人影院 通用决策 磁盘清理基线"
+            query = "请补充一下你的看法 私人影院 通用决策 清单基线"
             handler, loggers = _capture("baize.cortex_plugin", "baize.recall")
             try:
                 assert client.prefetch(query, as_text=True) == ""
@@ -299,11 +301,11 @@ def test_replay_group_request_does_not_surface_private_cards():
                 _release(handler, loggers)
             joined = "\n".join(handler.messages)
             assert PRIVATE_ID in joined and "proj:general_decisions" in joined and "memory gate scope=group" in joined
-            assert PRIVATE_TEXT not in joined and "磁盘清理基线" not in joined
+            assert PRIVATE_TEXT not in joined and "清单基线" not in joined
 
             client.bind_session("dm_session_20261026", "dm")
             dm_text = client.prefetch(query, session_id="dm_session_20261026", as_text=True)
-            assert PRIVATE_NAME in dm_text and "磁盘清理基线" in dm_text
+            assert PRIVATE_NAME in dm_text and "清单基线" in dm_text
 
 
 if __name__ == "__main__":

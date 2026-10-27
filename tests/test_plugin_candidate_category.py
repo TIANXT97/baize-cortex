@@ -98,7 +98,7 @@ def test_sync_turn_tags_candidates_with_category():
 
 def _run_sync_turn_tags_candidates_with_category():
     verdicts = {
-        "就按这个记:服务器IP是101.200.45.220": ("exploration", 0.95, 0.7),
+        "就按这个记:服务器IP是192.0.2.10": ("exploration", 0.95, 0.7),
         "好,那就这样做": ("decision_approved", 0.2, 0.85),
         "拍板:用方案A": ("decision_approved", 0.1, 0.97),
         "不对,昨天那个结论作废": ("rejection", 0.9, 0.95),
@@ -108,12 +108,12 @@ def _run_sync_turn_tags_candidates_with_category():
         with TestClient(app) as tc:
             detector = _FakeDetector(verdicts)
             cc = _client(d, _transport(tc), detector)
-            cc.sync_turn("就按这个记:服务器IP是101.200.45.220", "好的,已记下", session_id="s1")
+            cc.sync_turn("就按这个记:服务器IP是192.0.2.10", "好的,已记下", session_id="s1")
             for text in ("好,那就这样做", "拍板:用方案A", "不对,昨天那个结论作废", "今天天气不错"):
                 cc.sync_turn(text, "", session_id="s1")
 
             assert _rows(app.state.conn) == [
-                ("user", "就按这个记:服务器IP是101.200.45.220", "candidate", "fact"),
+                ("user", "就按这个记:服务器IP是192.0.2.10", "candidate", "fact"),
                 ("assistant", "好的,已记下", None, None),
                 ("user", "好,那就这样做", "candidate", "decision"),
                 ("user", "拍板:用方案A", "approval", None),

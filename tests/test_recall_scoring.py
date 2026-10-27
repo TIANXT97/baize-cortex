@@ -67,7 +67,7 @@ def test_spaced_query_prefers_stronger_match_over_first_row():
     with tempfile.TemporaryDirectory() as d:
         conn, router = _env(d)
         try:
-            _put(conn, "proj:a_mold", "玻璃与模具工程知识库", MOLD_DECISION, aliases=["模具知识库", "玻璃模具"])
+            _put(conn, "proj:a_mold", "示例工程知识库", MOLD_DECISION, aliases=["示例知识库", "示例别名"])
             _put(conn, "proj:z_feishu_streaming", "飞书流式卡片", "飞书消息流式输出,用卡片 patch 更新")
             out = router.recall("飞书 流式")
             assert out["state"]["entity_id"] == "proj:z_feishu_streaming", out

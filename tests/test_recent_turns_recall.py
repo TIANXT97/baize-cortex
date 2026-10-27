@@ -34,10 +34,10 @@ def _recall(tc, query, **extra):
 
 
 def test_recent_user_turn_is_recalled_when_nothing_else_matches():
-    """窗口内的普通 user 行必须能被召回（这正是「上一轮老板让我测什么」的场景）。"""
+    """窗口内的普通 user 行必须能被召回（这正是「上一轮要求测试什么」的场景）。"""
     with tempfile.TemporaryDirectory() as d:
         with TestClient(_app(d)) as tc:
-            lid = _turn(tc, "user", f"重启开新会话了，把 {TOKEN} 那个懒加载再测一遍")
+            lid = _turn(tc, "user", f"新会话已开启，请把 {TOKEN} 那个功能再测一遍")
             out = _recall(tc, TOKEN)
             assert out["strategy"] == RECENT, out
             assert out["provisional"] is True and out["authoritative"] is False
