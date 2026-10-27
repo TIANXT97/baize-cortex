@@ -1,6 +1,7 @@
 """Cognitive Recall Router: Level 1 活体卡直达 / Level 2 PPR 能量游走的统一召回入口"""
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -9,8 +10,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import TIMESTAMP_FORMAT, ScratchpadManager
 from baize.core.temporal_graph import BiTemporalGraphManager
+from baize.core.visibility import SCOPE_DM, SCOPE_GROUP, group_view, is_group_visible, normalize_scope
 from baize.intelligence.ppr_engine import PPREngine
 
+log = logging.getLogger("baize.recall")
 
 _PARTICLES = ("的", "什么", "怎么", "定的", "呢", "吗", "吧", "啊")
 _TOKEN_RE = re.compile(r"[一-鿿A-Za-z0-9_]{2,}")
@@ -96,7 +99,69 @@ class CognitiveRecallRouter:
         self.graph = BiTemporalGraphManager(conn)
         self.ppr = ppr_engine or PPREngine()
 
-    def recall(self, query: str, top_k: int = 5, agent_id: Optional[str] = None) -> Dict[str, Any]:
+    def recall(
+        self, query: str, top_k: int = 5, agent_id: Optional[str] = None, scope: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """scope=None 为旧客户端(行为不变、不回显);dm 走全量并回显;其余一律走群聊视图并回显 group。"""
+        scope = normalize_scope(scope)
+        if scope == SCOPE_GROUP:
+            return self._recall_group(query, top_k)
+        result = self._recall_all(query, top_k, agent_id)
+        if scope == SCOPE_DM:
+            result["scope"] = SCOPE_DM
+        return result
+
+    def _recall_group(self, query: str, top_k: int) -> Dict[str, Any]:
+        """群聊视图:只在 visibility=group_ok 的卡上匹配,且只返回白名单字段。
+
+        草稿流(provisional/candidate/explicit)、最近对话层、PPR 排名与种子节点都可能带私聊内容,
+        这里整层不走;卡片 facts 由夜间整理从任意会话折叠而来,同样不出。
+        """
+        top_k = max(1, int(top_k))
+        now = datetime.now(timezone.utc)
+        tokens = _scoring_tokens(query)
+        words = set(_tokens(_strip_particles(query)))
+        active = self.living.list_active_states()
+        visible = [group_view(s) for s in active if is_group_visible(s)]
+        private = [s for s in active if not is_group_visible(s)]
+
+        direct = self._match_living_states(query, visible)
+        if direct:
+            ranked = self._rank(direct, tokens, words, now)[:top_k]
+            result = {"strategy": "LIVING_STATE_DIRECT", "confidence": 1.0, "state": ranked[0][0], "nodes": []}
+        else:
+            ranked = []
+            seeds = self._match_seed_nodes(query)
+            if seeds:
+                energy = self.ppr.run_ppr(self.graph.get_active_subgraph(), seeds)
+                order = [node for node, score in energy.items() if score > 0][:top_k]
+                by_id = {s["entity_id"]: s for s in visible}
+                ranked = [(by_id[node], None) for node in order if node in by_id][:1]
+            if ranked:
+                result = {"strategy": "PPR_SPREADING", "resolved_state": ranked[0][0]}
+            else:
+                ranked = self._rank(visible, tokens, words, now, require_match=True)[:top_k]
+                if ranked:
+                    result = {"strategy": "DECISION_TEXT_MATCH", "confidence": 0.6, "state": ranked[0][0], "nodes": []}
+                else:
+                    result = {"strategy": "NO_MATCH", "confidence": 0.0, "state": None, "nodes": []}
+
+        withheld = self._withheld_ids(query, private, tokens, words, now)
+        if withheld:
+            log.warning("recall scope=group: 私人卡命中但未注入 count=%d entity_ids=%s", len(withheld), withheld)
+        result["scope"] = SCOPE_GROUP
+        result["withheld_entity_ids"] = withheld
+        return self._finish(result, ranked, [])
+
+    def _withheld_ids(
+        self, query: str, private: List[Dict[str, Any]], tokens: List[str], words: set, now: datetime
+    ) -> List[str]:
+        hit = self._match_living_states(query, private)
+        if not hit:
+            hit = [s for s, _ in self._rank(private, tokens, words, now, require_match=True)]
+        return sorted(s["entity_id"] for s in hit)
+
+    def _recall_all(self, query: str, top_k: int, agent_id: Optional[str]) -> Dict[str, Any]:
         top_k = max(1, int(top_k))
         now = datetime.now(timezone.utc)
         tokens = _scoring_tokens(query)
@@ -164,10 +229,12 @@ class CognitiveRecallRouter:
         except sqlite3.Error:
             self.conn.rollback()
 
-    def _match_living_states(self, query: str) -> List[Dict[str, Any]]:
+    def _match_living_states(
+        self, query: str, states: Optional[List[Dict[str, Any]]] = None
+    ) -> List[Dict[str, Any]]:
         stripped = _strip_particles(query)
         matched = []
-        for state in self.living.list_active_states():
+        for state in (self.living.list_active_states() if states is None else states):
             names = [state["display_name"], *state["metadata"].get("aliases", [])]
             if any(name and self._name_matches(name, query, stripped) for name in names):
                 matched.append(state)
