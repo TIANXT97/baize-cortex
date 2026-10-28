@@ -4,11 +4,14 @@
 ALPHA 对应「项目自身的记忆服务卡」,BETA 对应「带英文别名、与另一个服务联动的网关卡」。
 """
 import contextlib
+import functools
 import hashlib
 import io
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 
 from baize.core import consolidator as consolidator_module
@@ -29,20 +32,33 @@ GENERAL = "proj:general_decisions"
 MODES = ("log", "apply")
 
 
+AMBIENT_ENV = (ROUTING_ENV, "CORTEX_LLM_URL", "CORTEX_LLM_KEY", "CORTEX_REASONING_MODEL", "CORTEX_BATCH_JUDGE")
+
+
 @contextlib.contextmanager
 def routing_mode(value):
-    saved = os.environ.get(ROUTING_ENV)
+    """清掉外部环境里会影响整理的变量(闸门、模型、批量判研),只按 value 设置闸门;退出时原样恢复。"""
+    saved = {name: os.environ.get(name) for name in AMBIENT_ENV}
     try:
-        if value is None:
-            os.environ.pop(ROUTING_ENV, None)
-        else:
+        for name in AMBIENT_ENV:
+            os.environ.pop(name, None)
+        if value is not None:
             os.environ[ROUTING_ENV] = value
         yield
     finally:
-        if saved is None:
-            os.environ.pop(ROUTING_ENV, None)
-        else:
-            os.environ[ROUTING_ENV] = saved
+        for name, previous in saved.items():
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
+
+
+def _isolated(test):
+    @functools.wraps(test)
+    def wrapper():
+        with routing_mode(None):
+            return test()
+    return wrapper
 
 
 class _QueueLLM:
@@ -816,6 +832,56 @@ def test_cli_default_run_still_executes_and_writes():
             assert LivingStateManager(conn).get_state(GENERAL) is None
         finally:
             conn.close()
+
+
+def test_cli_subprocess_uses_only_the_env_it_is_given():
+    """真起子进程跑 python -m:env 完全显式(不继承外部的 CORTEX_*),闸门值只由本用例决定。"""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base = {k: v for k, v in os.environ.items() if not k.startswith("CORTEX_")}
+    base["PYTHONPATH"] = repo
+    with tempfile.TemporaryDirectory() as d:
+        db = os.path.join(d, "x.db")
+        _build_db_file(db)
+        before = _dir_state(d)
+        results = {}
+        for label, extra in (("unset", {}), ("apply", {ROUTING_ENV: "apply"}), ("garbage", {ROUTING_ENV: "Apply "})):
+            env = {**base, **extra, "CORTEX_LLM_URL": "http://127.0.0.1:9/never", "CORTEX_LLM_KEY": "k"}
+            done = subprocess.run(
+                [sys.executable, "-m", "baize.core.consolidator", "--db", db, "--dry-run", "--no-llm"],
+                env=env, capture_output=True, text=True, encoding="utf-8", cwd=d, timeout=120,
+            )
+            assert done.returncode == 0, done.stderr
+            report = json.loads(done.stdout)
+            results[label] = (report["routing"]["mode"], report["routing"]["summary"]["would_route"])
+            assert "llm=disabled" in done.stderr
+        assert results == {"unset": ("log", 1), "apply": ("apply", 0), "garbage": ("log", 1)}, results
+        assert _dir_state(d) == before and sorted(os.listdir(d)) == ["x.db"]
+
+
+def test_isolation_clears_ambient_env_and_restores_it():
+    ambient = {
+        ROUTING_ENV: "apply", "CORTEX_LLM_URL": "http://127.0.0.1:9/x", "CORTEX_LLM_KEY": "k",
+        "CORTEX_REASONING_MODEL": "m", "CORTEX_BATCH_JUDGE": "on",
+    }
+    assert [name for name in AMBIENT_ENV if name in os.environ] == []
+    os.environ.update(ambient)
+    try:
+        with routing_mode(None):
+            assert [name for name in AMBIENT_ENV if name in os.environ] == []
+            assert fact_routing_mode() == "log"
+            with routing_mode("apply"):
+                assert fact_routing_mode() == "apply" and "CORTEX_LLM_URL" not in os.environ
+            assert ROUTING_ENV not in os.environ
+        assert {name: os.environ.get(name) for name in AMBIENT_ENV} == ambient
+    finally:
+        for name in ambient:
+            os.environ.pop(name, None)
+
+
+# 每个用例都在清掉外部闸门/模型/批量判研变量的环境里运行;需要某个闸门值的用例在里面再用 routing_mode(...)
+for _name, _test in list(globals().items()):
+    if _name.startswith("test_") and callable(_test):
+        globals()[_name] = _isolated(_test)
 
 
 if __name__ == "__main__":
