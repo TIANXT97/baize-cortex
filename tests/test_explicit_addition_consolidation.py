@@ -77,19 +77,19 @@ def test_single_fact_with_known_anchor_is_consolidated():
             conn.close()
 
 
-def test_anchorless_fact_goes_to_general_and_never_pollutes_recent_entity():
+def test_anchorless_unmatched_fact_stays_hot_and_never_pollutes_recent_entity():
     with tempfile.TemporaryDirectory() as d:
         conn, sp, living, arc = _env(d)
         try:
             living.update_decision("proj:recent", "最近项目", "最近定案")
             lid = _add(sp, "小明负责美西验收")
             report = DreamConsolidator(conn, archive_dir=arc).run_consolidation()
-            assert report["updated_states"] == ["proj:general_decisions"], report
+            assert report["updated_states"] == [] and report["archived_logs"] == 0, report
+            assert [(s["id"], s["kind"]) for s in report["skipped_explicit"]] == [(lid, "unrouted")]
             recent = living.get_state("proj:recent")
             assert recent["current_decision"] == "最近定案" and "facts" not in recent["metadata"]
-            general = living.get_state("proj:general_decisions")
-            assert general["current_decision"] == ""
-            assert [f["id"] for f in general["metadata"]["facts"]] == [lid]
+            assert living.get_state("proj:general_decisions") is None
+            assert _hot(conn) == [lid]
             assert _count(conn, "graph_nodes") == 0 and _count(conn, "graph_edges") == 0
         finally:
             conn.close()
@@ -101,10 +101,12 @@ def test_unknown_anchor_does_not_create_stranger_entity():
         try:
             lid = _add(sp, "proj:stranger 的端口是 8080")
             report = DreamConsolidator(conn, archive_dir=arc).run_consolidation()
-            assert report["updated_states"] == ["proj:general_decisions"], report
+            assert report["updated_states"] == [] and report["archived_logs"] == 0, report
             assert living.get_state("proj:stranger") is None
+            assert living.get_state("proj:general_decisions") is None
             assert _count(conn, "graph_nodes") == 0
-            assert [f["id"] for f in _facts(living, "proj:general_decisions")] == [lid]
+            assert _hot(conn) == [lid]
+            assert report["routing"]["items"][0]["anchor"] == "anchor_unknown"
         finally:
             conn.close()
 
@@ -280,7 +282,7 @@ def test_public_ingest_cannot_forge_explicit_addition():
 
 if __name__ == "__main__":
     test_single_fact_with_known_anchor_is_consolidated()
-    test_anchorless_fact_goes_to_general_and_never_pollutes_recent_entity()
+    test_anchorless_unmatched_fact_stays_hot_and_never_pollutes_recent_entity()
     test_unknown_anchor_does_not_create_stranger_entity()
     test_three_facts_are_all_kept_with_sources_and_order()
     test_approval_stays_primary_and_explicit_is_supplementary()

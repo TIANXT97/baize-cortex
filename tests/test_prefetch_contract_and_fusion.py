@@ -101,7 +101,7 @@ def test_narrow_queries_still_use_fallback_and_consolidated_fact_stops_being_pro
     with tempfile.TemporaryDirectory() as d:
         with TestClient(_app(d)) as tc:
             _card(tc)
-            fid = _add(tc, "修复上线实测 commit 0b8b352 已验收")
+            fid = _add(tc, "proj:baize 修复上线实测 commit 0b8b352 已验收")
             assert _recall(tc, "0b8b352")["strategy"] == "SCRATCHPAD_EXPLICIT_FALLBACK"
             assert _recall(tc, "修复上线实测")["source_log_ids"] == [fid]
 

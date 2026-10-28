@@ -46,12 +46,24 @@ def test_fact_is_visible_before_consolidation_as_provisional():
 def test_after_consolidation_the_living_card_answers_instead_of_fallback():
     with tempfile.TemporaryDirectory() as d:
         with TestClient(_app(d)) as tc:
-            _add_http(tc, "小明验收口令是北斗七号")
+            tc.post("/v1/living-state/decision", json={
+                "entity_id": "proj:alpha", "display_name": "阿尔法项目", "new_decision": "方案A"})
+            _add_http(tc, "proj:alpha 验收口令是北斗七号")
             report = tc.post("/v1/sleep/consolidate", json={}).json()
             assert report["archived_logs"] == 1, report
             out = _recall(tc, "北斗七号")
             assert out["strategy"] != FALLBACK, out
-            assert out["state"]["entity_id"] == "proj:general_decisions"
+            assert out["state"]["entity_id"] == "proj:alpha"
+
+
+def test_unrouted_fact_stays_recallable_through_fallback_after_consolidation():
+    with tempfile.TemporaryDirectory() as d:
+        with TestClient(_app(d)) as tc:
+            lid = _add_http(tc, "小明验收口令是北斗七号")
+            report = tc.post("/v1/sleep/consolidate", json={}).json()
+            assert report["archived_logs"] == 0, report
+            out = _recall(tc, "北斗七号")
+            assert out["strategy"] == FALLBACK and out["source_log_ids"] == [lid], out
 
 
 def test_living_card_hit_never_triggers_fallback():
@@ -146,6 +158,7 @@ def test_no_match_when_nothing_matches():
 if __name__ == "__main__":
     test_fact_is_visible_before_consolidation_as_provisional()
     test_after_consolidation_the_living_card_answers_instead_of_fallback()
+    test_unrouted_fact_stays_recallable_through_fallback_after_consolidation()
     test_living_card_hit_never_triggers_fallback()
     test_fallback_is_strictly_read_only()
     test_reproduces_field_queries_and_removes_no_match()

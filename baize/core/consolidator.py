@@ -11,12 +11,18 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 from collections import defaultdict
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from baize.core.fact_router import (
+    RESERVED_ENTITIES, ROUTING_APPLY, fact_routing_mode, is_exploratory, leading_anchor, parse_anchor,
+    pick_winner, rank_entities,
+)
 from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import (
     CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT, EXPLICIT_HINT, ScratchpadManager,
@@ -25,19 +31,20 @@ from baize.core.scratchpad import (
 from baize.core.temporal_graph import BiTemporalGraphManager, plan_node_id
 from baize.intelligence.batch_judge import BatchJudgeRunner
 from baize.intelligence.phase_detector import llm_client_from_env
-from baize.storage.db import init_db
+from baize.storage.db import init_db, open_memory_copy
 
 logger = logging.getLogger("baize.consolidator")
 
-_ENTITY_RE = re.compile(r"(proj:[\w\-]+)")
 _DECISION_RE = re.compile(r"(?:定案|改为|敲定)[::]?\s*(.+)")
 _SUPERSEDE_RE = re.compile(r"(?:推翻|废弃|取代)[::]?\s*(.+?)(?:[,,。;;]|$)|(.+?)\s*(?:推翻|废弃|取代)")
 _ALIAS_RE = re.compile(r"alias[::]\s*([^\s]+)")
 _ALIAS_SPLIT_RE = re.compile(r"[,,、]")
-_EXPLORATION_RE = re.compile(r"假设|如果|要不|探讨|尚未批准|[?？]|呢$")
 _LEADING_PUNCT = " \t\r\n:："
-_GENERAL_ENTITY = "proj:general_decisions"
 _DELETE_CHUNK = 500
+_STALE_DAYS = 14
+_BACKLOG_WARNING = 20
+_PREVIEW_MAX = 80
+_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Issue #44 CTO 红线:纯通用词禁止作为别名入库,已入库的在慢波下次触碰该卡时清洗(精确匹配,不误伤「时间机器」类长词)
 _GENERIC_ALIAS_BLACKLIST = frozenset({
     "记忆", "方案", "项目", "系统", "服务", "配置", "记录", "问题", "时间", "数据", "工具",
@@ -62,26 +69,30 @@ def _is_authoritative(log: Dict[str, Any]) -> bool:
     return (
         log["role"] == "user"
         and log["phase_hint"] == "approval"
-        and not _EXPLORATION_RE.search(log["raw_text"])
+        and not is_exploratory(log["raw_text"])
     )
 
 
 def _is_explicit_addition(log: Dict[str, Any]) -> bool:
-    return log.get("phase_hint") == EXPLICIT_HINT and not _EXPLORATION_RE.search(log["raw_text"])
+    return log.get("phase_hint") == EXPLICIT_HINT and not is_exploratory(log["raw_text"])
 
 
 def _clean_decision(text: Optional[str]) -> Optional[str]:
     return (text or "").lstrip(_LEADING_PUNCT).strip() or None
 
 
-def _resolve_explicit_entity(text: str, index: Dict[str, str]) -> str:
-    for anchor in _ENTITY_RE.findall(text):
-        if anchor in index:
-            return index[anchor]
-        bare = anchor[len("proj:"):]
-        if bare in index:
-            return index[bare]
-    return _GENERAL_ENTITY
+def _lookup_entity(anchor: str, index: Dict[str, str]) -> Optional[str]:
+    if anchor in index:
+        return index[anchor]
+    return index.get(anchor[len("proj:"):])
+
+
+def _age_days(created_at: Optional[str]) -> Optional[int]:
+    try:
+        created = datetime.strptime(created_at or "", _TIME_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return max(0, (datetime.now(timezone.utc) - created).days)
 
 
 def _merge_facts(current: Optional[Dict[str, Any]], new: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -141,6 +152,8 @@ def _describe_change(plan: Dict[str, Any], before: Optional[Dict[str, Any]], aft
 def _entity_index_of(states: List[Dict[str, Any]]) -> Dict[str, str]:
     index: Dict[str, str] = {}
     for state in states:
+        if state["entity_id"] in RESERVED_ENTITIES:
+            continue
         index[state["entity_id"]] = state["entity_id"]
         for alias in state["metadata"].get("aliases", []):
             index.setdefault(alias, state["entity_id"])
@@ -153,17 +166,79 @@ class _Snapshot:
         self,
         phase_logs: List[Dict[str, Any]],
         states: List[Dict[str, Any]],
-        recent_entity: Optional[str],
         fingerprints: Dict[str, Tuple[Any, ...]],
     ):
         self.phase_logs = phase_logs
         self.states = states
-        self.recent_entity = recent_entity
         self.fingerprints = fingerprints
         self.index = _entity_index_of(states)
+        routable = [state for state in states if state["entity_id"] not in RESERVED_ENTITIES]
         self.catalog = "; ".join(
-            f"{state['entity_id']}({','.join(state['metadata'].get('aliases', []))})" for state in states
+            f"{state['entity_id']}({','.join(state['metadata'].get('aliases', []))})" for state in routable
         )
+        self.names_by_entity = {state["entity_id"]: _routing_names(state) for state in routable}
+
+
+def _routing_names(state: Dict[str, Any]) -> List[str]:
+    entity_id = str(state["entity_id"]).lower()
+    names = [state["display_name"], *state["metadata"].get("aliases", [])]
+    return [
+        name for name in names
+        if isinstance(name, str) and name not in _GENERIC_ALIAS_BLACKLIST
+        and name.strip().lower() != entity_id and not name.strip().lower().startswith("proj:")
+    ]
+
+
+class _RoutingReport:
+    """Issue #95:一次整理里每条未固化事实的归卡决定,供人审与夜间报告。"""
+
+    def __init__(self, mode: str, preview_chars: int = 0, dry_run: bool = False):
+        self.mode = mode
+        self.dry_run = dry_run
+        self.preview_chars = max(0, min(int(preview_chars or 0), _PREVIEW_MAX))
+        self.items: List[Dict[str, Any]] = []
+
+    @property
+    def write_decision(self) -> str:
+        return "would_write" if self.dry_run else "written"
+
+    def add(
+        self, log: Dict[str, Any], kind: str, decision: str, *, target: Optional[str] = None,
+        via: Optional[str] = None, ranked: Optional[List[Tuple[str, int]]] = None,
+        reason: Optional[str] = None, anchor_note: Optional[str] = None,
+    ) -> None:
+        age = _age_days(log.get("created_at"))
+        item: Dict[str, Any] = {
+            "id": log["id"], "kind": kind, "decision": decision, "target": target, "via": via,
+            "scores": [[entity_id, score] for entity_id, score in (ranked or [])[:2]],
+            "reason": reason, "age_days": age,
+        }
+        if anchor_note:
+            item["anchor"] = anchor_note
+        if decision == "pending" and age is not None and age > _STALE_DAYS:
+            item["stale"] = True
+        if self.preview_chars:
+            item["preview"] = log["raw_text"][:self.preview_chars]
+        self.items.append(item)
+
+    def defer(self, entity_id: str, reason: str) -> None:
+        for item in self.items:
+            if item["target"] == entity_id and item["decision"] in ("written", "would_write"):
+                item["decision"], item["reason"] = "deferred", reason
+
+    def as_dict(self) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {
+            "anchor": 0, "verdict": 0, "name": 0, "written": 0, "would_write": 0, "would_route": 0,
+            "deferred": 0, "pending": 0, "stale": 0, "exploratory": 0, "superseded": 0,
+        }
+        for item in self.items:
+            if item["via"] in ("anchor", "verdict", "name"):
+                summary[item["via"]] += 1
+            summary[item["decision"]] += 1
+            summary["stale"] += 1 if item.get("stale") else 0
+        if summary["pending"] > _BACKLOG_WARNING:
+            summary["backlog_warning"] = True
+        return {"mode": self.mode, "summary": summary, "items": self.items}
 
 def _empty_candidates() -> Dict[str, Any]:
     return {"verified": 0, "rejected": [], "skipped": []}
@@ -194,7 +269,8 @@ class DreamConsolidator:
         self._run_mutex = threading.Lock()
 
     def run_consolidation(
-        self, target_date: Optional[str] = None, dry_run: bool = False, lock: Optional[Any] = None
+        self, target_date: Optional[str] = None, dry_run: bool = False, lock: Optional[Any] = None,
+        preview_chars: int = 0,
     ) -> Dict[str, Any]:
         """Issue #87:三段式——锁内取快照 -> 锁外只对内存快照分析并调模型 -> 锁内重新检查再回写。
 
@@ -202,22 +278,26 @@ class DreamConsolidator:
         真实整理走非阻塞互斥,第二次进来直接返回 busy;dry_run 只读预览,不占互斥。
         """
         if dry_run:
-            return self._run(target_date, True, lock)
+            return self._run(target_date, True, lock, preview_chars)
         if not self._run_mutex.acquire(blocking=False):
             return {
                 "status": "busy", "archived_logs": 0, "updated_states": [], "archive_file": None,
                 "skipped_explicit": [], "batch_judge": {"status": "busy"}, "candidates": _empty_candidates(),
+                "routing": _RoutingReport(fact_routing_mode()).as_dict(),
                 "message": "整理正在进行,本次请求未执行",
             }
         try:
-            return self._run(target_date, False, lock)
+            return self._run(target_date, False, lock, preview_chars)
         finally:
             self._run_mutex.release()
 
-    def _run(self, target_date: Optional[str], dry_run: bool, lock: Optional[Any]) -> Dict[str, Any]:
+    def _run(
+        self, target_date: Optional[str], dry_run: bool, lock: Optional[Any], preview_chars: int = 0
+    ) -> Dict[str, Any]:
         guard = lock if lock is not None else nullcontext()
         # Issue #78:dry_run 真跑分析与回写,读出结果后整体回滚;不跑批量判研(会写库)、不写冷归档
         judge_report = {"status": "skipped_dry_run"} if dry_run else self._batch_judge_step(lock)
+        routing = _RoutingReport(fact_routing_mode(), preview_chars, dry_run)
         with guard:
             snap = self._take_snapshot(target_date)
         phase_logs = snap.phase_logs
@@ -228,8 +308,8 @@ class DreamConsolidator:
             log for log in phase_logs
             if log["phase_hint"] not in (EXPLICIT_HINT, CANDIDATE_HINT) and not log.get("expired_at")
         ], snap)
-        skipped = self._merge_explicit(plans, explicit_logs, snap)
-        candidates = self._merge_candidates(plans, candidate_logs, snap)
+        skipped = self._merge_explicit(plans, explicit_logs, snap, routing)
+        candidates = self._merge_candidates(plans, candidate_logs, snap, routing)
         folded = [log for plan in plans for log in plan["logs"]]
         if not folded and not candidates["rejected"]:
             report = {
@@ -241,9 +321,13 @@ class DreamConsolidator:
                 report.update(
                     status="dry_run", dry_run=True, would_archive_logs=0, would_update_states=[], changes=[]
                 )
-            return report
-        with guard:
-            return self._commit(snap, plans, candidates, skipped, judge_report, target_date, dry_run)
+        else:
+            with guard:
+                report = self._commit(snap, plans, candidates, skipped, judge_report, target_date, dry_run)
+        for change in report.get("skipped_changed", []):
+            routing.defer(change["entity_id"], change["reason"])
+        report["routing"] = routing.as_dict()
+        return report
 
     def _take_snapshot(self, target_date: Optional[str]) -> _Snapshot:
         phase_logs = self.scratchpad.export_pending_phase_logs(target_date)
@@ -252,14 +336,7 @@ class DreamConsolidator:
             row[0]: (row[1], row[2], row[3])
             for row in self.conn.execute("SELECT entity_id, version, updated_at, current_decision FROM living_states")
         }
-        row = self.conn.execute(
-            """
-            SELECT entity_id FROM living_states
-            WHERE status = 'ACTIVE' AND updated_at >= datetime('now', '-30 minutes')
-            ORDER BY updated_at DESC LIMIT 1
-            """
-        ).fetchone()
-        return _Snapshot(phase_logs, states, row[0] if row else None, fingerprints)
+        return _Snapshot(phase_logs, states, fingerprints)
 
     def _commit(
         self,
@@ -368,8 +445,44 @@ class DreamConsolidator:
             logger.warning("batch judge step failed: %s", exc)
             return {"status": "failed", "error": str(exc)[:200]}
 
+    def _route_fact(
+        self, text: str, index: Dict[str, str], snap: _Snapshot, verdict_entity: Any = None
+    ) -> Dict[str, Any]:
+        """未固化事实归哪张卡:开头锚点 > 候选核实给出的实体 > 名字匹配。都不行返回 target=None。"""
+        anchor = leading_anchor(text)
+        note = None
+        if anchor:
+            if anchor in RESERVED_ENTITIES:
+                note = "reserved_anchor"
+            else:
+                target = _lookup_entity(anchor, index)
+                if target:
+                    return {"target": target, "via": "anchor", "ranked": [], "reason": None, "note": None}
+                note = "anchor_unknown"
+        if isinstance(verdict_entity, str) and verdict_entity in index:
+            return {"target": index[verdict_entity], "via": "verdict", "ranked": [], "reason": None, "note": note}
+        ranked = rank_entities(text, snap.names_by_entity)
+        winner = pick_winner(ranked)
+        if winner:
+            return {"target": winner, "via": "name", "ranked": ranked, "reason": None, "note": note}
+        return {
+            "target": None, "via": None, "ranked": ranked,
+            "reason": "ambiguous" if ranked else "no_match", "note": note,
+        }
+
+    def _plan_for(self, plans: List[Dict[str, Any]], by_entity: Dict[str, Dict[str, Any]], entity_id: str):
+        plan = by_entity.get(entity_id)
+        if plan is None:
+            plan = {
+                "entity_id": entity_id, "logs": [], "decision": None, "superseded": None,
+                "display_name": None, "aliases": [], "facts": [],
+            }
+            by_entity[entity_id] = plan
+            plans.append(plan)
+        return plan
+
     def _merge_explicit(
-        self, plans: List[Dict[str, Any]], logs: List[Dict[str, Any]], snap: _Snapshot
+        self, plans: List[Dict[str, Any]], logs: List[Dict[str, Any]], snap: _Snapshot, routing: _RoutingReport
     ) -> List[Dict[str, Any]]:
         skipped: List[Dict[str, Any]] = []
         by_entity = {plan["entity_id"]: plan for plan in plans}
@@ -377,29 +490,51 @@ class DreamConsolidator:
         index.update({entity_id: entity_id for entity_id in by_entity})
         for log in sorted(logs, key=lambda item: (item["created_at"], item["id"])):
             if log.get("expired_at"):
-                skipped.append({"id": log["id"], "reason": "已被后续记录推翻(supersedes_id),不再固化"})
+                skipped.append({"id": log["id"], "kind": "superseded", "reason": "已被后续记录推翻(supersedes_id),不再固化"})
+                routing.add(log, "explicit", "superseded", reason="superseded")
                 continue
             if not _is_explicit_addition(log):
-                skipped.append({"id": log["id"], "reason": "含探索或疑问措辞,不作为事实固化"})
+                skipped.append({"id": log["id"], "kind": "exploratory", "reason": "含探索或疑问措辞,不作为事实固化"})
+                routing.add(log, "explicit", "exploratory", reason="exploratory")
                 continue
-            entity_id = _resolve_explicit_entity(log["raw_text"], index)
-            plan = by_entity.get(entity_id)
-            if plan is None:
-                plan = {
-                    "entity_id": entity_id, "logs": [], "decision": None, "superseded": None,
-                    "display_name": None, "aliases": [], "facts": [],
-                }
-                by_entity[entity_id] = plan
-                plans.append(plan)
+            route = self._route_fact(log["raw_text"], index, snap)
+            if route["target"] is None:
+                skipped.append({
+                    "id": log["id"], "kind": "unrouted",
+                    "reason": "没有开头锚点且名字匹配不到唯一的卡,留在热表待分拣",
+                })
+                routing.add(
+                    log, "explicit", "pending", ranked=route["ranked"], reason=route["reason"],
+                    anchor_note=route["note"],
+                )
+                continue
+            if route["via"] == "name" and routing.mode != ROUTING_APPLY:
+                skipped.append({
+                    "id": log["id"], "kind": "deferred",
+                    "reason": f"闸门为 log:名字匹配到 {route['target']},只记录,未写卡",
+                })
+                routing.add(
+                    log, "explicit", "would_route", target=route["target"], via="name",
+                    ranked=route["ranked"], anchor_note=route["note"],
+                )
+                continue
+            routing.add(
+                log, "explicit", routing.write_decision, target=route["target"], via=route["via"],
+                ranked=route["ranked"], anchor_note=route["note"],
+            )
+            plan = self._plan_for(plans, by_entity, route["target"])
             plan["logs"].append(log)
-            plan.setdefault("facts", []).append({
+            fact = {
                 "id": log["id"], "text": log["raw_text"], "category": log.get("category"),
                 "reason": log.get("reason"), "created_at": log["created_at"],
-            })
+            }
+            if route["via"] == "name":
+                fact["routed_by"] = "name"
+            plan.setdefault("facts", []).append(fact)
         return skipped
 
     def _merge_candidates(
-        self, plans: List[Dict[str, Any]], logs: List[Dict[str, Any]], snap: _Snapshot
+        self, plans: List[Dict[str, Any]], logs: List[Dict[str, Any]], snap: _Snapshot, routing: _RoutingReport
     ) -> Dict[str, Any]:
         """红线 1:candidate 经 System 2 二次核实——通过并入 facts,否决归档清退,不参与定案改写。"""
         report: Dict[str, Any] = {"verified": 0, "rejected": [], "skipped": []}
@@ -424,21 +559,34 @@ class DreamConsolidator:
                 reason = "核实为非正式定案" if kind == CANDIDATE_DECISION else "核实为非客观事实"
                 report["rejected"].append({**log, "reject_reason": reason})
                 continue
-            entity_id = self._resolve_verified_entity(verdict.get("entity"), log["raw_text"], index)
-            plan = by_entity.get(entity_id)
-            if plan is None:
-                plan = {
-                    "entity_id": entity_id, "logs": [], "decision": None, "superseded": None,
-                    "display_name": None, "aliases": [], "facts": [],
-                }
-                by_entity[entity_id] = plan
-                plans.append(plan)
+            route = self._route_fact(log["raw_text"], index, snap, verdict.get("entity"))
+            if route["target"] is None:
+                report["skipped"].append({"id": log["id"], "reason": "没有开头锚点且名字匹配不到唯一的卡,留在热表待分拣"})
+                routing.add(
+                    log, "candidate", "pending", ranked=route["ranked"], reason=route["reason"],
+                    anchor_note=route["note"],
+                )
+                continue
+            if route["via"] == "name" and routing.mode != ROUTING_APPLY:
+                report["skipped"].append({"id": log["id"], "reason": f"闸门为 log:名字匹配到 {route['target']},只记录,未写卡"})
+                routing.add(
+                    log, "candidate", "would_route", target=route["target"], via="name",
+                    ranked=route["ranked"], anchor_note=route["note"],
+                )
+                continue
+            routing.add(
+                log, "candidate", routing.write_decision, target=route["target"], via=route["via"],
+                ranked=route["ranked"], anchor_note=route["note"],
+            )
+            plan = self._plan_for(plans, by_entity, route["target"])
             plan["logs"].append(log)
             fact = {
                 "id": log["id"], "text": log["raw_text"], "category": kind,
                 "reason": f"candidate:{log.get('reason') or 'verified'}",
                 "created_at": log["created_at"], "noul": log["noul_score"],
             }
+            if route["via"] == "name":
+                fact["routed_by"] = "name"
             if verdict["subject"]:
                 fact["subject"] = verdict["subject"]
             plan.setdefault("facts", []).append(fact)
@@ -460,13 +608,6 @@ class DreamConsolidator:
             "entity": data.get("entity") or "",
             "subject": (data.get("subject") or "").strip() if is_decision else "",
         }
-
-    def _resolve_verified_entity(
-        self, proposed: Any, text: str, index: Dict[str, str]
-    ) -> str:
-        if isinstance(proposed, str) and proposed in index:
-            return index[proposed]
-        return _resolve_explicit_entity(text, index)
 
     def purge_scratchpad(
         self,
@@ -531,11 +672,11 @@ class DreamConsolidator:
         groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         last_entity: Dict[str, str] = {}
         for log in phase_logs:
-            entity = self._extract_entity(log["raw_text"])
+            entity = parse_anchor(log["raw_text"])
             if entity:
                 last_entity[log["session_id"]] = entity
             elif _is_authoritative(log):
-                entity = last_entity.get(log["session_id"]) or snap.recent_entity or _GENERAL_ENTITY
+                entity = last_entity.get(log["session_id"])
             if entity:
                 groups[entity].append(log)
 
@@ -586,10 +727,6 @@ class DreamConsolidator:
                 if s:
                     superseded = (s.group(1) or s.group(2)).strip()
         return {"decision": decision, "superseded": superseded, "display_name": None, "aliases": aliases}
-
-    def _extract_entity(self, text: str) -> Optional[str]:
-        m = _ENTITY_RE.search(text)
-        return m.group(1) if m else None
 
     def _write_archive(self, logs: List[Dict[str, Any]], prefix: str) -> str:
         os.makedirs(self.archive_dir, exist_ok=True)
@@ -716,20 +853,45 @@ class DreamConsolidator:
         return self.conn.execute("SELECT strftime('%Y-%m-%d %H:%M:%S', 'now')").fetchone()[0]
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="白泽·Cortex 慢波睡眠合成")
     parser.add_argument("--db", default="baize.db")
     parser.add_argument("--archive-dir", default="cold_archive")
     parser.add_argument("--date", default=None)
-    args = parser.parse_args()
-    conn = init_db(args.db)
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="只读预览:把数据库读进内存再整理,不写目标库(含 -wal/-shm)、不写冷归档、不跑批量判研",
+    )
+    parser.add_argument("--no-llm", action="store_true", help="不构造 System 2 客户端,即使环境里配了 CORTEX_LLM_*")
+    parser.add_argument("--preview-chars", type=int, default=0, help="routing 明细里附正文前 N 字(上限 80,默认 0)")
+    args = parser.parse_args(argv)
+    if not os.path.isfile(args.db):
+        print(f"数据库不存在: {args.db}", file=sys.stderr)
+        return 2
+    if args.preview_chars < 0:
+        print("--preview-chars 不能为负数", file=sys.stderr)
+        return 2
     try:
-        consolidator = DreamConsolidator(conn, archive_dir=args.archive_dir, llm_client=llm_client_from_env())
-        report = consolidator.run_consolidation(args.date)
+        conn = open_memory_copy(args.db) if args.dry_run else init_db(args.db)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    try:
+        llm = None if args.no_llm else llm_client_from_env()
+        print(
+            f"db={os.path.abspath(args.db)} mode={'dry-run' if args.dry_run else 'execute'} "
+            f"routing={fact_routing_mode()} llm={'disabled' if args.no_llm else ('env' if llm else 'none')}",
+            file=sys.stderr,
+        )
+        consolidator = DreamConsolidator(conn, archive_dir=args.archive_dir, llm_client=llm)
+        report = consolidator.run_consolidation(
+            args.date, dry_run=args.dry_run, preview_chars=args.preview_chars
+        )
         print(json.dumps(report, ensure_ascii=False))
     finally:
         conn.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
