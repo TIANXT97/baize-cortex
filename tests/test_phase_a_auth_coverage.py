@@ -39,6 +39,7 @@ def _requests():
         ("post", "/v1/admin/expire-scratchpad", {"ids": [1], "dry_run": True}),
         ("get", "/v1/living-state/proj:x/history", None),
         ("post", "/v1/admin/living-state/rollback", {"entity_id": "proj:x", "dry_run": True}),
+        ("post", "/v1/admin/relocate-facts", {"source_entity": "proj:x", "dry_run": True}),
         ("post", "/v1/admin/seed", None),
     ]
 

@@ -11,9 +11,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 
-from baize.core.consolidator import DreamConsolidator
+from baize.core.consolidator import DreamConsolidator, RelocateError
 from baize.core.living_state import LivingStateManager
 from baize.core.normalization import idempotency_key as make_idempotency_key
 from baize.core.normalization import normalize_content
@@ -129,6 +129,17 @@ class RollbackIn(BaseModel):
     entity_id: str
     to_version: Optional[int] = None
     history_id: Optional[int] = None
+    dry_run: bool = True
+
+
+class MoveIn(BaseModel):
+    fact_id: StrictInt
+    target: Optional[str] = None
+
+
+class RelocateIn(BaseModel):
+    source_entity: str
+    moves: Optional[List[MoveIn]] = None
     dry_run: bool = True
 
 
@@ -462,6 +473,21 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
                 raise HTTPException(status_code=404, detail=str(exc))
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc))
+
+    @app.post("/v1/admin/relocate-facts")
+    def admin_relocate_facts(body: RelocateIn, request: Request):
+        authenticate(request)
+        if not body.dry_run and not body.moves:
+            raise HTTPException(status_code=422, detail="执行搬事实(dry_run=false)必须带人审过的非空 moves")
+        moves = None if body.moves is None else [move.model_dump() for move in body.moves]
+        try:
+            return app.state.consolidator.relocate_facts(body.source_entity, moves, body.dry_run, lock=lock)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except RelocateError as exc:
+            raise HTTPException(status_code=422, detail={"message": str(exc), "problems": exc.problems})
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
 
     @app.post("/v1/admin/expire-scratchpad")
     def admin_expire_scratchpad(body: ExpireIn, request: Request):
