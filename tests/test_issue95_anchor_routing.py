@@ -153,7 +153,7 @@ def test_sample_533_no_matching_card_stays_pending_never_general():
                 report = _run(consolidator, mode)
                 item = _item(report, lid)
                 assert item["decision"] == "pending" and item["target"] is None, (mode, item)
-                assert item["reason"] == "no_match" and item["scores"] == []
+                assert item["reason"] == "no_system2" and item["name_result"] == "no_match" and item["scores"] == []
                 assert report["archived_logs"] == 0 and report["updated_states"] == []
                 assert [s["kind"] for s in report["skipped_explicit"]] == ["unrouted"]
                 assert _hot(conn) == [lid]
@@ -188,7 +188,8 @@ def test_sample_559_close_scores_stay_pending_in_both_modes():
                 lid = _add(sp, text)
                 report = _run(consolidator, mode)
                 item = _item(report, lid)
-                assert item["decision"] == "pending" and item["reason"] == "ambiguous", (mode, item)
+                assert item["decision"] == "pending" and item["reason"] == "no_system2", (mode, item)
+                assert item["name_result"] == "ambiguous"
                 assert [s[0] for s in item["scores"]] == [BETA, ALPHA]
                 assert _hot(conn) == [lid] and living.get_state(GENERAL) is None
                 assert _facts(living, ALPHA) == [] and _facts(living, BETA) == []

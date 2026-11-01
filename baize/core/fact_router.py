@@ -1,9 +1,10 @@
 """Issue #95:事实归卡用到的纯函数(锚点解析、疑问措辞判断)。不碰数据库与模型。"""
+import json
 import os
 import re
 import unicodedata
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 RESERVED_ENTITIES = frozenset({"proj:general_decisions"})
 
@@ -15,6 +16,7 @@ NAME_MIN_CHARS = 4
 NAME_REPEAT_CAP = 3
 AUTO_MIN_SCORE = 6
 AUTO_DOMINANCE = 2.0
+ROUTE_ANSWER_MAX_CHARS = 80
 
 _ANCHOR_RE = re.compile(r"^[\s\[\(【「《\"'“‘`]*(proj:[A-Za-z0-9_\-]+)")
 
@@ -100,3 +102,22 @@ def pick_winner(ranked: List[Tuple[str, int]]) -> Optional[str]:
     if top >= AUTO_MIN_SCORE and top >= AUTO_DOMINANCE * second:
         return ranked[0][0]
     return None
+
+def parse_route_answer(raw: Any, index: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    """模型选卡的返回 -> (目标实体, 可记入报告的答案)。非 JSON、非对象、空串、不在索引里、保留名一律返回 target=None。
+
+    答案只留 entity 字段的字符串并截断,模型的其他输出不外传。
+    """
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, None
+    entity = data.get("entity") if isinstance(data, dict) else None
+    if not isinstance(entity, str):
+        return None, None
+    answer = entity.strip()
+    shown = answer[:ROUTE_ANSWER_MAX_CHARS] or None
+    target = index.get(answer) if answer else None
+    if target is None or answer in RESERVED_ENTITIES or target in RESERVED_ENTITIES:
+        return None, shown
+    return target, shown
