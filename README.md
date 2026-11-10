@@ -211,6 +211,47 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+#### 机器重启或休眠后的补跑
+
+上面的 timer 开了 `Persistent=true`，机器停机跨过触发点时，开机后会立刻补跑。但 `baize-cortex.service` 是 `Type=simple`，进程起来不等于端口已经在听，光写 `After=` / `Wants=` 不够：补跑的慢波可能在服务就绪前就发请求，curl 报 `Failed to connect`（退出码 7），这一天就漏掉了，也不会自己重试。
+
+用 drop-in 补上「先等健康检查、失败隔一段时间重试」，不改原单元文件：
+
+```ini
+# /etc/systemd/system/baize-cortex-slowwave.service.d/10-wait-and-retry.conf
+[Unit]
+# 3 小时内最多启动 4 次（含首次），主服务坏掉时不会无限重试
+StartLimitIntervalSec=3h
+StartLimitBurst=4
+
+[Service]
+# 最多等 5 分钟（60 次 × 5 秒）健康检查通过
+ExecStartPre=/bin/sh -c 'i=0; until /usr/bin/curl -fsS -m 3 -o /dev/null http://127.0.0.1:8768/health; do i=$$((i+1)); if [ $$i -ge 60 ]; then echo "baize-cortex health check not ok after 5 min" >&2; exit 1; fi; sleep 5; done'
+# HTTP 出错也算失败；连接被拒和临时错误重试 3 次。重复触发时服务返回 busy，不会重复整理
+ExecStart=
+ExecStart=/usr/bin/curl -sS --fail-with-body --retry 3 --retry-connrefused --retry-delay 20 -m 600 -X POST http://127.0.0.1:8768/v1/sleep/consolidate -H 'Content-Type: application/json' -d '{}'
+TimeoutStartSec=2400
+Restart=on-failure
+RestartSec=10min
+
+# /etc/systemd/system/baize-cortex-purge.service.d/10-wait-and-retry.conf
+[Unit]
+StartLimitIntervalSec=3h
+StartLimitBurst=4
+
+[Service]
+ExecStartPre=/bin/sh -c 'i=0; until /usr/bin/curl -fsS -m 3 -o /dev/null http://127.0.0.1:8768/health; do i=$$((i+1)); if [ $$i -ge 60 ]; then echo "baize-cortex health check not ok after 5 min" >&2; exit 1; fi; sleep 5; done'
+TimeoutStartSec=1800
+Restart=on-failure
+RestartSec=10min
+```
+
+- `ExecStartPre` 里的 `$$` 是 systemd 对 `$` 的转义，执行时会变回 `$`
+- 启用了 `CORTEX_AGENT_TOKENS` 时，覆盖后的 `ExecStart` 里同样要加 `-H 'Authorization: Bearer <token>'`
+- purge 直接读写数据库，等健康检查是为了不在服务启动流程中间插进去
+- 改完执行 `systemctl daemon-reload`，用 `systemd-analyze verify <单元名>` 检查，`systemctl cat <单元名>` 应能看到 drop-in
+- 慢波漏跑后想立刻补上：`systemctl start baize-cortex-slowwave.service`，然后在 `journalctl -u baize-cortex-slowwave.service` 里确认返回 `"status":"ok"`
+
 ### Hermes 插件
 
 - 参考实现在 `baize/client/`（纯标准库：`plugin.py`、`outbox.py`、`breaker.py`、`recall.py`）。Hermes 实际加载的是插件目录下的入口文件，它 import `baize` 包并委托给 `CortexClient`
