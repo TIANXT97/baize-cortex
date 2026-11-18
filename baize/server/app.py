@@ -15,7 +15,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictInt
 
 from baize.core.consolidator import DreamConsolidator, RelocateError
+from baize.client.plugin import MIRROR_ORIGIN, WRITE_FAILED_ORIGIN
 from baize.core.living_state import LivingStateManager
+from baize.core.memory_migrator import FILES as MEMORY_FILES
+from baize.core.memory_migrator import MemoryMigrator, USER_FILE, recent_runs, user_profile_anchor
 from baize.core.normalization import idempotency_key as make_idempotency_key
 from baize.core.normalization import normalize_content
 from baize.core.resident import ResidentError, ResidentManager
@@ -26,7 +29,9 @@ from baize.core.scratchpad import (
 )
 from baize.core.temporal_graph import BiTemporalGraphManager
 from baize.core.seeds import seed_initial_assets
-from baize.core.visibility import VISIBILITY_GROUP_OK, VISIBILITY_PRIVATE, visibility_of
+from baize.core.visibility import (
+    SCOPE_DM, VISIBILITY_GROUP_OK, VISIBILITY_PRIVATE, normalize_scope, visibility_of,
+)
 from baize.intelligence.phase_detector import llm_client_from_env
 from baize.intelligence.ppr_engine import PPREngine
 from baize.intelligence.recall_router import CognitiveRecallRouter
@@ -78,6 +83,8 @@ class CortexAddIn(BaseModel):
     reason: str = ""
     idempotency_key: Optional[str] = None
     supersedes_id: Optional[int] = None
+    origin: Optional[str] = None
+    moved_from: Optional[str] = None
 
 
 class DecisionIn(BaseModel):
@@ -185,6 +192,11 @@ class ResidentUpdateIn(BaseModel):
     dry_run: bool = False
 
 
+class MigrationRollbackIn(BaseModel):
+    batch_id: str
+    dry_run: bool = True
+
+
 class BackfillIn(BaseModel):
     dry_run: bool = True
 
@@ -211,6 +223,9 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         app.state.consolidator = DreamConsolidator(conn, archive_dir=archive_dir, llm_client=llm_client_from_env())
         app.state.router = CognitiveRecallRouter(conn, ppr)
         app.state.resident = ResidentManager(conn)
+        app.state.migrator = (
+            None if db_path == ":memory:" else MemoryMigrator(db_path, app.state.consolidator.llm_client)
+        )
         try:
             yield
         finally:
@@ -251,6 +266,22 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
             if hmac.compare_digest(known.encode("utf-8"), token.encode("utf-8")):
                 return agent
         raise HTTPException(status_code=403, detail="凭据无效")
+
+    def touch_migration(trigger: str) -> None:
+        """Issue #105 PR2:顺手量一次记忆文件字数,超线就交给后台线程;任何异常都不影响本次请求。"""
+        migrator = getattr(app.state, "migrator", None)
+        if migrator is None:
+            return
+        try:
+            migrator.on_request(trigger)
+        except Exception:
+            pass
+
+    def touch_after_add(origin: Optional[str]) -> None:
+        if origin == MIRROR_ORIGIN:
+            touch_migration("on_memory_write")
+        elif origin == WRITE_FAILED_ORIGIN:
+            touch_migration("write_failed")
 
     def deduplicated(existing, agent_id: Optional[str]) -> Dict[str, Any]:
         if (existing[1] or DEFAULT_AGENT) != agent_id:
@@ -294,6 +325,7 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
                 if existing:
                     return deduplicated(existing, agent_id)
                 raise
+        touch_migration("sync_turn")
         return {"id": log_id}
 
     @app.post("/v1/cortex/add")
@@ -312,14 +344,36 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         if body.idempotency_key and body.idempotency_key != key:
             raise HTTPException(status_code=422, detail="idempotency_key 与规范化结果不一致")
 
+        failed_write = body.origin == WRITE_FAILED_ORIGIN
+        reason, stored, raw_content = body.reason, content, content
+        if failed_write:
+            if body.moved_from not in MEMORY_FILES:
+                raise HTTPException(status_code=422, detail=f"moved_from 必须是 {list(MEMORY_FILES)} 之一")
+            reason = f"moved_from={body.moved_from};write_failed"
+            raw_content = body.content.strip()
+            stored = raw_content
+
         conn = app.state.conn
         with lock:
             existing = app.state.scratchpad.find_by_idempotency_key(key)
             if existing:
+                touch_after_add(body.origin)
                 return {**deduplicated(existing, agent_id), "idempotency_key": key}
+            if failed_write:
+                if body.moved_from == USER_FILE:
+                    anchor, _ = user_profile_anchor(conn)
+                    stored = f"{anchor} {raw_content}" if anchor else raw_content
+                same = conn.execute(
+                    "SELECT id, agent_id FROM scratchpad_log WHERE phase_hint = 'explicit_addition' "
+                    "AND expired_at IS NULL AND reason = ? AND raw_text IN (?, ?) ORDER BY id LIMIT 1",
+                    (reason, raw_content, stored),
+                ).fetchone()
+                if same:
+                    touch_after_add(body.origin)
+                    return {**deduplicated(same, agent_id), "idempotency_key": key}
             try:
                 new_id = app.state.scratchpad.add_explicit(
-                    body.session_id, content, body.category, body.reason, key, agent_id, commit=False
+                    body.session_id, stored, body.category, reason, key, agent_id, commit=False
                 )
                 if body.supersedes_id is not None:
                     supersede(conn, "scratchpad_log", new_id, body.supersedes_id, commit=False)
@@ -342,6 +396,7 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
             except Exception:
                 conn.rollback()
                 raise
+        touch_after_add(body.origin)
         return {"id": new_id, "deduplicated": False, "idempotency_key": key}
 
     @app.get("/v1/living-states")
@@ -489,7 +544,10 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         # Issue #39:读路径与写路径使用同一个 agent 身份,否则跨代理召回没有隔离依据。
         agent_id = authenticate(request)
         with lock:
-            return app.state.router.recall(body.query, body.top_k, agent_id=agent_id, scope=body.scope)
+            result = app.state.router.recall(body.query, body.top_k, agent_id=agent_id, scope=body.scope)
+        if normalize_scope(body.scope) == SCOPE_DM:
+            touch_migration("recall")
+        return result
 
     @app.post("/v1/admin/backfill-display-names")
     def admin_backfill(body: BackfillIn, request: Request):
@@ -584,6 +642,27 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
             )
         with lock:
             return app.state.scratchpad.expire_rows(body.ids, body.session_ids, body.dry_run)
+
+    @app.get("/v1/admin/memory-migration/runs")
+    def admin_memory_migration_runs(
+        request: Request, limit: int = 10, batch_id: Optional[str] = None, file: Optional[str] = None
+    ):
+        authenticate(request)
+        with lock:
+            return {"runs": recent_runs(app.state.conn, limit, batch_id, file)}
+
+    @app.post("/v1/admin/memory-migration/rollback")
+    def admin_memory_migration_rollback(body: MigrationRollbackIn, request: Request):
+        authenticate(request)
+        migrator = app.state.migrator
+        if migrator is None:
+            raise HTTPException(status_code=422, detail="内存数据库不支持外迁")
+        try:
+            return migrator.rollback(body.batch_id, body.dry_run)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
     @app.post("/v1/admin/seed")
     def admin_seed(request: Request):

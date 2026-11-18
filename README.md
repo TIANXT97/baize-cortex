@@ -106,6 +106,8 @@ pip install -r requirements.txt
 | `CORTEX_ALLOW_ADMIN_SEED` | 是否放行 `POST /v1/admin/seed`，`1` / `true` / `on` 放行 | 拒绝（403） |
 | `CORTEX_RESIDENT_DM_BUDGET` | 常驻层私聊注入的字符预算（含标题行，其中 `group_ok` 子集另受下一项限制） | 1500 |
 | `CORTEX_RESIDENT_GROUP_BUDGET` | 常驻层群聊注入的字符预算，同时是私聊预算里 `group_ok` 规则的上限 | 600 |
+| `CORTEX_MEMORY_MIGRATION` | 记忆文件自动外迁与夜间常驻层整理的开关：`off` / `dry_run` / `apply`，大小写与首尾空白忽略，非法值按 `dry_run` 处理并记一次警告 | `dry_run`：只出报告，文件和库（除运行记录）都不变 |
+| `CORTEX_HERMES_HOME` | Hermes 主目录；记忆文件在 `<主目录>/memories/`，字数上限读 `<主目录>/config.yaml` 的 `memory.memory_char_limit` / `memory.user_char_limit`（读不到用 2200 / 1375） | `~/.hermes`（运行服务的用户的主目录） |
 
 **插件进程**（Hermes 网关，加载 `baize/client/` 的那一侧）：
 
@@ -259,6 +261,7 @@ RestartSec=10min
 - 参考实现在 `baize/client/`（纯标准库：`plugin.py`、`outbox.py`、`breaker.py`、`recall.py`）。Hermes 实际加载的是插件目录下的入口文件，它 import `baize` 包并委托给 `CortexClient`
 - 部署：把仓库里的 `baize/` 包放到插件进程能 import 到的位置（或在入口文件里把仓库路径加进 `sys.path`），入口文件放到 `<hermes_home>/plugins/cortex/`。入口文件约定读取 `CORTEX_URL`（服务地址，默认本机 8768 端口）、`CORTEX_TOKEN`（启用凭据时）和 `HERMES_HOME`（Outbox 文件放在 `<hermes_home>/outbox.jsonl`）
 - 改了插件文件，或更新了 `baize/` 包，都要重启 Hermes 网关才生效
+- 写失败兜底（Issue #105 PR2）需要入口把 `sync_turn` 的 `messages` 转给 client，补丁见 `deploy/hermes_plugin_entry_pr2.patch` 和上面「记忆文件自动外迁」一节
 - 顺序：先升级并重启 Cortex 服务，再更新插件。新插件依赖服务端新增的接口，反序时群聊会 fail-closed，什么都不注入
 - 常驻层（Issue #105）：入口文件的 Provider 里加一个委托方法即可，Hermes 在构建 system prompt 时调用一次，结果随 system prompt 冻结，改动下个会话生效：
 
@@ -279,6 +282,32 @@ RestartSec=10min
 - **接口**（都要鉴权，写接口都支持 `dry_run`）：`GET /v1/resident?scope=dm|group`（返回 `text`、`rules` 与 `report`；认不出的 scope 一律按群聊，群聊只含 `group_ok`）、`GET /v1/resident/rules[?include_retired=true]`、`GET /v1/resident/rules/{id}`、`GET /v1/resident/rules/{id}/history`、`POST /v1/resident/rules`、`PATCH /v1/resident/rules/{id}`、`DELETE /v1/resident/rules/{id}`
 - **预算**：私聊 1500 字符（其中 `group_ok` 最多 600），群聊 600 字符，可用上面两个环境变量覆盖；标题行与项目符号都算在内。超了不报错：按 `priority`（`hard` > `normal` > `low`）再按 `updated_at` 新到旧注入，放不下就停（低优先级不插队），剩下的写进 `report.omitted` 并打 warning 日志。合并与降级留给后续的夜间整理
 - **导入**：`python -m baize.cortex_resident_import 清单.json`，默认只 `dry_run`，加 `--execute` 才写；执行前先整批 `dry_run`，有一条被拒就整批不写，重复执行安全。清单格式见 `docs/examples/resident_rules.example.json`，凭据读环境变量 `CORTEX_TOKEN`
+
+### 记忆文件自动外迁（Issue #105 PR2）
+
+Hermes 的 `MEMORY.md`（2200 字符）和 `USER.md`（1375 字符）有硬上限。cortex 在文件超过上限的 70% 时，把最早的条目外迁到常驻层或事实，降到 60% 以下。
+
+- **开关**：`CORTEX_MEMORY_MIGRATION=off|dry_run|apply`，默认 `dry_run`。`dry_run` 只写运行记录，不改记忆文件，也不写常驻层、事实等其他表；`off` 连字数都不量。Hermes 主目录用 `CORTEX_HERMES_HOME` 指定，上限从它的 `config.yaml` 读。触发线 70%、目标线 60% 是 `baize/core/memory_migrator.py` 里的常量（`TRIGGER_PERCENT` / `TARGET_PERCENT`），按整数算：2200 对应 1540 / 1320，1375 对应 962 / 825
+- **字数算法**与 Hermes 的 `_parse_entries` / `_char_count` 一致：按 `\n§\n` 分隔，每条 strip、去空、去重（保持顺序），再用 `\n§\n` join 后取 `len`，测试锁死
+- **触发**：不加文件监视。以下请求顺手量一次，请求线程里只做 stat 加读文件，按 mtime / size 缓存，超线就起后台线程外迁，量字数或外迁的任何异常都不影响请求：`POST /v1/recall`（`scope=dm`）、`POST /v1/scratchpad/log`（同步对话）、`POST /v1/cortex/add` 里 `origin` 为镜像（`hermes_builtin_mirror`，插件 `on_memory_write` 只在 Hermes 写成功时才发）或写失败兜底（`hermes_memory_write_failed`）。群聊（`scope` 不是 `dm`、认不出）的 recall 不量。同一时间只跑一个外迁（进程内锁加库里的运行标记，标记超过 30 分钟算僵死可接管），一次外迁结束后同一文件至少隔 10 分钟再检查；`dry_run` 下文件没变就不重复出报告。夜间整理不触发外迁
+- **挑哪些**：从最早的条目挑起，跳过开头带「【底线】」的条目，挑到剩下的字数低于目标线；全是底线或模型失败导致降不到目标时，能挑的都挑，报告写明
+- **分类**：用跟夜间整理同一个 System 2 客户端逐条判断「规则」还是「知识」。模型报错、超时、返回解析不了的条目这次不动，下次再试；每次外迁最多调 10 次模型（`MAX_MODEL_CALLS`）
+- **去向**：
+  - 规则 → 常驻层（scope 固定 `dm`，`source=memory_migration`，`moved_from` 为原文件，`batch_id` 为本批），走 PR1 同一套校验。单条超 300 字符、含换行（常驻层按行注入，折行会改原文）、或写入会让常驻层超预算的，改按知识处理，报告写明原因（`rule_fallback`）。常驻层里已有一字不差的规则就复用，不重复写，回滚时也不会撤掉它
+  - 知识 → 一条 `explicit_addition` 事实，原文不做 NFKC 归一（要求一字不差），`reason` 为 `moved_from=<文件>;batch=<batch_id>`，进待归卡队列，由夜间整理按 #95 / #104 的规则归卡
+  - `USER.md` 来的：规则一律 `dm`（`moved_from=USER.md` 的规则不允许标 `group_ok`）；知识开头带 `proj:user_profile` 锚点，只进这张私有卡。卡不存在、已停用或不是私有时，不带锚点进队列并在报告里写 `anchor_note`，不会自动建卡
+  - 库里已有内容一字不差的镜像事实（`hermes_builtin_mirror`）：新写一条带 `moved_from` 的事实，并把镜像那条标过期（软删除），所以夜里只会归一次；回滚时把镜像那条恢复。不复用旧行，是因为镜像行没有 `moved_from`，`USER.md` 的知识还需要锚点，改旧行的内容比新写加过期更难回滚
+- **顺序与安全**（任何一步失败，记忆文件都不动，已写的库内副本会撤销）：① 备份到数据库同目录下的 `memory_backups/`，文件名带 `batch_id`，权限 0600，保留 14 天，过期的顺手清掉；② 写库并提交，逐条读回确认一字不差；③ 对 `<文件名>.lock` 加 `flock`（与 Hermes 同一把锁；锁文件不存在就按 0600 创建并 chown 成记忆文件的属主；用 `LOCK_NB` 轮询最多 30 秒，不会永远挂住），锁内重读，只删本批迁走且仍一字不差存在的条目，其余（包括 Hermes 这期间新写的）原样保留，在这期间被 Hermes 改动或删除的条目，对应的库内副本撤销；④ 写同目录临时文件再 `os.replace`，新文件 chown / chmod 回原来的 uid / gid / mode（cortex 以 root 运行时记忆文件属于另一个用户，不改回 Hermes 会读不了）；⑤ 写完重量字数写进报告
+- **回滚**：`POST /v1/admin/memory-migration/rollback`，body `{"batch_id": "...", "dry_run": true}`（默认 `dry_run`）。常驻规则软删除（`status=retired`），事实标过期，被标过期的镜像事实恢复，然后在锁内把本批迁走的条目加回文件（已存在的不重复，插回原来的位置，不用备份整个覆盖，所以不会冲掉 Hermes 之后的新写入）。加回会超过上限时什么都不改（文件、库都不动），返回原因、`over_limit` 和 `backup_path`。只能撤回已执行（`apply`）且未撤回的批次
+- **报告**：新表 `memory_migration_runs`（老库启动自动建表，不动已有表），每次外迁（含 `dry_run`、不到触发线的空跑）一行：触发来源、文件、模式、前后字数、备份路径，以及 `report_json` 里逐条的去向（常驻层 id 和 scope，或事实 id、锚点、队列）、跳过的条目和原因。`GET /v1/admin/memory-migration/runs?limit=&batch_id=&file=` 查最近几批。夜间整理的返回里带 `memory_migration`（当天的外迁摘要）和 `resident_budget`（见下）
+- **写失败兜底**：Hermes 的 `memory` 工具超上限拒绝 add / replace 时不会触发 `on_memory_write`（它只在写成功后通知），拿不到内容。Hermes 每轮把本轮 `messages`（含工具调用和结果）传给插件的 `sync_turn`，`CortexClient.sync_turn` 收到后用 `failed_memory_writes` 识别 `success` 不是 true 且报错含 `would put memory at` / `would exceed the limit` 的 add / replace（含批量里的每个 add / replace，不含 patch），把内容改存进 cortex（`explicit_addition`，`reason=moved_from=<文件>;write_failed`），同时触发一次外迁检查。只在私聊会话做（认不出按群聊，不写）；同一条重复失败只存一次（进程内去重，服务端再按内容去重）；`USER.md` 来的失败内容同样只进私有卡。内容超过 2000 字符存不进去，记日志。入口文件没打补丁时其余功能照常，只是没有这条兜底
+- **夜间常驻层整理**：常驻层私聊总字数超过预算（1500）的 90%，或 `group_ok` 部分超过群聊预算（600）的 90% 时，夜间整理先让模型合并相近的规则（只合并同 scope；合并结果走同一套校验；带 `USER.md` 来源的合并后仍是 `dm`；最多 2 次模型调用），还超就把优先级低、最久没改的规则降级成普通事实（`moved_from=resident_rules`；`USER.md` 来源的带私有卡锚点）。`priority=hard` 的既不合并也不降级。还超就沿用 PR1 的按优先级注入，只在报告里写明，不报错、不卡住。同样受 `CORTEX_MEMORY_MIGRATION` 管：`dry_run` 只报告「会合并 / 降级哪几条」（`would_merge` / `would_demote`），不改库
+- **上线步骤**：
+  1. 合并后先升级并重启 Cortex 服务（构建、重启由 NAS 侧维护者执行）。此时开关是默认的 `dry_run`，只出报告；日志里不会有任何记忆文件被改
+  2. 观察一阵 `GET /v1/admin/memory-migration/runs` 和夜间整理返回里的 `memory_migration` / `resident_budget`，确认挑选和去向符合预期
+  3. （可选，但没有它就没有写失败兜底）给插件入口打补丁：`cd <hermes_home> && patch -p1 < <仓库>/deploy/hermes_plugin_entry_pr2.patch`，只改一行，把 `sync_turn` 收到的 `messages` 转给 `self._client.sync_turn(..., messages=messages)`；补丁以现在线上入口为基准，先备份入口再 `patch --dry-run`；打完重启 Hermes 网关。必须先上新版服务和 `baize/` 包，再打补丁；补丁和 `on_memory_write` / `system_prompt_block` 不冲突
+  4. 在服务的 systemd drop-in 里设 `Environment=CORTEX_MEMORY_MIGRATION=apply`，需要时再设 `Environment=CORTEX_HERMES_HOME=<主目录>`，重启服务。运行服务的用户要对 `<主目录>/memories/` 有读写权限（以非 root 运行时必须就是记忆文件的属主），并且对数据库所在目录有写权限（备份写在那里）
+  5. 要撤回某一批：先 `dry_run` 看计划，再 `dry_run=false`
 
 ### 升级
 
@@ -304,7 +333,7 @@ curl -s http://127.0.0.1:8768/health
 for f in tests/test_*.py; do PYTHONPATH=. python "$f" || echo "FAILED: $f"; done
 ```
 
-每个测试文件也可以单独运行，例如 `PYTHONPATH=. python tests/test_phase1_mvp.py`。仓库目前有 41 个测试文件，修改代码后请全部跑一遍。
+每个测试文件也可以单独运行，例如 `PYTHONPATH=. python tests/test_phase1_mvp.py`。仓库目前有 45 个测试文件，修改代码后请全部跑一遍。
 
 ---
 
@@ -330,6 +359,8 @@ baize-cortex/
 │   │   ├── supersession.py    # supersedes_id 校验与旧记录失效
 │   │   ├── visibility.py      # Issue #72: 会话范围 (dm/group) 判定与活体卡群聊可见性
 │   │   ├── resident.py        # Issue #105: 常驻层 (规则存储 / group_ok 写入校验 / 预算裁剪)
+│   │   ├── memory_migrator.py # Issue #105 PR2: Hermes 记忆文件超线自动外迁 (字数算法 / 备份 / 锁内改写 / 回滚 / 运行记录)
+│   │   ├── resident_compactor.py # Issue #105 PR2: 夜间常驻层合并与降级 (受 CORTEX_MEMORY_MIGRATION 管)
 │   │   └── seeds.py           # 核心工程资产预置
 │   ├── intelligence/          # 认知双系统与召回
 │   │   ├── phase_detector.py  # System 1: 毫秒级相变探测器 (Drex-Max)
@@ -368,11 +399,14 @@ baize-cortex/
 │   ├── test_issue84_plan_node_trace.py # Issue #84: 方案节点追溯与兜底续走 (含群聊闸)
 │   ├── test_issue87_consolidate_out_of_lock.py # Issue #87: 整理调模型不持全局锁、复查回写、整理互斥与 dry_run
 │   ├── test_issue105_resident_layer.py # Issue #105: 常驻层 (校验 / 增查改删与历史 / 预算 / 群聊只给 group_ok / 插件取块 / 导入脚本)
+│   ├── test_issue105_pr2_*.py      # Issue #105 PR2: 外迁 (字数 / 阈值 / 挑选 / 备份 / 权限属主 / 回滚)、触发点与写失败兜底、与 Hermes 抢锁并发、常驻层合并降级
 │   ├── test_issue75_day_judge_log_only.py # Issue #75: 白天判定器只记日志 (CORTEX_DAY_JUDGE) 与草稿行软清理
 │   ├── test_purge_before_date.py   # Issue #32: 草稿流时间窗归档与一键脚本
 │   ├── test_purge_protect_phase_hints.py # Issue #34: 草稿归档默认豁免待固化记录
 │   ├── test_phase_a_*.py           # Phase A: 迁移 / Outbox / cortex_add / 规范化 / 镜像 / 熔断 / 鉴权覆盖 / 配置沉淀
 │   └── fixtures/normalization_vectors.json # 规范化 golden vectors
+├── deploy/
+│   └── hermes_plugin_entry_pr2.patch # Issue #105 PR2: 插件入口补丁 (把 messages 转给 client, 启用写失败兜底)
 ├── README.md
 ├── LICENSE
 └── requirements.txt

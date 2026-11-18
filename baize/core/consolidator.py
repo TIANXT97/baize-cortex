@@ -24,6 +24,8 @@ from baize.core.fact_router import (
     leading_anchor_name, parse_anchor, parse_route_answer, pick_winner, rank_entities, resolve_anchor,
 )
 from baize.core.living_state import LivingStateManager
+from baize.core.memory_migrator import current_mode, summarize_day
+from baize.core.resident_compactor import compact_resident
 from baize.core.scratchpad import (
     CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT, EXPLICIT_HINT, ScratchpadManager,
     batch_judge_enabled,
@@ -428,7 +430,25 @@ class DreamConsolidator:
         for change in report.get("skipped_changed", []):
             routing.defer(change["entity_id"], change["reason"])
         report["routing"] = routing.as_dict()
+        report["resident_budget"] = self._resident_budget_step(dry_run, lock)
+        report["memory_migration"] = self._migration_summary(lock)
         return report
+
+    def _resident_budget_step(self, dry_run: bool, lock: Optional[Any]) -> Dict[str, Any]:
+        """Issue #105 PR2:常驻层合并与降级,受 CORTEX_MEMORY_MIGRATION 管;出错只进报告,不影响整理本身。"""
+        try:
+            return compact_resident(self.conn, self.llm_client, current_mode(), lock, consolidation_dry_run=dry_run)
+        except Exception as exc:
+            logger.warning("resident budget step failed: %s", type(exc).__name__)
+            return {"status": "error", "error": type(exc).__name__}
+
+    def _migration_summary(self, lock: Optional[Any]) -> Dict[str, Any]:
+        try:
+            with (lock if lock is not None else nullcontext()):
+                return summarize_day(self.conn)
+        except Exception as exc:
+            logger.warning("memory migration summary failed: %s", type(exc).__name__)
+            return {"status": "error", "error": type(exc).__name__}
 
     def _take_snapshot(self, target_date: Optional[str]) -> _Snapshot:
         phase_logs = self.scratchpad.export_pending_phase_logs(target_date)

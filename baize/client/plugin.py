@@ -13,7 +13,7 @@ from baize.client.recall import extract_memories
 from baize.core.normalization import idempotency_key, normalize_content
 from baize.core.scratchpad import CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT
 from baize.core.resident import SCOPE_GROUP_OK, TITLE as RESIDENT_TITLE, find_group_unsafe
-from baize.core.visibility import SCOPE_GROUP, group_view, is_group_visible, scope_from_chat_type
+from baize.core.visibility import SCOPE_DM, SCOPE_GROUP, group_view, is_group_visible, scope_from_chat_type
 from baize.intelligence.batch_judge import APPROVAL_CONFIDENCE_GATE, CANDIDATE_NOUL_GATE
 from baize.intelligence.phase_detector import (
     _APPROVAL_KEYWORDS, _REJECTION_KEYWORDS, PhaseDetector,
@@ -26,6 +26,12 @@ MAX_CONTENT = 2000
 MAX_REASON = 500
 MIRROR_TARGETS = {"MEMORY.md", "USER.md"}
 MIRROR_ORIGIN = "hermes_builtin_mirror"
+WRITE_FAILED_ORIGIN = "hermes_memory_write_failed"
+_MEMORY_TARGET_FILES = {"memory": "MEMORY.md", "user": "USER.md"}
+_FAILED_WRITE_ACTIONS = ("add", "replace")
+# 超上限被 Hermes 拒绝的报错文案:add 是 "would exceed the limit",replace/批量是 "would put memory at"
+_OVER_LIMIT_MARKERS = ("would put memory at", "would exceed the limit")
+_MAX_FAILED_SEEN = 256
 QUEUED_MESSAGE = "已保存到本地队列，将自动同步，无需重试"
 # Issue #56 P2-5(#44 B 项止血):白天快速门直接引用 PhaseDetector 本地规则词表,不再另写一份
 GATE_KEYWORDS = _APPROVAL_KEYWORDS + _REJECTION_KEYWORDS
@@ -90,6 +96,69 @@ def _retry_after(headers: Dict[str, str]) -> Optional[float]:
             except ValueError:
                 return None
     return None
+
+
+def _json_dict(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return ""
+
+
+def failed_memory_writes(messages: Any) -> List[Tuple[str, str]]:
+    """本轮(最后一条 user 消息之后)里,Hermes 因超上限拒绝的 memory add/replace:[(MEMORY.md|USER.md, 内容)]。
+
+    只认工具结果 success 不是 true 且报错含超上限文案的调用;批量 operations 整批失败,每个 add/replace 的内容都取。
+    patch 的 new_text 只是片段,不是一条完整记忆,不取。"""
+    if not isinstance(messages, list):
+        return []
+    start = 0
+    for index, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            start = index + 1
+    calls: Dict[str, Dict[str, Any]] = {}
+    found: List[Tuple[str, str]] = []
+    for message in messages[start:]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") if isinstance(call, dict) else None
+                if isinstance(function, dict) and function.get("name") == "memory" and call.get("id"):
+                    args = _json_dict(function.get("arguments"))
+                    if args is not None:
+                        calls[str(call["id"])] = args
+        elif message.get("role") == "tool" and str(message.get("tool_call_id")) in calls:
+            result = _json_dict(_message_text(message.get("content")))
+            error = result.get("error") if result else None
+            if result is None or result.get("success") is True or not isinstance(error, str):
+                continue
+            if not any(marker in error for marker in _OVER_LIMIT_MARKERS):
+                continue
+            args = calls[str(message.get("tool_call_id"))]
+            target = _MEMORY_TARGET_FILES.get(str(args.get("target") or "memory"))
+            operations = args.get("operations")
+            ops = operations if isinstance(operations, list) and operations else [args]
+            for op in ops:
+                if not isinstance(op, dict) or op.get("action") not in _FAILED_WRITE_ACTIONS or target is None:
+                    continue
+                content = str(op.get("content") or op.get("new_text") or "").strip()
+                if content and (target, content) not in found:
+                    found.append((target, content))
+    return found
 
 
 class SessionScopes:
@@ -159,6 +228,7 @@ class CortexClient:
         self._resident_url = base_url.rstrip("/") + "/v1/resident"
         self._get_transport = get_transport or urllib_get
         self._resident_cache: Dict[str, str] = {}
+        self._failed_seen: Dict[Tuple[str, str], bool] = {}
         self._log_url = base_url.rstrip("/") + "/v1/scratchpad/log"
         self._detector = phase_detector or PhaseDetector.from_env()
         self._token = token
@@ -321,14 +391,54 @@ class CortexClient:
         reason = f"config_change:{tool or 'unknown'}"[:MAX_REASON]
         return self._deliver(content, "rule", reason, None, "tool_config_change")
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", **_: Any) -> None:
-        """Hermes MemoryProvider 契约:每轮写 Layer 0,user 行经快速门打标,assistant 行恒不打标。失败只记日志。"""
+    def sync_turn(
+        self, user_content: str, assistant_content: str, *, session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None, **_: Any,
+    ) -> None:
+        """Hermes MemoryProvider 契约:每轮写 Layer 0,user 行经快速门打标,assistant 行恒不打标。失败只记日志。
+
+        messages 是 Hermes 传来的本轮消息列表(入口打了补丁才会转进来),用来兜住 memory 工具超上限写失败的内容。"""
         session = session_id or self._session_id
         if user_content:
             hint, category, noul = self._classify(user_content)
             self._log_turn(session, "user", user_content, hint, noul, category)
         if assistant_content:
             self._log_turn(session, "assistant", assistant_content, None, 0.0, None)
+        if messages:
+            self.store_failed_memory_writes(messages, session_id=session)
+
+    def store_failed_memory_writes(self, messages: Any, *, session_id: str = "") -> int:
+        """memory 工具因超上限拒绝写入的 add/replace,把内容改存进 cortex(explicit_addition,带 moved_from)。
+
+        Hermes 写失败时不会触发 on_memory_write,这是唯一能拿到这类内容的路。只在私聊会话做(与镜像的群聊隔离一致);
+        同一条重复失败只存一次(进程内去重 + 服务端按幂等键与内容去重)。任何异常只记日志。返回本次新提交的条数。"""
+        try:
+            session = session_id or self._session_id
+            if self._scopes.scope(session) != SCOPE_DM:
+                return 0
+            saved = 0
+            for target, content in failed_memory_writes(messages):
+                if len(content) > MAX_CONTENT:
+                    log.warning("memory 写失败兜底:内容超过 %s 字符,无法存入 cortex(%s)", MAX_CONTENT, target)
+                    continue
+                seen_key = (target, content)
+                if seen_key in self._failed_seen:
+                    continue
+                while len(self._failed_seen) >= _MAX_FAILED_SEEN:
+                    self._failed_seen.pop(next(iter(self._failed_seen)))
+                self._failed_seen[seen_key] = True
+                reason = f"moved_from={target};write_failed"
+                result = self._deliver(
+                    content, "fact", reason, None, WRITE_FAILED_ORIGIN, extra={"moved_from": target}
+                )
+                if result.get("status") in ("ok", "queued") and not result.get("deduplicated"):
+                    saved += 1
+                elif result.get("status") not in ("ok", "queued"):
+                    log.warning("memory 写失败兜底未存入: %s", result.get("message"))
+            return saved
+        except Exception:
+            log.exception("memory 写失败兜底出错,已忽略")
+            return 0
 
     def _classify(self, text: str) -> Tuple[Optional[str], Optional[str], float]:
         # 快速门未命中留 NULL:批量判开启时自动 pending 等夜间判,关闭时归第 5 层普通轮次
@@ -398,9 +508,12 @@ class CortexClient:
         return payload
 
     def _deliver(
-        self, content: str, category: str, reason: str, supersedes_id: Optional[int], origin: Optional[str]
+        self, content: str, category: str, reason: str, supersedes_id: Optional[int], origin: Optional[str],
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         payload = self._payload(content, category, reason, supersedes_id, origin)
+        if extra:
+            payload.update(extra)
         key = payload["idempotency_key"]
         try:
             status, body, _ = self._transport(self._url, payload, self._headers(), self._timeout)

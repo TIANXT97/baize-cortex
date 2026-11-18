@@ -92,6 +92,29 @@ CREATE TABLE IF NOT EXISTS resident_rule_history (
 
 CREATE INDEX IF NOT EXISTS idx_resident_rule_history_rule ON resident_rule_history(rule_id, id);
 
+-- Issue #105 PR2 外迁运行记录:每次外迁(含 dry_run、不到触发线的空跑)一行。纯新增表,不动已有表。
+-- status: running(运行标记,started_at 超过 30 分钟视为僵死可接管)/ done / dry_run / skipped / failed / abandoned / rolled_back
+-- report_json 存逐条去向、跳过原因、备份路径等(含条目原文,仅管理接口可读)。时间戳统一 'YYYY-MM-DD HH:MM:SS' UTC。
+CREATE TABLE IF NOT EXISTS memory_migration_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL UNIQUE,
+    trigger_source TEXT NOT NULL,
+    file TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    chars_before INTEGER,
+    chars_after INTEGER,
+    limit_chars INTEGER,
+    backup_path TEXT,
+    source_signature TEXT,
+    report_json TEXT NOT NULL DEFAULT '{}',
+    rolled_back_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_migration_runs_file ON memory_migration_runs(file, id);
+
 -- ============================================================================
 -- Layer 2: 双时态实体拓扑图 (Bi-temporal Graph)
 -- 实体节点与带有现实有效时态、系统认知时态的有向加权关系网
