@@ -17,11 +17,11 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from baize.core.fact_router import (
-    RESERVED_ENTITIES, ROUTING_APPLY, fact_routing_mode, is_exploratory, leading_anchor, parse_anchor,
-    parse_route_answer, pick_winner, rank_entities,
+    RESERVED_ENTITIES, ROUTING_APPLY, anchor_key, anchor_map_of, fact_routing_mode, is_exploratory,
+    leading_anchor_name, parse_anchor, parse_route_answer, pick_winner, rank_entities, resolve_anchor,
 )
 from baize.core.living_state import LivingStateManager
 from baize.core.scratchpad import (
@@ -83,18 +83,24 @@ def _is_authoritative(log: Dict[str, Any]) -> bool:
     )
 
 
-def _is_explicit_addition(log: Dict[str, Any]) -> bool:
-    return log.get("phase_hint") == EXPLICIT_HINT and not is_exploratory(log["raw_text"])
+def _is_explicit_addition(log: Dict[str, Any], anchor_map: Dict[str, Set[str]]) -> bool:
+    if log.get("phase_hint") != EXPLICIT_HINT:
+        return False
+    name = leading_anchor_name(log["raw_text"])
+    if name is not None and resolve_anchor(name, anchor_map)[0] == "matched":
+        return True
+    return not is_exploratory(log["raw_text"])
 
 
 def _clean_decision(text: Optional[str]) -> Optional[str]:
     return (text or "").lstrip(_LEADING_PUNCT).strip() or None
 
 
-def _lookup_entity(anchor: str, index: Dict[str, str]) -> Optional[str]:
-    if anchor in index:
-        return index[anchor]
-    return index.get(anchor[len("proj:"):])
+def _anchor_names(state: Dict[str, Any]) -> List[str]:
+    return [
+        alias for alias in state["metadata"].get("aliases", [])
+        if isinstance(alias, str) and alias not in _GENERIC_ALIAS_BLACKLIST
+    ]
 
 
 def _age_days(created_at: Optional[str]) -> Optional[int]:
@@ -188,6 +194,15 @@ class _Snapshot:
         )
         self.names_by_entity = {state["entity_id"]: _routing_names(state) for state in routable}
         self.route_catalog = "; ".join(_route_catalog_entry(state) for state in routable)
+        self.routable = routable
+        self.anchor_map = anchor_map_of((state["entity_id"], _anchor_names(state)) for state in routable)
+
+    def anchor_map_with(self, plans: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+        """approval 本次新开的实体也要能被开头锚点认出来,与已知卡一起比对。"""
+        return anchor_map_of(
+            [(state["entity_id"], _anchor_names(state)) for state in self.routable]
+            + [(plan["entity_id"], []) for plan in plans]
+        )
 
 
 def _route_catalog_entry(state: Dict[str, Any]) -> str:
@@ -227,6 +242,14 @@ def _routing_names(state: Dict[str, Any]) -> List[str]:
     ]
 
 
+_ANCHOR_UNROUTED_REASONS = {
+    "anchor_unknown": "开头锚点对不上任何卡,不按名字或模型猜,留在热表待建卡或改写",
+    "anchor_ambiguous": "开头锚点归一后对上多张卡,不猜,留在热表待分拣",
+}
+
+def _unrouted_reason(route: Dict[str, Any], fallback: str) -> str:
+    return _ANCHOR_UNROUTED_REASONS.get(route.get("reason"), fallback)
+
 class _RoutingReport:
     """Issue #95:一次整理里每条未固化事实的归卡决定,供人审与夜间报告。"""
 
@@ -244,7 +267,7 @@ class _RoutingReport:
     def add(
         self, log: Dict[str, Any], kind: str, decision: str, *, target: Optional[str] = None,
         via: Optional[str] = None, ranked: Optional[List[Tuple[str, int]]] = None,
-        reason: Optional[str] = None, anchor_note: Optional[str] = None,
+        reason: Optional[str] = None, anchor_note: Optional[str] = None, anchor_name: Optional[str] = None,
         name_result: Optional[str] = None, model_answer: Optional[str] = None,
     ) -> None:
         age = _age_days(log.get("created_at"))
@@ -255,6 +278,8 @@ class _RoutingReport:
         }
         if anchor_note:
             item["anchor"] = anchor_note
+        if anchor_name:
+            item["anchor_name"] = anchor_name
         if name_result:
             item["name_result"] = name_result
         if model_answer is not None:
@@ -286,7 +311,22 @@ class _RoutingReport:
                 reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
         if summary["pending"] > _BACKLOG_WARNING:
             summary["backlog_warning"] = True
-        return {"mode": self.mode, "summary": summary, "items": self.items}
+        return {
+            "mode": self.mode, "summary": summary, "items": self.items,
+            "card_suggestions": self._card_suggestions(),
+        }
+
+    def _card_suggestions(self) -> List[Dict[str, Any]]:
+        """anchor_unknown 的记录按归一后的锚点名汇总,给人建卡用;锚点原样取首次出现的写法。"""
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for item in self.items:
+            if item.get("reason") != "anchor_unknown" or not item.get("anchor_name"):
+                continue
+            name = item["anchor_name"][len("proj:"):]
+            key = anchor_key(name)
+            entry = grouped.setdefault(key, {"anchor": item["anchor_name"], "ids": [], "suggestion": f"建议建卡:{key}"})
+            entry["ids"].append(item["id"])
+        return list(grouped.values())
 
 class RelocateError(ValueError):
     """搬事实的 moves 没通过校验:整批拒绝,problems 逐条说明。"""
@@ -508,22 +548,32 @@ class DreamConsolidator:
 
     def _route_fact(
         self, text: str, index: Dict[str, str], snap: _Snapshot, verdict_entity: Any = None, *,
-        budget: Optional[_ModelBudget] = None, created_at: Optional[str] = None,
+        anchor_map: Optional[Dict[str, Set[str]]] = None, budget: Optional[_ModelBudget] = None,
+        created_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         """未固化事实归哪张卡:开头锚点 > 候选核实给出的实体 > 名字匹配 > System 2 选卡(仅 budget 不为 None 时)。
 
+        开头锚点归一后对不上或对上多张卡时直接留待,不走名字匹配、不调模型、不采信候选核实的实体。
         都不行返回 target=None 和原因。created_at 给了且超过 _STALE_DAYS 天就不再调模型。
         """
-        anchor = leading_anchor(text)
+        name = leading_anchor_name(text)
+        anchor_name = f"proj:{name}" if name is not None else None
         note = None
-        if anchor:
-            if anchor in RESERVED_ENTITIES:
-                note = "reserved_anchor"
-            else:
-                target = _lookup_entity(anchor, index)
-                if target:
-                    return self._routed(target, "anchor", [], None)
-                note = "anchor_unknown"
+        if name is not None:
+            status, target = resolve_anchor(name, snap.anchor_map if anchor_map is None else anchor_map)
+            if status == "matched":
+                return {**self._routed(target, "anchor", [], None), "anchor_name": anchor_name}
+            if status in ("unknown", "ambiguous"):
+                stop = f"anchor_{status}"
+                return {**self._routed(None, None, [], stop), "reason": stop, "anchor_name": anchor_name}
+            note = "reserved_anchor"
+        result = self._route_by_name_or_model(text, index, snap, verdict_entity, note, budget, created_at)
+        return {**result, "anchor_name": anchor_name}
+
+    def _route_by_name_or_model(
+        self, text: str, index: Dict[str, str], snap: _Snapshot, verdict_entity: Any, note: Optional[str],
+        budget: Optional[_ModelBudget], created_at: Optional[str],
+    ) -> Dict[str, Any]:
         if isinstance(verdict_entity, str) and verdict_entity in index:
             return self._routed(index[verdict_entity], "verdict", [], note)
         ranked = rank_entities(text, snap.names_by_entity)
@@ -587,26 +637,30 @@ class DreamConsolidator:
         by_entity = {plan["entity_id"]: plan for plan in plans}
         index = dict(snap.index)
         index.update({entity_id: entity_id for entity_id in by_entity})
+        anchor_map = snap.anchor_map_with(plans)
         for log in sorted(logs, key=lambda item: (item["created_at"], item["id"])):
             if log.get("expired_at"):
                 skipped.append({"id": log["id"], "kind": "superseded", "reason": "已被后续记录推翻(supersedes_id),不再固化"})
                 routing.add(log, "explicit", "superseded", reason="superseded")
                 continue
-            if not _is_explicit_addition(log):
+            if not _is_explicit_addition(log, anchor_map):
                 skipped.append({"id": log["id"], "kind": "exploratory", "reason": "含探索或疑问措辞,不作为事实固化"})
                 routing.add(log, "explicit", "exploratory", reason="exploratory")
                 continue
             route = self._route_fact(
-                log["raw_text"], index, snap, budget=routing.budget, created_at=log["created_at"]
+                log["raw_text"], index, snap, anchor_map=anchor_map,
+                budget=routing.budget, created_at=log["created_at"],
             )
             detail = {
-                "ranked": route["ranked"], "anchor_note": route["note"],
+                "ranked": route["ranked"], "anchor_note": route["note"], "anchor_name": route["anchor_name"],
                 "name_result": route["name_result"], "model_answer": route["model_answer"],
             }
             if route["target"] is None:
                 skipped.append({
                     "id": log["id"], "kind": "unrouted",
-                    "reason": f"没有开头锚点,名字匹配与模型选卡都没有结果({route['reason']}),留在热表待分拣",
+                    "reason": _unrouted_reason(
+                        route, f"没有开头锚点,名字匹配与模型选卡都没有结果({route['reason']}),留在热表待分拣"
+                    ),
                 })
                 routing.add(log, "explicit", "pending", reason=route["reason"], **detail)
                 continue
@@ -646,6 +700,7 @@ class DreamConsolidator:
         by_entity = {plan["entity_id"]: plan for plan in plans}
         index = dict(snap.index)
         index.update({entity_id: entity_id for entity_id in by_entity})
+        anchor_map = snap.anchor_map_with(plans)
         for log in sorted(logs, key=lambda item: (item["created_at"], item["id"])):
             if log.get("expired_at"):
                 continue
@@ -662,10 +717,16 @@ class DreamConsolidator:
                 reason = "核实为非正式定案" if kind == CANDIDATE_DECISION else "核实为非客观事实"
                 report["rejected"].append({**log, "reject_reason": reason})
                 continue
-            route = self._route_fact(log["raw_text"], index, snap, verdict.get("entity"))
-            detail = {"ranked": route["ranked"], "anchor_note": route["note"], "name_result": route["name_result"]}
+            route = self._route_fact(log["raw_text"], index, snap, verdict.get("entity"), anchor_map=anchor_map)
+            detail = {
+                "ranked": route["ranked"], "anchor_note": route["note"], "anchor_name": route["anchor_name"],
+                "name_result": route["name_result"],
+            }
             if route["target"] is None:
-                report["skipped"].append({"id": log["id"], "reason": "没有开头锚点且名字匹配不到唯一的卡,留在热表待分拣"})
+                report["skipped"].append({
+                    "id": log["id"],
+                    "reason": _unrouted_reason(route, "没有开头锚点且名字匹配不到唯一的卡,留在热表待分拣"),
+                })
                 routing.add(log, "candidate", "pending", reason=route["reason"], **detail)
                 continue
             if route["via"] == "name" and routing.mode != ROUTING_APPLY:
