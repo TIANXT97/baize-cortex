@@ -568,7 +568,9 @@ def test_routing_report_is_present_on_every_return_branch():
         conn, sp, living, consolidator = _env(d)
         try:
             empty = _run(consolidator, None)
-            assert empty["routing"] == {"mode": "log", "summary": empty["routing"]["summary"], "items": []}
+            assert empty["routing"] == {
+                "mode": "log", "summary": empty["routing"]["summary"], "items": [], "card_suggestions": [],
+            }
             _add(sp, "ZetaPanel 的升级走脚本。")
             assert _run(consolidator, "apply", dry_run=True)["routing"]["mode"] == "apply"
             assert consolidator._run_mutex.acquire(blocking=False)
