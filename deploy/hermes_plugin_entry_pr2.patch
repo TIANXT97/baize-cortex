@@ -1,0 +1,12 @@
+--- a/plugins/cortex/__init__.py
++++ b/plugins/cortex/__init__.py
+@@ -322,7 +322,8 @@
+             logger.warning("Cortex sync_turn: client not initialized -> skipping turn recording")
+             return
+ 
+-        self._client.sync_turn(user_content, assistant_content, session_id=sid)
++        # Issue #105 PR2:把本轮 messages 交给 client,用来兜住 memory 工具超上限写失败的内容(群聊已在上面跳过)
++        self._client.sync_turn(user_content, assistant_content, session_id=sid, messages=messages)
+ 
+     def shutdown(self) -> None:
+         """Clean shutdown Outbox."""

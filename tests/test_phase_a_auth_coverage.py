@@ -48,6 +48,8 @@ def _requests():
         ("post", "/v1/resident/rules", {"text": "x", "dry_run": True}),
         ("patch", "/v1/resident/rules/1", {"priority": "low", "dry_run": True}),
         ("delete", "/v1/resident/rules/1", None),
+        ("get", "/v1/admin/memory-migration/runs", None),
+        ("post", "/v1/admin/memory-migration/rollback", {"batch_id": "mm-none", "dry_run": True}),
     ]
 
 
