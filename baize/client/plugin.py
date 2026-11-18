@@ -12,6 +12,7 @@ from baize.client.outbox import Outbox
 from baize.client.recall import extract_memories
 from baize.core.normalization import idempotency_key, normalize_content
 from baize.core.scratchpad import CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT
+from baize.core.resident import SCOPE_GROUP_OK, TITLE as RESIDENT_TITLE, find_group_unsafe
 from baize.core.visibility import SCOPE_GROUP, group_view, is_group_visible, scope_from_chat_type
 from baize.intelligence.batch_judge import APPROVAL_CONFIDENCE_GATE, CANDIDATE_NOUL_GATE
 from baize.intelligence.phase_detector import (
@@ -32,6 +33,9 @@ GATE_KEYWORDS = _APPROVAL_KEYWORDS + _REJECTION_KEYWORDS
 # 只有这些切换原因说明新会话与旧会话在同一个聊天里,才能继承旧会话的 chat_type;resume 等可能换到别的聊天,不继承
 _INHERIT_REASONS = frozenset({"compression", "new_session"})
 _MAX_TRACKED_SESSIONS = 1024
+# Issue #105:常驻层在会话开头取一次,慢了宁可不注入也不拖住开场
+RESIDENT_TIMEOUT = 2.0
+_MAX_RESIDENT_CACHE = 64
 
 Transport = Callable[[str, Dict[str, Any], Dict[str, str], float], Tuple[int, Dict[str, Any], Dict[str, str]]]
 
@@ -62,6 +66,15 @@ def urllib_transport(url: str, body: Dict[str, Any], headers: Dict[str, str], ti
     request = urllib.request.Request(
         url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST"
     )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return resp.status, _parse_json(resp.read()), dict(resp.headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, _parse_json(exc.read()), dict(exc.headers)
+
+
+def urllib_get(url: str, headers: Dict[str, str], timeout: float):
+    request = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             return resp.status, _parse_json(resp.read()), dict(resp.headers)
@@ -139,9 +152,13 @@ class CortexClient:
         path: str = "/v1/cortex/add",
         phase_detector: Optional[Any] = None,
         scopes: Optional["SessionScopes"] = None,
+        get_transport: Optional[Callable[[str, Dict[str, str], float], Tuple[int, Dict[str, Any], Dict[str, str]]]] = None,
     ):
         self._url = base_url.rstrip("/") + path
         self._recall_url = base_url.rstrip("/") + "/v1/recall"
+        self._resident_url = base_url.rstrip("/") + "/v1/resident"
+        self._get_transport = get_transport or urllib_get
+        self._resident_cache: Dict[str, str] = {}
         self._log_url = base_url.rstrip("/") + "/v1/scratchpad/log"
         self._detector = phase_detector or PhaseDetector.from_env()
         self._token = token
@@ -216,6 +233,51 @@ class CortexClient:
             sid, chat_type, len(filtered["living_states"]), len(withheld), withheld,
         )
         return filtered
+
+    def resident_block(self, session_id: str = "", timeout: float = RESIDENT_TIMEOUT) -> str:
+        """常驻层注入文本(Hermes system_prompt_block 用):每个会话只取一次,结果冻结在缓存里。
+
+        私聊/群聊判断与 recall_scoped 同一把尺(SessionScopes,认不出按群聊)。群聊只接受服务端回显 scope=group
+        的响应,并在本地再过滤一遍:只留 group_ok 且通过安全校验的规则。连不上、超时、非 2xx、返回异常一律返回空串,不抛异常。
+        """
+        sid = session_id or self._session_id
+        if sid in self._resident_cache:
+            return self._resident_cache[sid]
+        try:
+            scope = scope_from_chat_type(self._scopes.chat_type(sid))
+            status, body, _ = self._get_transport(
+                f"{self._resident_url}?scope={scope}", self._headers(), timeout
+            )
+            if not 200 <= status < 300 or not isinstance(body, dict):
+                return ""
+            title = body.get("title") if isinstance(body.get("title"), str) and body.get("title") else RESIDENT_TITLE
+            if scope == SCOPE_GROUP:
+                if body.get("scope") != SCOPE_GROUP:
+                    log.warning("resident gate CLOSED: session=%s scope=group 但服务端未回显 scope,不注入", sid)
+                    return ""
+                texts = []
+                for rule in body.get("rules") or []:
+                    text = rule.get("text") if isinstance(rule, dict) else None
+                    if not isinstance(text, str) or not text or rule.get("scope") != SCOPE_GROUP_OK:
+                        log.warning("resident gate: session=%s 群聊响应里有非 group_ok 规则,已丢弃", sid)
+                        continue
+                    if find_group_unsafe(text):
+                        log.warning("resident gate: session=%s group_ok 规则 id=%s 未过本地安全校验,已丢弃", sid, rule.get("id"))
+                        continue
+                    texts.append(f"- {text}")
+                text = "\n".join(texts)
+            else:
+                text = body.get("text")
+                if not isinstance(text, str):
+                    return ""
+            block = f"{title}\n{text}" if text.strip() else ""
+            while len(self._resident_cache) >= _MAX_RESIDENT_CACHE:
+                self._resident_cache.pop(next(iter(self._resident_cache)))
+            self._resident_cache[sid] = block
+            return block
+        except Exception as exc:
+            log.warning("resident_block 失败,本会话不注入常驻规则: %s", exc)
+            return ""
 
     def prefetch(self, query: str, top_k: int = 5, *, session_id: str = "", as_text: bool = False) -> Any:
         """Recall relevant memories via /v1/recall,按会话范围(dm / group)过滤。

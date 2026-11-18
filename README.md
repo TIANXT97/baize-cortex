@@ -104,6 +104,8 @@ pip install -r requirements.txt
 | `CORTEX_REASONING_MODEL` | System 2 使用的模型名 | 使用代码内置默认值（见 `baize/intelligence/phase_detector.py`） |
 | `CORTEX_AGENT_TOKENS` | 凭据表，格式 `token:agent_id,token2:agent_id2` | 不校验，所有写入归属 `default` |
 | `CORTEX_ALLOW_ADMIN_SEED` | 是否放行 `POST /v1/admin/seed`，`1` / `true` / `on` 放行 | 拒绝（403） |
+| `CORTEX_RESIDENT_DM_BUDGET` | 常驻层私聊注入的字符预算（含标题行，其中 `group_ok` 子集另受下一项限制） | 1500 |
+| `CORTEX_RESIDENT_GROUP_BUDGET` | 常驻层群聊注入的字符预算，同时是私聊预算里 `group_ok` 规则的上限 | 600 |
 
 **插件进程**（Hermes 网关，加载 `baize/client/` 的那一侧）：
 
@@ -258,6 +260,25 @@ RestartSec=10min
 - 部署：把仓库里的 `baize/` 包放到插件进程能 import 到的位置（或在入口文件里把仓库路径加进 `sys.path`），入口文件放到 `<hermes_home>/plugins/cortex/`。入口文件约定读取 `CORTEX_URL`（服务地址，默认本机 8768 端口）、`CORTEX_TOKEN`（启用凭据时）和 `HERMES_HOME`（Outbox 文件放在 `<hermes_home>/outbox.jsonl`）
 - 改了插件文件，或更新了 `baize/` 包，都要重启 Hermes 网关才生效
 - 顺序：先升级并重启 Cortex 服务，再更新插件。新插件依赖服务端新增的接口，反序时群聊会 fail-closed，什么都不注入
+- 常驻层（Issue #105）：入口文件的 Provider 里加一个委托方法即可，Hermes 在构建 system prompt 时调用一次，结果随 system prompt 冻结，改动下个会话生效：
+
+  ```python
+  def system_prompt_block(self) -> str:
+      return self._client.resident_block(self._session_id or "") if self._client else ""
+  ```
+
+  `resident_block` 按会话的 `chat_type` 请求 `GET /v1/resident`（认不出按群聊），超时 2 秒；连不上、超时、非 2xx、返回异常都返回空串，不抛异常，`MEMORY.md` 底线照常生效。群聊只接受服务端回显 `scope=group` 的响应，并在本地再滤一遍：只留 `group_ok` 且通过安全校验的规则
+
+### 常驻层（Issue #105）
+
+常驻层放每个会话都要遵守的少量硬规则，开场由插件原样注入，不靠关键词召回，也不占 `MEMORY.md` 的字数上限。
+
+- **存储**：`resident_rules`（`id`、`text`、`scope`、`priority`、`source`、`moved_from`、`batch_id`、`created_at`、`updated_at`、`status`）与 `resident_rule_history`（每次增、改、删各写一行旧值快照）。纯新增表，旧库启动时自动建表，不改任何已有表；删除是软删除（`status=retired`）。不复用 `pinned` 字段
+- **scope**：只有 `dm`（默认，只在私聊注入）和 `group_ok`（群聊也注入）。`priority` 为 `hard` / `normal` / `low`
+- **写入校验**（新增和修改都拦，纯函数在 `baize/core/resident.py` 的 `find_group_unsafe` / `validate_rule`）：标成 `group_ok` 的文本不能含 IP（v4/v6）、文件路径、主机名或域名加端口、URL、凭据样式（已知密钥前缀、`ou_` 加十六进制、`token=` 这类赋值、`password`、长随机串）与邮箱；`moved_from` 为 `USER.md` 的规则不能标 `group_ok`；单条最多 300 字符。命中返回 4xx，`detail` 写原因，`reasons` 给原因代码。普通中文句子里的斜杠（「私聊/群聊」）不算路径；误伤边界写在该文件的注释里
+- **接口**（都要鉴权，写接口都支持 `dry_run`）：`GET /v1/resident?scope=dm|group`（返回 `text`、`rules` 与 `report`；认不出的 scope 一律按群聊，群聊只含 `group_ok`）、`GET /v1/resident/rules[?include_retired=true]`、`GET /v1/resident/rules/{id}`、`GET /v1/resident/rules/{id}/history`、`POST /v1/resident/rules`、`PATCH /v1/resident/rules/{id}`、`DELETE /v1/resident/rules/{id}`
+- **预算**：私聊 1500 字符（其中 `group_ok` 最多 600），群聊 600 字符，可用上面两个环境变量覆盖；标题行与项目符号都算在内。超了不报错：按 `priority`（`hard` > `normal` > `low`）再按 `updated_at` 新到旧注入，放不下就停（低优先级不插队），剩下的写进 `report.omitted` 并打 warning 日志。合并与降级留给后续的夜间整理
+- **导入**：`python -m baize.cortex_resident_import 清单.json`，默认只 `dry_run`，加 `--execute` 才写；执行前先整批 `dry_run`，有一条被拒就整批不写，重复执行安全。清单格式见 `docs/examples/resident_rules.example.json`，凭据读环境变量 `CORTEX_TOKEN`
 
 ### 升级
 
@@ -283,7 +304,7 @@ curl -s http://127.0.0.1:8768/health
 for f in tests/test_*.py; do PYTHONPATH=. python "$f" || echo "FAILED: $f"; done
 ```
 
-每个测试文件也可以单独运行，例如 `PYTHONPATH=. python tests/test_phase1_mvp.py`。仓库目前有 36 个测试文件，修改代码后请全部跑一遍。
+每个测试文件也可以单独运行，例如 `PYTHONPATH=. python tests/test_phase1_mvp.py`。仓库目前有 41 个测试文件，修改代码后请全部跑一遍。
 
 ---
 
@@ -294,10 +315,12 @@ baize-cortex/
 ├── docs/                      # 架构规范与理论文献
 │   ├── ARCHITECTURE.md        # 白泽·Cortex 完整架构设计白皮书
 │   ├── CHANGELOG.md           # 按 PR 记录的变更日志
-│   └── PEER_REVIEWS.md        # 三方异构红蓝军同行评审报告实录
+│   ├── PEER_REVIEWS.md        # 三方异构红蓝军同行评审报告实录
+│   └── examples/resident_rules.example.json # Issue #105: 常驻规则导入清单示例 (编造文本)
 ├── baize/                     # 核心源码骨架
 │   ├── __init__.py
 │   ├── cortex_purge.py        # 草稿流冷归档一键脚本 (默认 dry-run)
+│   ├── cortex_resident_import.py # Issue #105: 常驻规则人审清单导入脚本 (默认 dry_run)
 │   ├── core/                  # 核心引擎层
 │   │   ├── living_state.py    # Layer 1: 项目活体状态卡管理器 (自动墓碑 / 历史快照 / 回滚)
 │   │   ├── temporal_graph.py  # Layer 2: 双时态图谱与有效子图切片
@@ -306,6 +329,7 @@ baize-cortex/
 │   │   ├── normalization.py   # 内容规范化与幂等键 (客户端/服务端共用)
 │   │   ├── supersession.py    # supersedes_id 校验与旧记录失效
 │   │   ├── visibility.py      # Issue #72: 会话范围 (dm/group) 判定与活体卡群聊可见性
+│   │   ├── resident.py        # Issue #105: 常驻层 (规则存储 / group_ok 写入校验 / 预算裁剪)
 │   │   └── seeds.py           # 核心工程资产预置
 │   ├── intelligence/          # 认知双系统与召回
 │   │   ├── phase_detector.py  # System 1: 毫秒级相变探测器 (Drex-Max)
@@ -343,6 +367,7 @@ baize-cortex/
 │   ├── test_issue83_seed_guard_and_system2_entries.py # Issue #83: seed 默认拒绝与三个整理入口共用 System 2 配置
 │   ├── test_issue84_plan_node_trace.py # Issue #84: 方案节点追溯与兜底续走 (含群聊闸)
 │   ├── test_issue87_consolidate_out_of_lock.py # Issue #87: 整理调模型不持全局锁、复查回写、整理互斥与 dry_run
+│   ├── test_issue105_resident_layer.py # Issue #105: 常驻层 (校验 / 增查改删与历史 / 预算 / 群聊只给 group_ok / 插件取块 / 导入脚本)
 │   ├── test_issue75_day_judge_log_only.py # Issue #75: 白天判定器只记日志 (CORTEX_DAY_JUDGE) 与草稿行软清理
 │   ├── test_purge_before_date.py   # Issue #32: 草稿流时间窗归档与一键脚本
 │   ├── test_purge_protect_phase_hints.py # Issue #34: 草稿归档默认豁免待固化记录
@@ -375,6 +400,7 @@ baize-cortex/
 - [x] **Issue #83: seed 端点默认拒绝与整理入口统一 System 2** —— `POST /v1/admin/seed` 默认 403（`CORTEX_ALLOW_ADMIN_SEED` 为 `1` / `true` / `on` 才放行，仍先过鉴权）；HTTP 服务、命令行整理入口、MCP 整理工具共用 `llm_client_from_env()` 读取 System 2 配置
 - [x] **Issue #84: 方案节点追溯与兜底续走** —— 问题里带已作废方案原话时，顺着 `decided_as` 边（含已失效）追溯到现役卡并返回现行方案；追溯不到继续走后面的兜底层；群聊视图沿用 #72 的闸
 - [x] **Issue #87: 整理调模型挪出全局锁** —— 整理改为三段（锁内快照、锁外调模型、锁内复查回写），卡片或来源行被改过则整组跳过；整理专用非阻塞互斥，重复触发返回 `busy`；`dry_run` 同样走三段式
+- [x] **Issue #105 PR1: 常驻层** —— 新表 `resident_rules` 与历史表、`/v1/resident*` 读写接口（写接口带 `dry_run`）、`group_ok` 写入校验（拦 IP / 路径 / 主机端口 / URL / 凭据，`USER.md` 来源不得标 `group_ok`）、私聊 1500 / 群聊 600 字符预算与 report、插件 `resident_block`（`system_prompt_block` 委托）、人审清单导入脚本；`MEMORY.md` / `USER.md` 自动外迁留给 PR2
 - [x] **README 快速开始** —— 安装、环境变量、启动、定时任务、插件部署与升级说明
 - [ ] **Issue #64: System 2 批量判研准召定线与慢波 candidate 闭环** —— 已完成 PR #65（只读评测引擎 judge_eval、布尔校验/标签保留契约硬化）与 PR #68（提示词定案与事实边界对齐）；NAS 侧黄金集复核已完成，PR #70（提示词 v3，草稿）实测三轮准确率 73%~74%，未达 95% 准入线，事实候选留存仍不稳；`CORTEX_BATCH_JUDGE` 继续保持 off，待准召达标后再受控启用
 - [ ] **后续: 全量生产平滑割接** —— 现役存量数据提纯与全场景持续演化(原路线图中的 Phase 6 编号已被别名提纯占用,此项改为不编号待排期)

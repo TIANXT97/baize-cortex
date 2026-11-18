@@ -41,6 +41,13 @@ def _requests():
         ("post", "/v1/admin/living-state/rollback", {"entity_id": "proj:x", "dry_run": True}),
         ("post", "/v1/admin/relocate-facts", {"source_entity": "proj:x", "dry_run": True}),
         ("post", "/v1/admin/seed", None),
+        ("get", "/v1/resident?scope=dm", None),
+        ("get", "/v1/resident/rules", None),
+        ("get", "/v1/resident/rules/1", None),
+        ("get", "/v1/resident/rules/1/history", None),
+        ("post", "/v1/resident/rules", {"text": "x", "dry_run": True}),
+        ("patch", "/v1/resident/rules/1", {"priority": "low", "dry_run": True}),
+        ("delete", "/v1/resident/rules/1", None),
     ]
 
 
