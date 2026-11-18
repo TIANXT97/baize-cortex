@@ -2,6 +2,22 @@
 
 按合并时间倒序记录。每个功能 PR 合并后，补一个 `docs/*` 分支同步本文件、`README.md` 与 `docs/ARCHITECTURE.md`，同样走 PR 合并。
 
+## 2026-11-18
+
+### 功能：常驻层——每个会话开头注入的硬规则（Part of #105，PR1）
+- **背景**：Agent 侧 `MEMORY.md` / `USER.md` 有字数上限，每轮必守的规则靠关键词召回不稳；群聊里召回只看 `group_ok` 卡，群聊安全规则在群里召回不到。#105 把必守规则放进 cortex 的常驻层，由插件在会话开头注入。本 PR 只做常驻层本身，`MEMORY.md` / `USER.md` 自动外迁、`on_memory_write` 钩子与夜间整理的规则合并是 PR2。
+- **做法**：
+  - 存储：新增 `resident_rules` 与 `resident_rule_history` 两张纯新增表（写在 `schema.sql`，旧库启动时自动建表，不动已有表，不复用 `pinned`）；每次增、改、删写一行旧值快照，删除是软删除（`status=retired`）。
+  - scope 只有 `dm`（默认）与 `group_ok`。新增和修改都校验：`group_ok` 的文本不能含 IP、文件路径、主机名加端口、URL、凭据样式、邮箱，`moved_from` 为 `USER.md` 的不能标 `group_ok`，单条最多 300 字符；命中返回 422（超长 413），`reasons` 给原因代码。校验是 `baize/core/resident.py` 里的纯函数，误伤边界写在注释里（「私聊/群聊」的斜杠不算路径）。
+  - 接口：`GET /v1/resident?scope=dm|group`（认不出的 scope 按群聊，群聊只含 `group_ok`）、规则的列表 / 单条 / 历史 / 新增 / 修改 / 软删除，写接口带 `dry_run`，全部走 `authenticate`；相同文本的在用规则返回 409，所以导入可重复执行。
+  - 预算：私聊 1500 字符（其中 `group_ok` 最多 600），群聊 600 字符，`CORTEX_RESIDENT_DM_BUDGET` / `CORTEX_RESIDENT_GROUP_BUDGET` 可覆盖；标题行与项目符号都计入。超了不报错：按 `priority`（`hard` > `normal` > `low`）再按 `updated_at` 新旧注入，放不下就停，剩下的写进 `report.omitted` 并打 warning 日志。
+  - 插件：`CortexClient.resident_block()` 供 Hermes 的 `system_prompt_block()` 委托；每个会话只取一次、结果冻结；私聊 / 群聊复用 `SessionScopes`（认不出按群聊）；2 秒超时；连不上、超时、非 2xx、返回异常都返回空串。群聊要求服务端回显 `scope=group`，并在本地再滤一遍（只留 `group_ok` 且过安全校验）。
+  - 导入：`python -m baize.cortex_resident_import 清单.json`，默认 `dry_run`，`--execute` 先整批预检、有一条被拒就整批不写；示例清单在 `docs/examples/resident_rules.example.json`（编造文本）。
+- **开关**：无总开关；两个预算环境变量见 README。
+- **测试**：新增 `test_issue105_resident_layer`（19 例：IP / 路径 / 主机端口 / URL / 凭据 / 邮箱命中，普通中文与斜杠不误伤，`USER.md` 来源与超长，旧库自动建表且旧表行数不变，增查改删与历史、`dry_run`、软删除，预算裁剪与 report 与 warning，`group_ok` 子集上限，群聊只给 `group_ok`、未知 scope 按群聊，鉴权三态，插件私聊 / 群聊 / 无回显 / cortex 不可达返回空串，与真实应用端到端，导入脚本的 dry_run / 重复执行 / 整批拒绝）；`test_phase_a_auth_coverage` 补常驻层 7 项请求。
+- **部署**：先备份数据库，再升级并重启 Cortex 服务（自动建表），再更新插件入口并重启 Hermes 网关使其生效；旧版本代码不认识新表，回退后照常运行。回滚：回退代码并重启即可，新表留在库里无影响；规则可逐条软删除。
+- **未覆盖**：不做 `MEMORY.md` / `USER.md` 外迁、每轮量字数、`on_memory_write` / `post_tool_call` 钩子与夜间整理的合并降级（PR2）；不改召回与 `CORTEX_FACT_ROUTING`。预算放不下时停在第一条放不下的规则，不跳过去塞更短的低优先级规则。
+
 ## 2026-10-27
 
 ### 文档：补记 #79、#80、#82 与漏记的变更日志，补 #78 架构说明（Closes #91）

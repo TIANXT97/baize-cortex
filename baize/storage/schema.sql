@@ -55,6 +55,43 @@ CREATE TABLE IF NOT EXISTS living_state_history (
 
 CREATE INDEX IF NOT EXISTS idx_living_state_history_entity ON living_state_history(entity_id, id);
 
+-- Issue #105 常驻层:每个会话开头原样注入的硬规则。纯新增表,不动已有表,不复用 pinned 字段。
+-- scope: dm 仅私聊注入;group_ok 群聊也注入(写入时校验不含 IP/路径/凭据,USER.md 来源不得标 group_ok)。
+-- status: active / retired(软删除,不物理删除)。时间戳统一 'YYYY-MM-DD HH:MM:SS' UTC。
+CREATE TABLE IF NOT EXISTS resident_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'dm' CHECK (scope IN ('dm', 'group_ok')),
+    priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('hard', 'normal', 'low')),
+    source TEXT,
+    moved_from TEXT,
+    batch_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_resident_rules_active ON resident_rules(status, scope);
+
+-- 每次增/改/删写一行:action=create 时旧值列为空,update/retire 存改动前的完整旧值
+CREATE TABLE IF NOT EXISTS resident_rule_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL,
+    action TEXT NOT NULL,                -- create / update / retire
+    text TEXT,
+    scope TEXT,
+    priority TEXT,
+    source TEXT,
+    moved_from TEXT,
+    batch_id TEXT,
+    status TEXT,
+    rule_updated_at TEXT,                -- 旧值在规则上的原 updated_at
+    recorded_at TEXT NOT NULL,
+    note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_resident_rule_history_rule ON resident_rule_history(rule_id, id);
+
 -- ============================================================================
 -- Layer 2: 双时态实体拓扑图 (Bi-temporal Graph)
 -- 实体节点与带有现实有效时态、系统认知时态的有向加权关系网

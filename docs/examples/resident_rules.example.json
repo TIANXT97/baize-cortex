@@ -1,0 +1,24 @@
+{
+  "batch_id": "example-batch-001",
+  "rules": [
+    {
+      "text": "回答先给结论,再给依据;不确定就明说不确定。",
+      "scope": "group_ok",
+      "priority": "hard",
+      "source": "manual-review",
+      "moved_from": "MEMORY.md"
+    },
+    {
+      "text": "只在私聊里使用的偏好示例:汇报尽量简短,一段话说完。",
+      "scope": "dm",
+      "priority": "normal",
+      "source": "manual-review",
+      "moved_from": "USER.md"
+    },
+    {
+      "text": "低优先级示例规则:预算不够时最先被省掉。",
+      "priority": "low",
+      "source": "manual-review"
+    }
+  ]
+}

@@ -11,12 +11,14 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictInt
 
 from baize.core.consolidator import DreamConsolidator, RelocateError
 from baize.core.living_state import LivingStateManager
 from baize.core.normalization import idempotency_key as make_idempotency_key
 from baize.core.normalization import normalize_content
+from baize.core.resident import ResidentError, ResidentManager
 from baize.core.supersession import supersede
 from baize.core.scratchpad import (
     CANDIDATE_DECISION, CANDIDATE_FACT, CANDIDATE_HINT, EXPLICIT_HINT, ScratchpadManager,
@@ -163,6 +165,26 @@ class PurgeIn(BaseModel):
     dry_run: bool = True
 
 
+class ResidentCreateIn(BaseModel):
+    text: str
+    scope: str = "dm"
+    priority: str = "normal"
+    source: Optional[str] = None
+    moved_from: Optional[str] = None
+    batch_id: Optional[str] = None
+    dry_run: bool = False
+
+
+class ResidentUpdateIn(BaseModel):
+    text: Optional[str] = None
+    scope: Optional[str] = None
+    priority: Optional[str] = None
+    source: Optional[str] = None
+    moved_from: Optional[str] = None
+    batch_id: Optional[str] = None
+    dry_run: bool = False
+
+
 class BackfillIn(BaseModel):
     dry_run: bool = True
 
@@ -188,12 +210,17 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
         app.state.graph = BiTemporalGraphManager(conn)
         app.state.consolidator = DreamConsolidator(conn, archive_dir=archive_dir, llm_client=llm_client_from_env())
         app.state.router = CognitiveRecallRouter(conn, ppr)
+        app.state.resident = ResidentManager(conn)
         try:
             yield
         finally:
             conn.close()
 
     app = FastAPI(title="白泽·Cortex", version=VERSION, lifespan=lifespan)
+
+    @app.exception_handler(ResidentError)
+    async def resident_error_handler(request: Request, exc: ResidentError):
+        return JSONResponse(status_code=exc.status, content={"detail": exc.detail, "reasons": exc.reasons})
 
     @app.get("/health")
     def health():
@@ -353,6 +380,62 @@ def create_app(db_path: str = "baize.db", archive_dir: str = "cold_archive") -> 
             if app.state.living.get_state(entity_id) is None:
                 raise HTTPException(status_code=404, detail="living state not found")
             return {"entity_id": entity_id, "history": app.state.living.history(entity_id, min(max(limit, 1), 200))}
+
+    @app.get("/v1/resident")
+    def resident_render(request: Request, scope: Optional[str] = None):
+        """常驻层注入文本:scope=dm 返回全部规则,其余(含缺省、认不出的值)一律按群聊只返回 group_ok。"""
+        authenticate(request)
+        with lock:
+            return app.state.resident.render(scope)
+
+    @app.get("/v1/resident/rules")
+    def resident_list(request: Request, include_retired: bool = False):
+        authenticate(request)
+        with lock:
+            return {"rules": app.state.resident.list(include_retired=include_retired)}
+
+    @app.get("/v1/resident/rules/{rule_id}")
+    def resident_get(rule_id: int, request: Request):
+        authenticate(request)
+        with lock:
+            rule = app.state.resident.get(rule_id)
+        if rule is None:
+            raise HTTPException(status_code=404, detail="resident rule not found")
+        return rule
+
+    @app.get("/v1/resident/rules/{rule_id}/history")
+    def resident_history(rule_id: int, request: Request):
+        authenticate(request)
+        with lock:
+            if app.state.resident.get(rule_id) is None:
+                raise HTTPException(status_code=404, detail="resident rule not found")
+            return {"history": app.state.resident.history(rule_id)}
+
+    @app.post("/v1/resident/rules")
+    def resident_create(body: ResidentCreateIn, request: Request):
+        agent_id = authenticate(request)
+        with lock:
+            return app.state.resident.create(
+                body.text, body.scope, body.priority, body.source, body.moved_from, body.batch_id,
+                dry_run=body.dry_run, actor=f"api:{agent_id}",
+            )
+
+    @app.patch("/v1/resident/rules/{rule_id}")
+    def resident_update(rule_id: int, body: ResidentUpdateIn, request: Request):
+        agent_id = authenticate(request)
+        changes = body.model_dump(exclude_unset=True)
+        changes.pop("dry_run", None)
+        for required in ("text", "scope", "priority"):
+            if required in changes and changes[required] is None:
+                raise HTTPException(status_code=422, detail=f"{required} 不能为 null")
+        with lock:
+            return app.state.resident.update(rule_id, dry_run=body.dry_run, actor=f"api:{agent_id}", **changes)
+
+    @app.delete("/v1/resident/rules/{rule_id}")
+    def resident_retire(rule_id: int, request: Request, dry_run: bool = False):
+        agent_id = authenticate(request)
+        with lock:
+            return app.state.resident.retire(rule_id, dry_run=dry_run, actor=f"api:{agent_id}")
 
     @app.post("/v1/graph/node")
     def graph_node(body: GraphNodeIn, request: Request):
